@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from app.config import load_competitors
 from app.core.errors import ConfigurationError
@@ -77,3 +78,22 @@ def test_database_url_is_secret_and_displayed_masked() -> None:
     settings = make_settings(database_url="postgresql+psycopg://app:s3cret@db.internal:5432/intel")
     assert "s3cret" not in repr(settings)
     assert settings.database_url_display == "postgresql+psycopg://app:***@db.internal:5432/intel"
+
+
+def test_analysis_settings_defaults_and_routes() -> None:
+    from tests.fakesite import make_settings
+
+    settings = make_settings()
+    assert settings.analysis_model == settings.gemini_model == "gemini-3.8-flash"
+    assert settings.synthesis_model == "gemini-3.8-flash"
+    routed = make_settings(gemini_analysis_model="gemini-3.5-flash-lite")
+    assert routed.analysis_model == "gemini-3.5-flash-lite"
+    assert routed.synthesis_model == "gemini-3.8-flash"
+    assert {t.value for t in settings.analysis_exclude_types} == {"careers", "legal", "listing"}
+
+
+def test_an_item_must_fit_in_a_batch() -> None:
+    from tests.fakesite import make_settings
+
+    with pytest.raises(ValidationError, match="ANALYSIS_ITEM_MAX_CHARS"):
+        make_settings(analysis_item_max_chars=50_000, analysis_batch_max_chars=10_000)

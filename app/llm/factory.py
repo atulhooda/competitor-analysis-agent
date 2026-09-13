@@ -33,3 +33,30 @@ def create_llm_provider(settings: Settings) -> LLMProvider:
 def get_llm() -> LLMProvider:
     """Process-wide provider built from environment settings. Clear with ``get_llm.cache_clear()``."""
     return create_llm_provider(get_settings())
+
+
+class LazyLLM:
+    """Builds the provider on first use.
+
+    The API server and CLI start (and scan) without ``GEMINI_API_KEY``; only features
+    that call the LLM fail, with a clear ``LLMConfigurationError``.
+    """
+
+    def __init__(self, settings: Settings, provider: LLMProvider | None = None) -> None:
+        self._settings = settings
+        self._provider = provider
+        self._owned = provider is None
+
+    @property
+    def configured(self) -> bool:
+        return self._provider is not None or self._settings.llm_configured
+
+    def get(self) -> LLMProvider:
+        if self._provider is None:
+            self._provider = create_llm_provider(self._settings)
+        return self._provider
+
+    async def aclose(self) -> None:
+        if self._provider is not None and self._owned:
+            await self._provider.aclose()
+            self._provider = None

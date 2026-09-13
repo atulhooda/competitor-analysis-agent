@@ -47,7 +47,7 @@ def test_check(configured: Path) -> None:
     result = runner.invoke(cli, ["check"])
     assert result.exit_code == 0, result.output
     assert "up to date" in result.output
-    assert "not needed for Phases 1 and 2" in result.output
+    assert "scanning works without it" in result.output
     assert "gemini-3.8-flash" in result.output
 
 
@@ -123,3 +123,105 @@ def test_errors(configured: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     result = runner.invoke(cli, ["competitors", "list"])
     assert result.exit_code == 2
     assert "Cannot reach the database" in result.output
+
+
+# ── Phase 3 ──────────────────────────────────────────────────────────────────
+
+
+def _scan_acme() -> None:
+    assert runner.invoke(cli, ["competitors", "import"]).exit_code == 0
+    with respx.mock(assert_all_called=False) as router:
+        mount_site(router)
+        assert runner.invoke(cli, ["scan", "acme"]).exit_code == 0
+
+
+def test_analyze_dry_run_needs_no_key_and_real_runs_do(configured: Path) -> None:
+    _scan_acme()
+    dry = runner.invoke(cli, ["analyze", "acme", "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert "dry run" in dry.output
+    assert "pending 8" in dry.output
+    plan = json.loads(runner.invoke(cli, ["analyze", "acme", "--dry-run", "--json"]).stdout)
+    assert plan["batches"] == 2
+    assert len(plan["items"]) == 8
+
+    refused = runner.invoke(cli, ["analyze", "acme"])
+    assert refused.exit_code == 2
+    assert "GEMINI_API_KEY" in refused.output
+    assert runner.invoke(cli, ["analyze"]).exit_code == 2  # neither slug nor --all
+
+
+def test_analysis_commands(configured: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:  # fmt: skip
+    from app.llm import LazyLLM
+    from tests.fakellm import FakeLLM
+
+    fake = FakeLLM()
+    monkeypatch.setattr("app.cli.LazyLLM", functools.partial(LazyLLM, provider=fake))
+    _scan_acme()
+
+    analyzed = runner.invoke(cli, ["analyze", "--all"])
+    assert analyzed.exit_code == 0, analyzed.output
+    assert "succeeded" in analyzed.output
+    assert "analyzed=8" in analyzed.output
+    assert "gemini: 3 call(s)" in analyzed.output  # 2 analysis batches + 1 profile
+
+    payload = json.loads(runner.invoke(cli, ["analyze", "acme", "--json"]).stdout)
+    assert payload["status"] == "succeeded"
+    assert payload["summary"]["analyzed"] == 0
+
+    topics = runner.invoke(cli, ["topics"])
+    assert topics.exit_code == 0
+    assert "ai-agents" in topics.output
+    shown = runner.invoke(cli, ["topics", "show", "ai-agents"])
+    assert shown.exit_code == 0, shown.output
+    assert "AI Agents" in shown.output or "AI agents" in shown.output
+    assert "Ticket automation" in shown.output
+    assert runner.invoke(cli, ["topics", "list", "--parent", "ai-agents"]).exit_code == 0
+
+    trends = runner.invoke(cli, ["trends", "acme"])
+    assert trends.exit_code == 0, trends.output
+    assert "published: 3 in the last 30 days" in trends.output
+    assert runner.invoke(cli, ["trends"]).exit_code == 0
+    assert runner.invoke(cli, ["trends", "nope"]).exit_code == 2
+
+    profile = runner.invoke(cli, ["profile", "acme"])
+    assert profile.exit_code == 0, profile.output
+    assert "Resolve support tickets with AI agents" in profile.output
+    assert "2 statement(s) without evidence were dropped" in profile.output
+
+    assert runner.invoke(cli, ["landscape"]).exit_code == 2  # none generated yet
+    landscape = runner.invoke(cli, ["landscape", "--refresh"])
+    assert landscape.exit_code == 0, landscape.output
+    assert "AI agents dominate." in landscape.output
+
+    item_id = json.loads(runner.invoke(cli, ["content", "acme", "--json", "--search", "Support Agents"]).stdout)[0]["id"]  # fmt: skip
+    analysis = runner.invoke(cli, ["analysis", str(item_id)])
+    assert analysis.exit_code == 0, analysis.output
+    assert "content-analysis/1" in analysis.output
+    assert "Human handoff" in analysis.output
+    assert runner.invoke(cli, ["analysis", "999999"]).exit_code == 2
+
+    usage = runner.invoke(cli, ["usage"])
+    assert usage.exit_code == 0
+    assert "content_analysis" in usage.output
+    runs = runner.invoke(cli, ["runs"])
+    assert "analysis" in runs.output
+    assert "landscape" in runs.output
+
+    merged = runner.invoke(cli, ["topics", "merge", "automation", "ai-agents"])
+    assert merged.exit_code == 0, merged.output
+    assert runner.invoke(cli, ["topics", "merge", "nope", "ai-agents"]).exit_code == 2
+
+    seeds = tmp_path / "topics.yaml"
+    seeds.write_text("topics:\n  - {name: Data privacy, aliases: [GDPR compliance]}\n  - {name: Pricing, aliases: [Automation]}\n", encoding="utf-8")  # fmt: skip
+    imported = runner.invoke(cli, ["topics", "import", "--file", str(seeds)])
+    assert imported.exit_code == 0, imported.output
+    assert "topics created: 1" in imported.output
+    assert "already means" in imported.output  # "Automation" was merged into AI agents
+
+
+def test_topics_example_file_is_valid() -> None:
+    from app.config import load_topic_seeds
+
+    seeds = load_topic_seeds(Path(__file__).parents[2] / "config" / "topics.example.yaml")
+    assert any(seed.name == "AI agents" for seed in seeds)

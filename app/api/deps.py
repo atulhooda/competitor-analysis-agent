@@ -9,7 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.db.session import SessionFactory
+from app.services.analysis import AnalysisService
+from app.services.intelligence import IntelligenceService
+from app.services.landscape import LandscapeService
 from app.services.scans import ScanService
+from app.services.topic_admin import TopicAdminService
 
 
 def get_app_settings(request: Request) -> Settings:
@@ -57,3 +61,29 @@ def get_scan_service(request: Request) -> ScanService:
 
 
 ScanServiceDep = Annotated[ScanService, Depends(get_scan_service)]
+
+
+def get_analysis_service(request: Request) -> AnalysisService:
+    service: AnalysisService = request.app.state.analyses
+    return service
+
+
+def get_intelligence_service(request: Request) -> IntelligenceService:
+    service: IntelligenceService = request.app.state.intelligence
+    return service
+
+
+def get_landscape_service(request: Request) -> LandscapeService:
+    service: LandscapeService = request.app.state.landscapes
+    return service
+
+
+def get_topic_admin(request: Request) -> TopicAdminService:
+    service: TopicAdminService = request.app.state.topic_admin
+    return service
+
+
+AnalysisServiceDep = Annotated[AnalysisService, Depends(get_analysis_service)]
+IntelligenceDep = Annotated[IntelligenceService, Depends(get_intelligence_service)]
+LandscapeServiceDep = Annotated[LandscapeService, Depends(get_landscape_service)]
+TopicAdminDep = Annotated[TopicAdminService, Depends(get_topic_admin)]

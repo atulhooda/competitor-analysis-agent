@@ -4,9 +4,10 @@ An AI-powered competitor intelligence and content generation agent. It monitors 
 websites (and later their social channels), keeps a history of what they publish, finds content
 opportunities, and generates and publishes original blog posts.
 
-> **Status: Phase 2 of 10: persisted competitor history.** Scans are deterministic and
-> rule-based (no LLM calls) and are now stored in PostgreSQL: the system remembers what each
-> competitor has published, detects new and changed content, and answers questions about it.
+> **Status: Phase 3 of 10: AI competitor intelligence.** Scans stay deterministic (no LLM)
+> and are stored in PostgreSQL. Gemini now analyzes what competitors publish: topics, formats,
+> audiences, intent, angles, positioning, changes. Deterministic metrics then show trends,
+> coverage and neglected subjects across competitors. Nothing is generated or published yet.
 > See [MIGRATION_PLAN.md](MIGRATION_PLAN.md) for the architecture and roadmap.
 
 ## What it does today
@@ -45,6 +46,65 @@ opportunities, and generates and publishes original blog posts.
   `duplicate` rather than counted as separate content.
 - **Runs.** Every scan is recorded with its statistics and an audit trail (skipped URLs, errors).
   Scans of the same competitor never overlap (Postgres advisory lock).
+
+**AI analysis (Phase 3).** Turns the history into intelligence:
+
+| Question | Where the answer comes from |
+|---|---|
+| What are competitors publishing? | Per-page analysis: summary, topics and subtopics, format, audience, intent, funnel stage, angle, themes, keywords, positioning claims, entities (`analyses`, `analysis`) |
+| What topics do they focus on? Which are growing? | Topic shares and window-over-window trends per competitor and overall (`trends`, `/intelligence`) |
+| What formats do they use? How is the mix shifting? | Format, audience and intent mixes, plus shifts between windows |
+| What changed recently? | Change events (Phase 2) with model-written explanations of significant pricing and positioning changes |
+| How does each competitor position itself? | A versioned profile whose statements all cite the competitor's own pages (`profile`) |
+| Which subjects matter across competitors, and which are neglected? | Topic coverage across competitors; rising, dormant, declining, single-competitor and thin subtopics; plus a model-written briefing grounded in those numbers (`landscape`) |
+
+The pipeline never sends the whole database to the model:
+
+```
+history ─► select what needs analysis ─► reuse analyses of minor edits (no LLM)
+        ─► digest: page facts + text condensed to a budget (no LLM)
+        ─► batch (count and size limits) ─► Gemini structured output ─► validate
+        ─► normalize topics (aliases, taxonomy) ─► store ─► deterministic metrics
+        ─► summaries, profiles, landscape briefing (Gemini, grounded in stored results)
+```
+
+- **Only what changed costs money.** A page is analyzed once per content version (and prompt
+  version). Re-runs with no new content make no LLM calls. Pages whose text changed only
+  slightly (the Phase 2 minor-edit rule) reuse their previous analysis without a call.
+- **Deterministic preprocessing.** Each page becomes a bounded digest: URL, page type, title,
+  description, reliable publication date, author, categories, tags, length, heading outline,
+  and main text. Long pages are condensed extractively (the opening, then each section's start),
+  never summarized by a model.
+- **Batches** of up to `ANALYSIS_BATCH_SIZE` pages and `ANALYSIS_BATCH_MAX_CHARS` characters per
+  call. A batch with unusable output is retried in halves; a page the model skipped is retried
+  once; persistent failures are recorded, and the pages stay pending for the next run.
+- **Budgets.** `LLM_MAX_TOKENS_PER_RUN` and `LLM_DAILY_TOKEN_BUDGET` are checked *before* each
+  call; every call (tokens, latency, model, prompt version) is recorded in `llm_calls`.
+  `analyze --dry-run` shows exactly what would be sent, and its token estimate, without a key.
+- **Typed, validated output.** Each prompt has a Pydantic schema, sent to Gemini as a JSON
+  Schema. Enums are enforced, and odd values are normalized rather than failing a batch. Results
+  are stored as typed columns, not raw model responses.
+- **Topic normalization.** A two-level taxonomy (topics → subtopics):
+  1. Labels are matched by a normalized key: case, punctuation, plurals and common abbreviations,
+     so "AI-Agents", "AI agents" and "Artificial intelligence agents" land on one topic.
+  2. The model is shown the existing taxonomy and told to reuse its names.
+  3. Every spelling ever seen becomes an alias.
+  4. Duplicates the rules can't catch ("Agentic AI" vs "AI agents") are merged by
+     `topics consolidate` (Gemini proposes, you apply) or `topics merge`.
+
+  Merged topics keep resolving to their target. You can also seed names and synonyms from
+  `config/topics.yaml`.
+- **Grounding.** Profile statements must cite evidence ids (the competitor's analyzed pages or
+  summarized changes); uncited statements are dropped and counted. Landscape findings must cite
+  topics and competitors present in the metrics, or they are dropped. Page text is wrapped in
+  delimiters it can't break out of, and treated as data, not instructions. The model has no
+  tools.
+- **Trends use reliable publication dates only.** A competitor whose captured, dated history
+  doesn't reach back to the previous window is reported as `insufficient_history` instead of
+  "rising". Scans capture newest content first, so a first scan would otherwise look like a
+  sudden surge.
+- **Descriptive, not prescriptive.** Phase 3 reports what competitors do. Scoring opportunities
+  (what *you* should write) is Phase 4.
 
 ### Dates: what they mean
 
@@ -89,6 +149,15 @@ uv run python -m app competitors import                     # load them into the
 uv run python -m app check                                  # validate everything
 ```
 
+For AI analysis, set `GEMINI_API_KEY` in `.env`, then scan and analyze:
+
+```bash
+uv run python -m app scan --all
+uv run python -m app analyze --all --dry-run                # review what would be sent first
+uv run python -m app analyze --all
+uv run python -m app landscape --refresh
+```
+
 The database is the source of truth for competitors; the YAML file is an import format.
 Only `slug`, `name` and `website` are required:
 
@@ -122,8 +191,27 @@ uv run python -m app content acme --published-since 7d    # what did Acme publis
 uv run python -m app content acme --new-only              # first seen after the baseline
 uv run python -m app changes acme --since 30d             # new / updated / pricing / removed
 uv run python -m app activity acme --weeks 12             # weekly publication and change counts
-uv run python -m app runs acme                            # recent scans
-uv run python -m app run 42                               # one scan with its audit events
+uv run python -m app runs acme                            # recent runs (scans, analyses, reports)
+uv run python -m app run 42                               # one run with its audit events
+
+# AI analysis (needs GEMINI_API_KEY, except --dry-run)
+uv run python -m app analyze acme --dry-run          # what would be sent, token estimate; no call
+uv run python -m app analyze acme                    # analyze new/changed pages, summarize, profile
+uv run python -m app analyze --all --limit 20        # every active competitor, 20 pages each
+uv run python -m app analysis 123                    # one page's analysis
+uv run python -m app trends acme --days 30           # topics, formats, audiences, shifts
+uv run python -m app trends                          # across competitors: rising, neglected
+uv run python -m app profile acme                    # evidence-backed positioning profile
+uv run python -m app landscape --refresh             # new cross-competitor AI briefing
+uv run python -m app usage --days 7                  # Gemini calls and tokens per day
+
+# Topic taxonomy
+uv run python -m app topics                          # topics with page and competitor counts
+uv run python -m app topics show ai-agents           # trend, subtopics, recent pages
+uv run python -m app topics import                   # seed from TOPICS_FILE (optional)
+uv run python -m app topics consolidate              # Gemini proposes duplicate merges
+uv run python -m app topics consolidate --apply      # ...and applies them
+uv run python -m app topics merge agentic-ai ai-agents
 
 # Database
 uv run python -m app db upgrade                      # apply migrations
@@ -150,7 +238,17 @@ uv run uvicorn app.main:create_app --factory --port 8000
 | GET | `/api/v1/content/{id}` | One item with its current version (`?include_text=true`) |
 | GET | `/api/v1/content/{id}/versions` | Version history |
 | GET | `/api/v1/changes` | Change events: `competitor`, `change_type`, `since`, `include_minor` |
-| GET | `/api/v1/runs`, `/api/v1/runs/{id}` | Scan runs, with their audit events |
+| GET | `/api/v1/runs`, `/api/v1/runs/{id}` | Runs (scans, analyses, reports), with their audit events |
+| POST | `/api/v1/competitors/{slug}/analyses` | Start an AI analysis run: `202` plus a run to poll, or `?wait=true`. Body: `{"limit": 20, "reanalyze": false, "change_summaries": true, "profile": true, "force_profile": false}`. `503` without `GEMINI_API_KEY` |
+| GET | `/api/v1/competitors/{slug}/analysis-plan` | What a run would send, with token estimates (no LLM call) |
+| GET | `/api/v1/competitors/{slug}/intelligence` | Topics, subtopics, formats, audiences, intents, trends, mix shifts, recent items and changes, latest profile (`?days=30`) |
+| GET | `/api/v1/competitors/{slug}/profile`, `/profiles` | Latest profile / version history |
+| GET | `/api/v1/analyses` | Latest analysis per page: `competitor`, `topic`, `content_format`, `published_since` |
+| GET | `/api/v1/content/{id}/analyses` | Every analysis of one page |
+| GET | `/api/v1/topics`, `/api/v1/topics/{slug}` | Taxonomy (`?parent=`, `?q=`) / one topic across competitors |
+| POST | `/api/v1/topics/merge`, `/api/v1/topics/consolidate` | Merge `{"source", "target"}` / Gemini-proposed merges (`?apply=true` to apply) |
+| GET / POST | `/api/v1/intelligence/landscape` | Cross-competitor metrics plus the latest briefing / generate a new briefing (`202` or `?wait=true`) |
+| GET | `/api/v1/llm/usage` | Gemini calls and tokens per day, purpose and model (`?days=7`) |
 
 `/api/v1/*` requires the `X-API-Key` header whenever `API_KEY` is set. Outside development,
 requests are refused until it is. Interactive docs are served at `/docs`.
@@ -167,10 +265,11 @@ PostgreSQL, managed with Alembic migrations (`migrations/`), in separate layers:
 | Configuration | `competitors` | Who is monitored, and how (options stored as validated JSON) |
 | Raw | `raw_documents` | HTML exactly as fetched (gzip), stored only for captured versions |
 | Normalized | `content_items`, `content_versions`, `change_events` | One row per URL (lifecycle + reliable dates); immutable snapshots; the change log |
-| Operations | `runs`, `run_events` | What ran, when, with what result, and why URLs were skipped |
+| Analysis (Phase 3) | `topics`, `topic_aliases`, `content_analyses`, `content_analysis_topics`, `change_summaries`, `competitor_profiles`, `landscape_reports` | Model-produced interpretations, each with its run, model and prompt version; profiles and reports stored with the metrics they were grounded on |
+| Operations | `runs`, `run_events`, `llm_calls` | What ran, when, with what result; every LLM call with its tokens |
 
-Nothing in these tables is produced by an LLM. AI-generated analysis (Phase 3) and
-recommendations (Phase 4+) get their own tables.
+Only the analysis layer holds LLM output, and it never modifies the layers below it.
+Recommendations (Phase 4+) get their own tables.
 
 ## LLM provider: Google Gemini
 
@@ -194,10 +293,19 @@ topics = await llm.generate_structured(LLMRequest(prompt="..."), TopicList)  # a
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `GEMINI_API_KEY` | From Phase 3 | *(empty)* | Gemini API key. Create one in [Google AI Studio](https://aistudio.google.com/apikey). |
+| `GEMINI_API_KEY` | For AI analysis | *(empty)* | Gemini API key. Create one in [Google AI Studio](https://aistudio.google.com/apikey). |
 | `GEMINI_MODEL` | No | `gemini-3.8-flash` | Model ID. Leave empty for the default. |
+| `GEMINI_ANALYSIS_MODEL` / `GEMINI_SYNTHESIS_MODEL` | No | `GEMINI_MODEL` | Per-route models: bulk per-page analysis vs. profiles, briefings, summaries, consolidation |
+| `ANALYSIS_REASONING_EFFORT` / `SYNTHESIS_REASONING_EFFORT` | No | `low` / `medium` | Gemini `thinking_level` per route |
+| `LLM_MAX_TOKENS_PER_RUN` / `LLM_DAILY_TOKEN_BUDGET` | No | `400000` / `2000000` | Hard budgets checked before each call (`0` daily = unlimited) |
 | `LLM_TIMEOUT_SECONDS` | No | `120` | Per-request timeout |
 | `LLM_MAX_RETRIES` | No | `2` | SDK retries for 429/5xx/timeouts |
+
+- Structured outputs: every prompt's Pydantic schema is sent as a self-contained JSON Schema
+  (nested models are inlined), and the reply is validated before use.
+- Prompts live in [`app/prompts/`](app/prompts/), each with a `VERSION`, and that version is
+  stored on everything it produces. Changing a prompt means bumping its version: pages then
+  become pending again and are re-analyzed gradually, within the per-run limit.
 
 - The default, `gemini-3.8-flash`, was the latest stable model in
   [Google's model list](https://ai.google.dev/gemini-api/docs/models) when this was written;
@@ -210,9 +318,9 @@ topics = await llm.generate_structured(LLMRequest(prompt="..."), TopicList)  # a
 
 | Phase | Uses Gemini? |
 |---|---|
-| 1 · Website monitoring | **No.** Deterministic. |
-| 2 · Persisted history (current) | **No.** Storage, incremental scans and change detection are deterministic. **`GEMINI_API_KEY` may be empty.** |
-| 3 · Competitor analysis | Yes: topics, formats, audience, positioning, change summaries |
+| 1 · Website monitoring | **No.** Deterministic. Works with `GEMINI_API_KEY` empty. |
+| 2 · Persisted history | **No.** Storage, incremental scans and change detection are deterministic. |
+| 3 · Competitor analysis (current) | **Yes:** per-page analysis, change summaries, profiles, landscape briefings, topic consolidation. Metrics, trends and gaps stay deterministic. |
 | 4 · Opportunity detection | Yes: relevance judgments and angles (scores are deterministic) |
 | 5 · Blog research and generation | Yes |
 | 6 · SEO, editing, fact-checking, quality | Yes |
@@ -235,6 +343,13 @@ All settings are environment variables (or `.env`); see [`.env.example`](.env.ex
 | `CRAWLER_DEFAULT_SCAN_LIMIT` | `25` | New or changed pages fetched per scan |
 | `CRAWLER_REVISIT_LIMIT` / `_AFTER_DAYS` | `5` / `7` | Stale captured pages re-checked per scan |
 | `CRAWLER_MAX_SITEMAP_FILES` / `_URLS` | `20` / `10000` | Sitemap discovery bounds |
+| `TOPICS_FILE` | `config/topics.yaml` | Optional seed taxonomy for `topics import` |
+| `ANALYSIS_MAX_ITEMS_PER_RUN` | `40` | Pages analyzed per run; the rest stay pending |
+| `ANALYSIS_BATCH_SIZE` / `_BATCH_MAX_CHARS` / `_ITEM_MAX_CHARS` | `6` / `40000` / `6000` | Pages per Gemini call and character budgets per call and per page |
+| `ANALYSIS_MIN_WORDS` / `_MIN_WORDS_POSITIONING` | `80` / `20` | Minimum words for editorial pages / homepage, pricing, product and landing pages |
+| `ANALYSIS_EXCLUDE_TYPES` | `["careers","legal","listing"]` | Page types never analyzed (JSON list) |
+| `ANALYSIS_MAX_CHANGE_SUMMARIES_PER_RUN` | `10` | Significant changes explained per run |
+| `ANALYSIS_TAXONOMY_PROMPT_LIMIT` | `150` | Existing topics shown to the analyzer |
 
 ## Development
 
@@ -244,6 +359,7 @@ uv run pytest                        # offline: no external network, no real Gem
 uv run ruff check . && uv run ruff format --check .
 uv run mypy app                      # strict type checking
 LIVE_SCAN_URL=https://www.example.com uv run pytest -m live   # opt-in real-site scan
+uv run pytest -m llm_live            # opt-in: one real Gemini call (needs GEMINI_API_KEY)
 ```
 
 - Each test session creates a fresh database from the Alembic migrations (proving a fresh
@@ -252,6 +368,9 @@ LIVE_SCAN_URL=https://www.example.com uv run pytest -m live   # opt-in real-site
   isn't reachable, except in CI (`REQUIRE_DB_TESTS=1`), where that fails the run.
 - HTTP, including the Gemini API, is mocked with [respx]; an autouse guard blocks every
   non-loopback socket.
+- The analysis pipeline is tested end to end with `tests/fakellm.py`, a deterministic stand-in
+  for Gemini. It reads prompts like the real model, and can fail, omit documents or return
+  invalid output on demand.
 - CI runs lint, format, type checks and tests against a PostgreSQL service
   (`.github/workflows/ci.yml`).
 
@@ -270,12 +389,21 @@ app/
     monitoring.py              scan orchestration (incremental when given known pages)
     scans.py                   run lifecycle: locking, scanning, recording
     history.py                 records scans: discovered URLs, versions, change events
-    change_detection.py        word-level diffs and price-change detection
+    change_detection.py        word-level diffs, price changes, diff excerpts
+    analysis.py                AI analysis runs: select → digest → batch → Gemini → store
+    digest.py                  deterministic page digests, condensing, batching
+    topics.py, labels.py       taxonomy: label normalization, aliases, seeds, merges
+    trends.py                  deterministic trends, mixes, coverage and gaps
+    intelligence.py            competitor and landscape intelligence (read side)
+    profiles.py, landscape.py  grounded syntheses (Gemini)
+    change_summaries.py        explanations of significant changes (Gemini)
+    llm_usage.py               token budgets and the LLM call ledger
+  prompts/                     versioned prompts + their structured-output schemas
   db/                          models (by layer), sessions, advisory locks, queries, migrations
-  llm/                         provider-agnostic LLM interface + Gemini provider (Phase 3+)
+  llm/                         provider-agnostic LLM interface + Gemini provider
   api/                         HTTP routes and schemas
 migrations/                    Alembic migrations
-config/                        competitors.example.yaml
+config/                        competitors.example.yaml, topics.example.yaml
 tests/                         unit, integration (incl. PostgreSQL) and opt-in live tests
 ```
 

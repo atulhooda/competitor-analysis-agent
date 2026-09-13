@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import structlog
-from sqlalchemy import select, update
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.config import Settings
@@ -26,9 +26,11 @@ from app.domain.history import ACTIVE_RUN_STATUSES, RunStatus, RunTrigger
 from app.domain.scan import ScanResult
 from app.services.history import HistoryRecorder, RecordSummary
 from app.services.monitoring import MonitoringService
+from app.services.runs import run_slot_free
 
 log = structlog.get_logger(__name__)
 
+RUN_KIND = "scan"
 _STATUS_FROM_SCAN = {"ok": RunStatus.SUCCEEDED, "partial": RunStatus.PARTIAL, "failed": RunStatus.FAILED}  # fmt: skip
 
 
@@ -101,19 +103,17 @@ class ScanService:
                 raise CompetitorNotFoundError(f"Unknown competitor {slug!r}")
             if not competitor.active:
                 raise CompetitorInactiveError(f"Competitor {slug!r} is inactive")
-            active_run = await session.scalar(
-                select(Run.id)
-                .where(Run.competitor_id == competitor.id, Run.status.in_(ACTIVE_RUN_STATUSES))
-                .limit(1)
+            free = await run_slot_free(
+                session,
+                kind=RUN_KIND,
+                competitor_id=competitor.id,
+                lock=competitor_scan_lock(self._engine, competitor.id),
+                now=self._now(),
             )
-            if active_run is not None:
-                async with competitor_scan_lock(self._engine, competitor.id) as free:
-                    if not free:
-                        raise ScanAlreadyRunningError(f"A scan of {slug!r} is already running")
-                # Nobody holds the lock, so that run was left behind by a crashed process.
-                await self._fail_abandoned_runs(session, competitor.id)
+            if not free:
+                raise ScanAlreadyRunningError(f"A scan of {slug!r} is already running")
             run = Run(
-                kind="scan",
+                kind=RUN_KIND,
                 trigger=trigger.value,
                 status=RunStatus.QUEUED.value,
                 competitor_id=competitor.id,
@@ -188,7 +188,9 @@ class ScanService:
         self, session: AsyncSession, competitor_id: int, *, keep: int | None = None
     ) -> None:
         query = update(Run).where(
-            Run.competitor_id == competitor_id, Run.status.in_(ACTIVE_RUN_STATUSES)
+            Run.kind == RUN_KIND,
+            Run.competitor_id == competitor_id,
+            Run.status.in_(ACTIVE_RUN_STATUSES),
         )
         if keep is not None:
             query = query.where(Run.id != keep)

@@ -6,6 +6,7 @@
 - r1 (2026-09-13): initial analysis and plan.
 - r2 (2026-09-13): **the primary LLM provider changed from Anthropic to Google Gemini**, at the owner's request. Gemini is the only LLM provider; no other provider is introduced unless the owner explicitly asks. Phase 1 stays deterministic (no LLM calls) and only establishes the provider-agnostic LLM interface and Gemini configuration.
 - r3 (2026-09-13): Phase 1 approved. Phase 2 (persisted history) implemented; see the implementation notes under §12, Phase 2.
+- r4 (2026-09-13): Phase 2 approved. Phase 3 (AI competitor intelligence, the first Gemini calls) implemented; see the implementation notes under §12, Phase 3.
 
 The three source repositories were cloned to a temporary scratch directory for analysis only. They are not vendored, submoduled, or left beside the project.
 
@@ -177,7 +178,7 @@ There is a second concern with R2. Its code references corporate-internal toolin
 | R1 file / module | Disposition | Target |
 |---|---|---|
 | `shemas.py`: `CompetitorProfile`, `CompetitiveAnalysisReport` | **Import, adapted.** Add evidence URLs, observed-at timestamps, confidence, and structured pricing tiers. | `app/domain/competitor_profile.py` (Phase 3) |
-| `main.py` pattern: each competitor researched in its own context, then synthesis from structured profiles only ("do not add information not present") | **Reuse pattern** in the analysis services | `app/services/analysis.py` (Phase 3) |
+| `main.py` pattern: each competitor researched in its own context, then synthesis from structured profiles only ("do not add information not present") | **Reuse pattern** in the analysis services | `app/services/profiles.py` (Phase 3) |
 | `config.py` `INDUSTRY`, `FOCUS_AREAS` | **Concept** folded into the company profile | `config/company_profile.yaml` (Phase 4) |
 | Upsonic `Agent`/`Task`, `FirecrawlTools` | **Removed.** No second agent framework; our compliant crawler replaces Firecrawl. | — |
 | Terminal/Markdown report printing, `report.json`, `example_report.md` | **Removed.** Output goes through the API (and later the dashboard). | — |
@@ -678,6 +679,38 @@ At every phase: run the tests → run the app → verify against real inputs →
 - Topic taxonomy.
 - Versioned competitor profiles (R1 schema) and summaries of pricing/messaging changes.
 - Deterministic trend snapshots (frequency, topic growth, formats, strategy shift).
+
+**Implemented (2026-09-13). What was built, and where it differs from §7:**
+- **Pipeline** (`app/services/analysis.py`), one run per competitor, advisory-locked:
+  1. select pages whose current version lacks an analysis for the current prompt version (prioritized: homepage, pricing, product/landing, then editorial newest first; capped per run);
+  2. reuse the analysis for minor edits (the Phase 2 word-diff rule), with no call;
+  3. build deterministic digests: page facts plus text condensed extractively to a budget;
+  4. batch by count and size, then make one Gemini structured-output call per batch;
+  5. validate, normalize topics, and persist each batch in its own transaction;
+  6. summarize significant changes, and refresh the profile if its evidence changed.
+
+  Failures split batches, retry missing pages once, and leave the rest pending. Outages and budget stops keep what was saved.
+- **Gemini usage.**
+  - Only `app/llm/gemini.py` imports the SDK.
+  - Nested Pydantic schemas are inlined (`$ref`/`$defs` removed), and constraints are emitted as standard `minimum`/`maximum`.
+  - Output types are lenient: odd values are normalized rather than failing a batch.
+  - `LLMResponseError` carries billed usage.
+  - Per-route models and reasoning: analysis `low`, synthesis `medium`.
+  - Budgets are checked before every call: per run and per UTC day.
+- **Tables (migration `0002`).**
+  - Analysis layer: `topics`, `topic_aliases`, `content_analyses`, `content_analysis_topics`, `change_summaries`, `competitor_profiles`, `landscape_reports`.
+  - Ops layer: `llm_calls`.
+- **Differences from §7:**
+  - Usage is recorded in a dedicated `llm_calls` ledger, not `run_events`: the daily budget needs efficient sums.
+  - `content_topics` is named `content_analysis_topics` and links to the analysis, which records its content version, prompt version and model.
+  - The taxonomy has two levels (topics → subtopics). Every spelling becomes a scoped alias, so resolution is deterministic. Merges re-point links and aliases and keep the source as `merged`.
+  - **`trend_snapshots` is not a table.** Metrics are computed on request from the latest analyses, which is always consistent. Each landscape report stores the exact metrics snapshot its narrative was grounded on. Phase 4 can persist snapshots if scoring needs them.
+  - Profiles store the validated `CompetitorProfile` (adapted R1 schema) as JSON. Every statement cites evidence (the competitor's own pages or summarized changes), and uncited statements are dropped. Content-strategy facts are deterministic.
+  - Change summaries are keyed on the version transition (`to_version_id`), so an `updated` event and a `pricing_changed` event for the same edit share one summary.
+  - pgvector is still not needed: normalization is key + alias + taxonomy-in-prompt + reviewed merges.
+- **Date rule.** Trends compare windows on reliable publication dates only. Competitors whose captured, dated history doesn't reach the previous window are reported as `insufficient_history` rather than rising: scans capture newest first.
+- **Run bookkeeping fix (also applies to scans).** A queued run less than 5 minutes old is treated as starting, not abandoned. Before, a second request could fail a queued run whose task hadn't yet taken its lock.
+- **Scope kept out:** opportunity scoring and recommendations (Phase 4); any generation or publishing.
 
 ### Phase 4 — Opportunity detection
 - Company profile; your own site crawled as `is_self`.

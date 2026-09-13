@@ -73,7 +73,7 @@ class GeminiProvider:
             response_format={
                 "type": "text",
                 "mime_type": "application/json",
-                "schema": schema.model_json_schema(),
+                "schema": gemini_schema(schema),
             },
         )
         try:
@@ -81,7 +81,8 @@ class GeminiProvider:
         except ValidationError as exc:
             raise LLMResponseError(
                 f"Gemini output does not match {schema.__name__} "
-                f"({exc.error_count()} validation error(s))"
+                f"({exc.error_count()} validation error(s); status {response.finish_reason!r})",
+                usage=response.usage,  # the call was billed even though it's unusable
             ) from exc
         return StructuredResponse(data=data, raw=response)
 
@@ -136,6 +137,43 @@ class GeminiProvider:
         )
 
 
+def gemini_schema(model: type[BaseModel]) -> dict[str, Any]:
+    """The model's JSON Schema, made self-contained for Gemini structured output.
+
+    Pydantic emits nested models as ``$defs`` + ``$ref``. They are inlined here so the
+    request doesn't depend on reference support, and ``default`` keywords are dropped
+    (defaults are applied when the response is validated, not by the model).
+    """
+    schema = model.model_json_schema()
+    definitions: dict[str, Any] = schema.pop("$defs", {})
+
+    def resolve(node: Any, seen: tuple[str, ...]) -> Any:
+        if isinstance(node, list):
+            return [resolve(item, seen) for item in node]
+        if not isinstance(node, dict):
+            return node
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/$defs/"):
+            name = ref.removeprefix("#/$defs/")
+            if name in seen:
+                raise ValueError(f"{model.__name__}: recursive schema ({name}) is unsupported")
+            siblings = {k: v for k, v in node.items() if k != "$ref"}
+            return resolve({**definitions[name], **siblings}, (*seen, name))
+        out: dict[str, Any] = {}
+        for key, value in node.items():
+            if key == "default":
+                continue
+            if key == "properties" and isinstance(value, dict):
+                # Property names are data, not keywords: keep them all (even one named "default").
+                out[key] = {name: resolve(prop, seen) for name, prop in value.items()}
+            else:
+                out[key] = resolve(value, seen)
+        return out
+
+    resolved: dict[str, Any] = resolve(schema, ())
+    return resolved
+
+
 def _usage(usage: Any) -> LLMUsage:
     if usage is None:
         return LLMUsage()
@@ -143,12 +181,15 @@ def _usage(usage: Any) -> LLMUsage:
     def count(field: str) -> int:
         return int(getattr(usage, field, None) or 0)
 
+    input_tokens = count("total_input_tokens")
+    output_tokens = count("total_output_tokens")
+    reasoning_tokens = count("total_thought_tokens")
     return LLMUsage(
-        input_tokens=count("total_input_tokens"),
-        output_tokens=count("total_output_tokens"),
-        reasoning_tokens=count("total_thought_tokens"),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens,
         cached_input_tokens=count("total_cached_tokens"),
-        total_tokens=count("total_tokens"),
+        total_tokens=count("total_tokens") or input_tokens + output_tokens + reasoning_tokens,
     )
 
 

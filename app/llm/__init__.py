@@ -17,6 +17,7 @@ from app.llm.base import (
 )
 from app.llm.errors import (
     LLMAuthenticationError,
+    LLMBudgetExceededError,
     LLMConfigurationError,
     LLMError,
     LLMInvalidRequestError,
@@ -24,10 +25,11 @@ from app.llm.errors import (
     LLMResponseError,
     LLMUnavailableError,
 )
-from app.llm.factory import create_llm_provider, get_llm
+from app.llm.factory import LazyLLM, create_llm_provider, get_llm
 
 __all__ = [
     "LLMAuthenticationError",
+    "LLMBudgetExceededError",
     "LLMConfigurationError",
     "LLMError",
     "LLMInvalidRequestError",
@@ -38,6 +40,7 @@ __all__ = [
     "LLMResponseError",
     "LLMUnavailableError",
     "LLMUsage",
+    "LazyLLM",
     "ReasoningEffort",
     "StructuredResponse",
     "create_llm_provider",

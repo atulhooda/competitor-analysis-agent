@@ -8,14 +8,19 @@ The settings pattern — a pydantic-settings ``Settings`` class plus a cached
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
 import yaml
-from pydantic import Field, SecretStr, ValidationError, field_validator
+from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.errors import ConfigurationError
 from app.domain.competitors import CompetitorConfig, CompetitorsFile
+from app.domain.content import DEFAULT_EXCLUDED_TYPES, ContentType
+from app.domain.topics import TopicSeed, TopicsFile
+
+# Same values as app.llm.ReasoningEffort (not imported: app.llm imports this module).
+ReasoningLevel = Literal["minimal", "low", "medium", "high"]
 
 # Latest stable Gemini model at the time of writing (see README). Override with GEMINI_MODEL.
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
@@ -80,11 +85,49 @@ class Settings(BaseSettings):
     gemini_model: str = DEFAULT_GEMINI_MODEL
     llm_timeout_seconds: float = Field(default=120.0, gt=0)
     llm_max_retries: int = Field(default=2, ge=0, le=10)
+    # Per-route overrides (empty → GEMINI_MODEL): bulk per-page analysis vs. synthesis
+    # (competitor profiles, landscape reports, change summaries, topic consolidation).
+    gemini_analysis_model: str | None = None
+    gemini_synthesis_model: str | None = None
+    analysis_reasoning_effort: ReasoningLevel = "low"
+    synthesis_reasoning_effort: ReasoningLevel = "medium"
+    # Cost controls. Tokens are counted from Gemini's reported usage.
+    llm_max_tokens_per_run: int = Field(default=400_000, ge=1_000)
+    llm_daily_token_budget: int = Field(default=2_000_000, ge=0, description="0 = unlimited")
+
+    # ── Analysis (Phase 3) ───────────────────────────────────────────────────
+    topics_file: Path = Path("config/topics.yaml")
+    analysis_max_items_per_run: int = Field(default=40, ge=1, le=2_000)
+    analysis_batch_size: int = Field(default=6, ge=1, le=25)
+    analysis_batch_max_chars: int = Field(default=40_000, ge=2_000, le=400_000)
+    analysis_item_max_chars: int = Field(default=6_000, ge=500, le=100_000)
+    analysis_min_words: int = Field(default=80, ge=0)
+    # Homepage, pricing, product and landing pages carry meaning in few words.
+    analysis_min_words_positioning: int = Field(default=20, ge=0)
+    analysis_exclude_types: list[ContentType] = Field(
+        default_factory=lambda: sorted(DEFAULT_EXCLUDED_TYPES)
+    )
+    analysis_max_change_summaries_per_run: int = Field(default=10, ge=0, le=200)
+    analysis_taxonomy_prompt_limit: int = Field(default=150, ge=0, le=1_000)
 
     @field_validator("api_key", "gemini_api_key", mode="before")
     @classmethod
     def _blank_secret_is_unset(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
+
+    @model_validator(mode="after")
+    def _item_fits_in_a_batch(self) -> Self:
+        if self.analysis_item_max_chars > self.analysis_batch_max_chars:
+            raise ValueError("ANALYSIS_ITEM_MAX_CHARS must not exceed ANALYSIS_BATCH_MAX_CHARS")
+        return self
+
+    @property
+    def analysis_model(self) -> str:
+        return self.gemini_analysis_model or self.gemini_model
+
+    @property
+    def synthesis_model(self) -> str:
+        return self.gemini_synthesis_model or self.gemini_model
 
     @property
     def database_url_display(self) -> str:
@@ -129,3 +172,20 @@ def load_competitors(path: Path) -> list[CompetitorConfig]:
 
 def find_competitor(competitors: list[CompetitorConfig], slug: str) -> CompetitorConfig | None:
     return next((c for c in competitors if c.slug == slug), None)
+
+
+def load_topic_seeds(path: Path) -> list[TopicSeed]:
+    """Load and validate the optional seed taxonomy YAML file."""
+    if not path.exists():
+        raise ConfigurationError(
+            f"Topics file not found: {path}. "
+            "Copy config/topics.example.yaml to that path and edit it."
+        )
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise ConfigurationError(f"Invalid YAML in {path}: {exc}") from exc
+    try:
+        return TopicsFile.model_validate(data).topics
+    except ValidationError as exc:
+        raise ConfigurationError(f"Invalid topics file {path}:\n{exc}") from exc

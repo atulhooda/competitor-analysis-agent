@@ -1,6 +1,7 @@
 """Provider-independent LLM errors. Providers map their SDK errors onto these."""
 
 from app.core.errors import AppError, ConfigurationError, PermanentError, TransientError
+from app.llm.base import LLMUsage
 
 
 class LLMError(AppError):
@@ -28,4 +29,16 @@ class LLMUnavailableError(LLMError, TransientError):
 
 
 class LLMResponseError(LLMError, PermanentError):
-    """The response was unusable: failed or blocked, empty, or invalid structured output."""
+    """The response was unusable: failed or blocked, empty, or invalid structured output.
+
+    ``usage`` is set when the provider billed the call anyway (e.g. invalid JSON), so cost
+    tracking stays accurate.
+    """
+
+    def __init__(self, message: str, *, usage: LLMUsage | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage
+
+
+class LLMBudgetExceededError(LLMError, TransientError):
+    """A configured token budget (per run or per day) would be exceeded; no call was made."""

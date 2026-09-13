@@ -51,3 +51,19 @@ def test_price_change_detection() -> None:
     assert change.removed == ["$29"]
     assert change.added == ["$35"]
     assert change.as_details()["prices_after"] == ["$35", "$79"]
+
+
+def test_diff_excerpt_shows_only_changed_lines() -> None:
+    from app.services.change_detection import diff_excerpt
+
+    old = "Plans\nStarter costs $29 per month\nGrowth costs $79 per month\nFAQ"
+    new = "Plans\nStarter costs $39 per month\nGrowth costs $79 per month\nFAQ\nNew enterprise tier"
+    excerpt = diff_excerpt(old, new, max_chars=1_000)
+    assert excerpt.splitlines() == [
+        "- Starter costs $29 per month",
+        "+ Starter costs $39 per month",
+        "+ New enterprise tier",
+    ]
+    long = diff_excerpt("a\n" * 10, "b " * 2_000, max_chars=300)
+    assert len(long) <= 300
+    assert long.endswith("[…]")

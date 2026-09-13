@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 from app.domain.content import ContentType
 from app.domain.history import RunView
+from app.domain.intelligence import Landscape, LandscapeReportView
 from app.domain.scan import ScanResult
 
 
@@ -37,6 +38,39 @@ class CompetitorPatch(BaseModel):
     include_patterns: list[str] | None = None
     exclude_patterns: list[str] | None = None
     exclude_types: list[ContentType] | None = None
+
+
+class AnalysisRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    limit: int | None = Field(default=None, ge=1, le=500, description="Max pages this run")
+    reanalyze: bool = Field(default=False, description="Redo already-analyzed pages")
+    change_summaries: bool = True
+    profile: bool = True
+    force_profile: bool = Field(default=False, description="Regenerate even if unchanged")
+
+
+class RunResponse(BaseModel):
+    run: RunView
+
+
+class LandscapeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    window_days: int = Field(default=30, ge=7, le=365)
+    force: bool = Field(default=False, description="Regenerate even if the data is unchanged")
+
+
+class LandscapeResponse(BaseModel):
+    metrics: Landscape = Field(description="Computed now from the latest analyses")
+    report: LandscapeReportView | None = Field(description="The latest stored AI briefing")
+
+
+class TopicMergeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(description="Slug of the topic to fold in")
+    target: str = Field(description="Slug of the topic to keep")
 
 
 class DatabaseStatus(BaseModel):

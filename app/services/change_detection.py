@@ -87,6 +87,34 @@ def diff_texts(
     )
 
 
+def diff_excerpt(old_text: str, new_text: str, *, max_chars: int, max_line: int = 600) -> str:
+    """Removed ("- ") and added ("+ ") lines in page order, bounded to ``max_chars``.
+
+    The compact input for explaining a change: unchanged text is never repeated.
+    """
+    old_lines = [line.strip() for line in old_text.splitlines() if line.strip()]
+    new_lines = [line.strip() for line in new_text.splitlines() if line.strip()]
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+
+    def clip(line: str) -> str:
+        return line if len(line) <= max_line else line[: max_line - 1] + "…"
+
+    out: list[str] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "equal":
+            out.extend(f"- {clip(line)}" for line in old_lines[i1:i2])
+            out.extend(f"+ {clip(line)}" for line in new_lines[j1:j2])
+    kept: list[str] = []
+    size = 0
+    for line in out:
+        if size + len(line) + 1 > max_chars - 4:
+            kept.append("[…]")
+            break
+        kept.append(line)
+        size += len(line) + 1
+    return "\n".join(kept)
+
+
 def extract_prices(text: str) -> list[str]:
     """Distinct currency amounts in the text, normalized (whitespace removed), sorted."""
     return sorted({re.sub(r"\s+", "", match) for match in _PRICE.findall(text)})

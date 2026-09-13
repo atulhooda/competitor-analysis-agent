@@ -192,3 +192,35 @@ def test_request_validation() -> None:
         LLMRequest(prompt="  ")
     with pytest.raises(ValueError, match="max_output_tokens"):
         LLMRequest(prompt="x", max_output_tokens=0)
+
+
+class Subtopic(BaseModel):
+    name: str
+    weight: float = 0.5
+
+
+class TopicTree(BaseModel):
+    topics: list[Subtopic]
+    primary: Subtopic | None = None
+
+
+async def test_nested_schemas_are_sent_self_contained(provider: GeminiProvider) -> None:
+    with respx.mock() as router:
+        route = router.post(url__regex=INTERACTIONS).respond(
+            200, json=interaction('{"topics": [{"name": "AI agents"}], "primary": null}')
+        )
+        result = await provider.generate_structured(LLMRequest(prompt="Topics?"), TopicTree)
+    schema = json.loads(route.calls.last.request.content)["response_format"]["schema"]
+    assert "$defs" not in schema
+    assert "$ref" not in json.dumps(schema)
+    assert schema["properties"]["topics"]["items"]["properties"]["name"] == {"title": "Name", "type": "string"}  # fmt: skip
+    assert result.data.topics[0].weight == 0.5  # defaults are applied on validation
+
+
+async def test_invalid_structured_output_still_reports_billed_usage(provider: GeminiProvider) -> None:  # fmt: skip
+    with respx.mock() as router:
+        router.post(url__regex=INTERACTIONS).respond(200, json=interaction('{"name": 1'))
+        with pytest.raises(LLMResponseError) as caught:
+            await provider.generate_structured(LLMRequest(prompt="x"), Topic)
+    assert caught.value.usage is not None
+    assert caught.value.usage.total_tokens == 20

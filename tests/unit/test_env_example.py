@@ -24,10 +24,22 @@ def test_env_example_declares_the_gemini_settings() -> None:
 
 
 def test_env_example_contains_no_secret_values() -> None:
-    secret_names = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+    secret_words = {"KEY", "TOKEN", "SECRET", "PASSWORD", "URL"}  # URLs may embed credentials
     for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():
         if line.startswith("#") or "=" not in line:
             continue
         name, value = line.split("=", 1)
-        if any(part in name for part in secret_names):
+        if secret_words & set(name.split("_")):
             assert value == "", f"{name} must be an empty placeholder in .env.example"
+
+
+def test_env_example_documents_every_setting() -> None:
+    text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    internal = {"database_echo", "log_json"}
+    documented = {
+        name
+        for name in Settings.model_fields
+        if name not in internal and not name.startswith("crawler_")
+    }
+    missing = [n for n in sorted(documented) if not re.search(rf"^#? ?{n.upper()}=", text, re.MULTILINE)]  # fmt: skip
+    assert not missing, f"undocumented in .env.example: {missing}"

@@ -1,0 +1,35 @@
+# Optional seed taxonomy for AI analysis (Phase 3).
+#
+# Copy to config/topics.yaml (gitignored), edit, then run:
+#   uv run python -m app topics import
+#
+# Seeds are not required: the analyzer creates topics as it meets new subjects, and is
+# shown the existing taxonomy so it reuses names. Seeding anchors the names you prefer
+# and maps known synonyms up front. Aliases and subtopic names are matched after
+# normalization (case, punctuation, plurals, common abbreviations), so "AI-Agents" and
+# "Artificial intelligence agents" both resolve to "AI agents".
+topics:
+  - name: AI agents
+    description: Autonomous or semi-autonomous AI systems that complete tasks.
+    aliases: [Agentic AI, Autonomous agents, AI assistants]
+    subtopics: [Agent evaluation, Multi-agent orchestration, Human handoff]
+
+  - name: Customer support
+    aliases: [Customer service, Help desk, Support operations]
+    subtopics: [Ticket automation, Self-service, Support metrics]
+
+  - name: Marketing automation
+    aliases: [Marketing workflows]
+
+  - name: Analytics
+    aliases: [Product analytics, Reporting]
+
+  - name: Pricing
+    aliases: [Pricing strategy]
+    subtopics: [Usage-based pricing, Per-seat pricing]
+
+  - name: Data privacy
+    aliases: [Privacy, GDPR compliance]
+
+  - name: Product updates
+    aliases: [Release notes, Product announcements]

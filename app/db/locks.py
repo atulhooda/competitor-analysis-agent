@@ -1,26 +1,35 @@
-"""Postgres advisory locks: at most one scan per competitor, across processes.
+"""Postgres advisory locks: one scan, one analysis per competitor, one landscape report.
 
 No Redis needed. A session-level lock lives exactly as long as the connection that holds
-it, so a crashed process can never leave a competitor locked.
+it, so a crashed process can never leave anything locked.
 """
 
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 _SCAN_NAMESPACE = 72_001
+_ANALYSIS_NAMESPACE = 72_002
+_LANDSCAPE_NAMESPACE = 72_003
+# 72_010 is the taxonomy's transaction-level lock (app.services.topics).
 
 
 def scan_lock_key(competitor_id: int) -> int:
     return (_SCAN_NAMESPACE << 32) | competitor_id
 
 
+def analysis_lock_key(competitor_id: int) -> int:
+    return (_ANALYSIS_NAMESPACE << 32) | competitor_id
+
+
+LANDSCAPE_LOCK_KEY = (_LANDSCAPE_NAMESPACE << 32) | 1
+
+
 @asynccontextmanager
-async def competitor_scan_lock(engine: AsyncEngine, competitor_id: int) -> AsyncIterator[bool]:
-    """Try to take the competitor's scan lock; yields whether it was acquired (never waits)."""
-    key = scan_lock_key(competitor_id)
+async def try_advisory_lock(engine: AsyncEngine, key: int) -> AsyncIterator[bool]:
+    """Try to take a session-level lock; yields whether it was acquired (never waits)."""
     async with engine.connect() as connection:
         conn = await connection.execution_options(isolation_level="AUTOCOMMIT")
         acquired = bool(
@@ -31,3 +40,15 @@ async def competitor_scan_lock(engine: AsyncEngine, competitor_id: int) -> Async
         finally:
             if acquired:
                 await conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
+
+
+def competitor_scan_lock(engine: AsyncEngine, competitor_id: int) -> AbstractAsyncContextManager[bool]:  # fmt: skip
+    return try_advisory_lock(engine, scan_lock_key(competitor_id))
+
+
+def competitor_analysis_lock(engine: AsyncEngine, competitor_id: int) -> AbstractAsyncContextManager[bool]:  # fmt: skip
+    return try_advisory_lock(engine, analysis_lock_key(competitor_id))
+
+
+def landscape_lock(engine: AsyncEngine) -> AbstractAsyncContextManager[bool]:
+    return try_advisory_lock(engine, LANDSCAPE_LOCK_KEY)

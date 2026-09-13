@@ -18,7 +18,7 @@ from app.db.session import create_engine as create_async_db_engine
 from app.llm import get_llm
 from tests.fakesite import FakeClock, make_settings, public_resolver
 
-_SETTINGS_PREFIXES = ("CRAWLER_", "LLM_", "GEMINI_", "GOOGLE_", "DATABASE_")
+_SETTINGS_PREFIXES = ("CRAWLER_", "LLM_", "GEMINI_", "GOOGLE_", "DATABASE_", "ANALYSIS_", "SYNTHESIS_")  # fmt: skip
 _SETTINGS_NAMES = {
     "API_KEY",
     "APP_ENV",
@@ -26,6 +26,7 @@ _SETTINGS_NAMES = {
     "LOG_JSON",
     "COMPETITORS_FILE",
     "STORE_RAW_HTML",
+    "TOPICS_FILE",
 }
 
 TEST_DATABASE_URL = os.environ.get(
@@ -33,7 +34,9 @@ TEST_DATABASE_URL = os.environ.get(
 )
 _DB_UNAVAILABLE = "PostgreSQL is not reachable"
 _TABLES = (
-    "competitors, runs, run_events, raw_documents, content_items, content_versions, change_events"
+    "competitors, runs, run_events, raw_documents, content_items, content_versions, "
+    "change_events, topics, topic_aliases, content_analyses, content_analysis_topics, "
+    "change_summaries, competitor_profiles, landscape_reports, llm_calls"
 )
 
 
@@ -63,7 +66,7 @@ def _is_loopback(host: Any) -> bool:
 def _no_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     """No real websites and no real Gemini calls in tests. Only loopback (the test database)
     is allowed; HTTP is mocked with respx, which intercepts before any socket is opened."""
-    if request.node.get_closest_marker("live"):
+    if request.node.get_closest_marker("live") or request.node.get_closest_marker("llm_live"):
         return
     real_connect, real_connect_ex, real_getaddrinfo = (
         socket.socket.connect,
