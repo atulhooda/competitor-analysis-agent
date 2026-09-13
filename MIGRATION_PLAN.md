@@ -710,6 +710,11 @@ At every phase: run the tests → run the app → verify against real inputs →
   - pgvector is still not needed: normalization is key + alias + taxonomy-in-prompt + reviewed merges.
 - **Date rule.** Trends compare windows on reliable publication dates only. Competitors whose captured, dated history doesn't reach the previous window are reported as `insufficient_history` rather than rising: scans capture newest first.
 - **Run bookkeeping fix (also applies to scans).** A queued run less than 5 minutes old is treated as starting, not abandoned. Before, a second request could fail a queued run whose task hadn't yet taken its lock.
+- **Live verification with Gemini** (PostHog and Plausible, 43 pages, `gemini-3.8-flash`, ~214k tokens total, 0 failed calls). It led to prompt version 2 of all five prompts:
+  - Profiles and landscape briefings filled only their first few fields when fields were optional in the schema. Every property is now marked required in the schema sent to Gemini (validation stays lenient), and the prompts say to fill every field the evidence supports. Afterwards all profile fields were filled with cited evidence (0 dropped), and every landscape section was present (0 dropped findings).
+  - One batch returned 1 of 6 documents (recovered by the retry). The prompt now lists the expected document ids; on the re-run every batch returned every document.
+  - Taxonomy reuse held: the re-run created 1 new topic across 43 pages. Consolidation proposed exactly the two true duplicates ("Data warehousing" → "Data warehouse", "Software development" → "Software engineering").
+  - Dry-run token estimates were within about 5% of actual usage.
 - **Scope kept out:** opportunity scoring and recommendations (Phase 4); any generation or publishing.
 
 ### Phase 4 — Opportunity detection

@@ -172,7 +172,7 @@ async def test_analysis_stores_validated_analyses_with_normalized_topics(scanned
             .where(ContentItem.url == f"{BASE}/blog/ai-support-agents")
         )
         assert row is not None
-        assert (row.method, row.model, row.analyzer_version) == ("llm", "gemini-3.8-flash", "content-analysis/1")  # fmt: skip
+        assert (row.method, row.model, row.analyzer_version) == ("llm", "gemini-3.8-flash", "content-analysis/2")  # fmt: skip
         assert row.content_format == "article"
         assert row.target_audiences == ["Customer support teams", "founders"]  # deduplicated
         assert len(row.input_hash) == 64

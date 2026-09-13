@@ -197,7 +197,7 @@ def test_analysis_commands(configured: Path, monkeypatch: pytest.MonkeyPatch, tm
     item_id = json.loads(runner.invoke(cli, ["content", "acme", "--json", "--search", "Support Agents"]).stdout)[0]["id"]  # fmt: skip
     analysis = runner.invoke(cli, ["analysis", str(item_id)])
     assert analysis.exit_code == 0, analysis.output
-    assert "content-analysis/1" in analysis.output
+    assert "content-analysis/2" in analysis.output
     assert "Human handoff" in analysis.output
     assert runner.invoke(cli, ["analysis", "999999"]).exit_code == 2
 

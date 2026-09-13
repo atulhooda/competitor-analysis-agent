@@ -140,9 +140,13 @@ class GeminiProvider:
 def gemini_schema(model: type[BaseModel]) -> dict[str, Any]:
     """The model's JSON Schema, made self-contained for Gemini structured output.
 
-    Pydantic emits nested models as ``$defs`` + ``$ref``. They are inlined here so the
-    request doesn't depend on reference support, and ``default`` keywords are dropped
-    (defaults are applied when the response is validated, not by the model).
+    - Nested models (``$defs`` + ``$ref``) are inlined, so the request doesn't depend on
+      reference support.
+    - Every property is marked required. With optional properties Gemini tends to fill the
+      first few and skip the rest; required-but-nullable makes it decide on each one (a
+      value, ``null`` or ``[]``). Defaults still apply when the response is validated, so
+      what we *accept* stays lenient.
+    - ``default`` keywords are dropped for the same reason.
     """
     schema = model.model_json_schema()
     definitions: dict[str, Any] = schema.pop("$defs", {})
@@ -166,7 +170,8 @@ def gemini_schema(model: type[BaseModel]) -> dict[str, Any]:
             if key == "properties" and isinstance(value, dict):
                 # Property names are data, not keywords: keep them all (even one named "default").
                 out[key] = {name: resolve(prop, seen) for name, prop in value.items()}
-            else:
+                out["required"] = list(value)
+            elif key != "required":
                 out[key] = resolve(value, seen)
         return out
 

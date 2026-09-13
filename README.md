@@ -302,7 +302,8 @@ topics = await llm.generate_structured(LLMRequest(prompt="..."), TopicList)  # a
 | `LLM_MAX_RETRIES` | No | `2` | SDK retries for 429/5xx/timeouts |
 
 - Structured outputs: every prompt's Pydantic schema is sent as a self-contained JSON Schema
-  (nested models are inlined), and the reply is validated before use.
+  (nested models inlined, every field marked required so the model fills or explicitly nulls
+  each one), and the reply is validated before use.
 - Prompts live in [`app/prompts/`](app/prompts/), each with a `VERSION`, and that version is
   stored on everything it produces. Changing a prompt means bumping its version: pages then
   become pending again and are re-analyzed gradually, within the per-run limit.

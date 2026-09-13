@@ -1,5 +1,6 @@
 """Per-page content analysis: a batch of competitor pages → one structured analysis each."""
 
+import re
 from collections.abc import Sequence
 from typing import Annotated
 
@@ -24,7 +25,8 @@ from app.prompts.fields import (
 )
 from app.services.topics import TaxonomyEntry
 
-VERSION = "content-analysis/1"
+VERSION = "content-analysis/2"
+_DOCUMENT_ID = re.compile(r'<document id="([^"]+)">')
 
 SYSTEM = """\
 You are a competitive-intelligence analyst. You receive pages captured from a competitor's \
@@ -161,7 +163,8 @@ def render(
         "",
         f"Competitor: {competitor} ({website})",
         "",
-        f"Analyze the following {len(documents)} document(s).",
+        f"Analyze the following {len(documents)} document(s). Return exactly one analysis for "
+        f"each of: {', '.join(ref for doc in documents for ref in _DOCUMENT_ID.findall(doc)[:1])}.",
         "",
         *documents,
     ]

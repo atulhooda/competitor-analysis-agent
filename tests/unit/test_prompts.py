@@ -219,3 +219,39 @@ def test_gemini_schemas_use_only_json_schema_keywords(schema: type[BaseModel]) -
         return set()
 
     assert walk(gemini_schema(schema)) == set()
+
+
+@pytest.mark.parametrize("schema", SCHEMAS, ids=lambda s: s.__name__)
+def test_every_property_is_required_so_the_model_decides_on_each(schema: type[BaseModel]) -> None:
+    def check(node: object) -> None:
+        if isinstance(node, dict):
+            if "properties" in node:
+                assert set(node["required"]) == set(node["properties"])
+            for key, value in node.items():
+                if key == "properties":
+                    for prop in value.values():
+                        check(prop)
+                else:
+                    check(value)
+        elif isinstance(node, list):
+            for item in node:
+                check(item)
+
+    check(gemini_schema(schema))
+
+
+def test_optional_fields_still_validate_when_omitted() -> None:
+    # Required in the request, lenient on the way back: defaults still apply.
+    out = competitor_profile.CompetitorProfileOut.model_validate({"confidence": 0.5})
+    assert out.tagline is None
+    assert out.key_features == []
+
+
+def test_the_analyzer_is_told_which_documents_to_answer() -> None:
+    rendered = content_analysis.render(
+        competitor="Acme",
+        website="w",
+        taxonomy=[],
+        documents=['<document id="D1">\na\n</document>', '<document id="D2">\nb\n</document>'],
+    )
+    assert "Return exactly one analysis for each of: D1, D2." in rendered

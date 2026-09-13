@@ -7,7 +7,7 @@ from pydantic import AfterValidator, BaseModel, Field
 
 from app.prompts.fields import cap, truncate
 
-VERSION = "topic-consolidation/1"
+VERSION = "topic-consolidation/2"
 
 SYSTEM = """\
 You maintain the topic taxonomy of a competitive content analysis system. Find topics that \

@@ -6,7 +6,7 @@ from pydantic import AfterValidator, BaseModel, Field
 
 from app.prompts.fields import cap, truncate
 
-VERSION = "landscape/1"
+VERSION = "landscape/2"
 
 SYSTEM = """\
 You are a competitive-intelligence analyst. You write a cross-competitor briefing from \
@@ -37,6 +37,8 @@ topic slugs.
 - format_trends: how content formats are used and shifting.
 - notable_changes: significant recent changes worth knowing.
 Each finding: text (at most 60 words), the topic slugs and competitor slugs it rests on.
+Fill every field the data supports; use [] only when the data has nothing for it. Give a \
+positioning entry for every competitor listed, and cover the neglected topics listed.
 """
 
 

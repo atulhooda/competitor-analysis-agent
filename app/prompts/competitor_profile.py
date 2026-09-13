@@ -13,7 +13,7 @@ from pydantic import AfterValidator, BaseModel, Field
 
 from app.prompts.fields import Label, Score, cap, optional_text, texts, truncate
 
-VERSION = "competitor-profile/1"
+VERSION = "competitor-profile/2"
 
 SYSTEM = """\
 You write an evidence-based profile of one competitor for a competitive-intelligence team.
@@ -33,6 +33,9 @@ inputs don't state. When something is unknown, leave the field empty (null or []
 ["E2", "E5"] or ["C1"]. Statements without valid evidence are discarded.
 - Quote prices exactly as the pricing page states them.
 - Be specific and neutral. Describe; don't recommend.
+- Fill every field the evidence supports. Use null or [] only when no item supports it. The \
+homepage, product and pricing pages usually support the tagline, description, positioning, \
+features, differentiators and pricing.
 
 Fields:
 - tagline: their main slogan or value proposition, as stated.

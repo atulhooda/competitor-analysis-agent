@@ -7,7 +7,7 @@ from pydantic import AfterValidator, BaseModel, BeforeValidator, Field
 from app.domain.analysis import ChangeCategory, Significance
 from app.prompts.fields import lenient_enum, texts, truncate
 
-VERSION = "change-summary/1"
+VERSION = "change-summary/2"
 
 SYSTEM = """\
 You explain changes to a competitor's web page for a competitive-intelligence team.
