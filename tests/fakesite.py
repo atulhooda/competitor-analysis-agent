@@ -184,8 +184,19 @@ SITEMAP_ARCHIVE = f"""<?xml version="1.0" encoding="UTF-8"?>
 </urlset>"""
 
 
-def mount_site(router: respx.MockRouter, *, robots: str = ROBOTS_TXT) -> dict[str, respx.Route]:
-    """Register every acme.test URL on ``router``; returns routes keyed by path."""
+def mount_site(
+    router: respx.MockRouter,
+    *,
+    robots: str = ROBOTS_TXT,
+    feed: str | None = None,
+    sitemap_posts: str | None = None,
+    pages: dict[str, str | int] | None = None,
+) -> dict[str, respx.Route]:
+    """Register every acme.test URL on ``router``; returns routes keyed by path.
+
+    ``feed``/``sitemap_posts`` replace those documents; ``pages`` maps a path to replacement
+    HTML or to an HTTP status code (e.g. 404), to simulate a site changing between scans.
+    """
     routes: dict[str, respx.Route] = {}
 
     def html(path: str, body: str) -> None:
@@ -198,9 +209,9 @@ def mount_site(router: respx.MockRouter, *, robots: str = ROBOTS_TXT) -> dict[st
 
     routes["/robots.txt"] = router.get(BASE + "/robots.txt").respond(200, text=robots)
     html("/", HOME_HTML)
-    xml("/blog/feed.xml", FEED_XML, "application/rss+xml; charset=utf-8")
+    xml("/blog/feed.xml", feed or FEED_XML, "application/rss+xml; charset=utf-8")
     xml("/sitemap_index.xml", SITEMAP_INDEX)
-    xml("/sitemap-posts.xml", SITEMAP_POSTS)
+    xml("/sitemap-posts.xml", sitemap_posts or SITEMAP_POSTS)
     xml("/sitemap-pages.xml", SITEMAP_PAGES)
     xml("/sitemap-archive.xml", SITEMAP_ARCHIVE)
     html(
@@ -241,4 +252,31 @@ def mount_site(router: respx.MockRouter, *, robots: str = ROBOTS_TXT) -> dict[st
     html("/careers", simple_page("Careers", _PARAGRAPH))
     html("/legal/privacy", simple_page("Privacy", _PARAGRAPH))
     html("/private/internal-post", simple_page("Internal", "This must never be requested."))
+    for path, replacement in (pages or {}).items():
+        if isinstance(replacement, int):
+            routes[path] = router.get(BASE + path).respond(replacement)
+        else:
+            html(path, replacement)
     return routes
+
+
+def feed_with(*items: tuple[str, str, str]) -> str:
+    """The standard feed plus extra (path, title, RFC 822 pubDate) items at the top."""
+    extra = "".join(
+        f"<item><title>{title}</title><link>{BASE}{path}</link><pubDate>{date}</pubDate></item>"
+        for path, title, date in items
+    )
+    return FEED_XML.replace(
+        "<link>https://acme.test/blog</link>", f"<link>{BASE}/blog</link>{extra}", 1
+    )
+
+
+def sitemap_posts_with(lastmods: dict[str, str], extra_urls: tuple[str, ...] = ()) -> str:
+    """The standard posts sitemap with some lastmod values changed and extra URLs added."""
+    body = SITEMAP_POSTS
+    for path, lastmod in lastmods.items():
+        start = body.index(f"<loc>{BASE}{path}</loc>")
+        end = body.index("</url>", start)
+        body = body[:start] + f"<loc>{BASE}{path}</loc><lastmod>{lastmod}</lastmod>" + body[end:]
+    extra = "".join(f"<url><loc>{BASE}{path}</loc></url>" for path in extra_urls)
+    return body.replace("</urlset>", f"{extra}</urlset>")

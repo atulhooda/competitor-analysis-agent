@@ -1,14 +1,15 @@
-"""FastAPI dependencies: settings, API-key auth, services."""
+"""FastAPI dependencies: settings, API-key auth, database sessions, services."""
 
+from collections.abc import AsyncIterator
 from secrets import compare_digest
 from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import Settings, load_competitors
-from app.core.errors import ConfigurationError
-from app.domain.competitors import CompetitorConfig
-from app.services.monitoring import MonitoringService
+from app.config import Settings
+from app.db.session import SessionFactory
+from app.services.scans import ScanService
 
 
 def get_app_settings(request: Request) -> Settings:
@@ -41,13 +42,18 @@ def require_api_key(
         )
 
 
-def get_competitors(settings: SettingsDep) -> list[CompetitorConfig]:
-    try:
-        return load_competitors(settings.competitors_file)
-    except ConfigurationError as exc:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from exc
+async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
+    sessions: SessionFactory = request.app.state.sessions
+    async with sessions() as session:
+        yield session
 
 
-def get_monitoring_service(request: Request) -> MonitoringService:
-    service: MonitoringService = request.app.state.monitoring
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+
+def get_scan_service(request: Request) -> ScanService:
+    service: ScanService = request.app.state.scans
     return service
+
+
+ScanServiceDep = Annotated[ScanService, Depends(get_scan_service)]

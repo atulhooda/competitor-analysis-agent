@@ -22,6 +22,7 @@ DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 DEFAULT_USER_AGENT = (
     "CompetitorMonitorBot/0.1 (+https://github.com/atulhooda/competitor-analysis-agent)"
 )
+DEFAULT_DATABASE_URL = "postgresql+psycopg://postgres@127.0.0.1:5433/competitor_agent"
 
 
 class Settings(BaseSettings):
@@ -42,6 +43,15 @@ class Settings(BaseSettings):
     )
     competitors_file: Path = Path("config/competitors.yaml")
 
+    # ── Database (Phase 2) ───────────────────────────────────────────────────
+    # The default matches docker-compose.yml: local-only Postgres without a password.
+    # Production URLs carry credentials, hence SecretStr (never logged or printed).
+    database_url: SecretStr = SecretStr(DEFAULT_DATABASE_URL)
+    database_echo: bool = False
+    store_raw_html: bool = Field(
+        default=True, description="Keep the raw HTML of every captured content version"
+    )
+
     # ── Crawler (Phase 1; deterministic, no LLM) ─────────────────────────────
     crawler_user_agent: str = DEFAULT_USER_AGENT
     crawler_min_delay_seconds: float = Field(default=3.0, ge=1.0)
@@ -60,6 +70,10 @@ class Settings(BaseSettings):
     crawler_allow_private_networks: bool = Field(
         default=False, description="Disables the SSRF guard. Local testing only."
     )
+    # Incremental scans (Phase 2): pages already captured are only re-fetched when a feed
+    # or sitemap reports a newer date, plus this small budget of stale pages per scan.
+    crawler_revisit_limit: int = Field(default=5, ge=0, le=100)
+    crawler_revisit_after_days: float = Field(default=7.0, gt=0)
 
     # ── LLM: Google Gemini (primary provider; first used in Phase 3) ─────────
     gemini_api_key: SecretStr | None = None
@@ -71,6 +85,13 @@ class Settings(BaseSettings):
     @classmethod
     def _blank_secret_is_unset(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
+
+    @property
+    def database_url_display(self) -> str:
+        """The database URL with any password masked, safe to print."""
+        from sqlalchemy.engine import make_url
+
+        return make_url(self.database_url.get_secret_value()).render_as_string(hide_password=True)
 
     @property
     def llm_configured(self) -> bool:

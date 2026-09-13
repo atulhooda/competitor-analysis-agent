@@ -5,6 +5,7 @@
 **Revision history**
 - r1 (2026-09-13): initial analysis and plan.
 - r2 (2026-09-13): **the primary LLM provider changed from Anthropic to Google Gemini**, at the owner's request. Gemini is the only LLM provider; no other provider is introduced unless the owner explicitly asks. Phase 1 stays deterministic (no LLM calls) and only establishes the provider-agnostic LLM interface and Gemini configuration.
+- r3 (2026-09-13): Phase 1 approved. Phase 2 (persisted history) implemented; see the implementation notes under §12, Phase 2.
 
 The three source repositories were cloned to a temporary scratch directory for analysis only. They are not vendored, submoduled, or left beside the project.
 
@@ -642,6 +643,34 @@ At every phase: run the tests → run the app → verify against real inputs →
 - Competitors are seeded from YAML.
 - Versioning with text hashes, and change events (`new` / `updated` / `removed` / `pricing_changed`).
 - Run history, and the query API ("what did X publish this week?").
+
+**Implemented (2026-09-13). What was built, and where it differs from §7:**
+- **Stack.**
+  - PostgreSQL 16, SQLAlchemy 2 (async) with psycopg 3, and Alembic.
+  - A single migration, `0001`, that is verified against the models and reversible (both are tested).
+  - `docker-compose.yml` runs the `pgvector/pgvector:pg16` image bound to `127.0.0.1:5433` with passwordless local access, so there are no credentials in the repo.
+- **Tables.**
+  - `competitors`, `runs`, `run_events`, `raw_documents`, `content_items`, `content_versions`, `change_events`.
+  - Status and type values are guarded by CHECK constraints rather than Postgres ENUM types, so adding a value later is a simple migration.
+- **Deferred from §7:**
+  - A `sources` table: competitor options are stored as validated JSON on `competitors`. Revisit in Phase 9, when social accounts need per-source state.
+  - A per-attempt `fetches` table: skipped URLs and errors go to `run_events`, and raw HTML is stored per captured version. Neither table had a consumer yet.
+- **Incremental scans.**
+  - Every in-scope discovered URL is persisted.
+  - A captured page is re-fetched only when a feed or sitemap date is newer than the last fetch, via conditional GET, or from a small revisit budget of stale pages.
+  - New content keeps first priority.
+- **Change semantics.**
+  - Change types are `new`, `updated` (with an `is_minor` flag from a word-level diff), `pricing_changed`, `removed` (only on 404/410, never on absence from a sitemap) and `restored`.
+  - Redirect and canonical aliases get status `duplicate`.
+  - A competitor's first scan is a **baseline**: it is recorded without `new` events.
+- **Date rule** (unchanged from Phase 1 and enforced in storage).
+  - `published_at` comes only from reliable sources and records its source. A less trusted source never overwrites a more trusted one.
+  - `first_seen_at` and `sitemap_lastmod` are never used as publication dates.
+- **Concurrency.**
+  - One scan per competitor, enforced by a Postgres advisory lock.
+  - A run abandoned by a crashed process is detected (its lock is free) and marked failed.
+  - No database transaction is held open during the crawl.
+- **API change.** `POST /api/v1/competitors/{slug}/scan` (Phase 1) became `POST /api/v1/competitors/{slug}/scans`: a background run with a pollable run ID, or `?wait=true` to run synchronously.
 
 ### Phase 3 — Competitor analysis
 - First Gemini calls through `app/llm`: structured outputs, per-route model and reasoning effort, usage tracking, and cost controls.

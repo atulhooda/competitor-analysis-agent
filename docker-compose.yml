@@ -1,0 +1,29 @@
+# Local development database. NOT for production.
+#
+#   docker compose up -d db            # start PostgreSQL 16
+#   uv run python -m app db upgrade    # create/upgrade the schema
+#
+# Passwordless ("trust") access is safe here only because the port is bound to
+# 127.0.0.1: nothing outside this machine can connect. Production uses a managed
+# PostgreSQL with credentials supplied through DATABASE_URL.
+# The pgvector image is used so vector search can be enabled later with a migration
+# (MIGRATION_PLAN.md §7.2); nothing uses it yet.
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: competitor_agent
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d competitor_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:

@@ -69,3 +69,11 @@ def test_invalid_files_fail_with_useful_messages(tmp_path: Path, body: str, mess
 def test_missing_file_explains_how_to_fix(tmp_path: Path) -> None:
     with pytest.raises(ConfigurationError, match=r"competitors\.example\.yaml"):
         load_competitors(tmp_path / "nope.yaml")
+
+
+def test_database_url_is_secret_and_displayed_masked() -> None:
+    from tests.fakesite import make_settings
+
+    settings = make_settings(database_url="postgresql+psycopg://app:s3cret@db.internal:5432/intel")
+    assert "s3cret" not in repr(settings)
+    assert settings.database_url_display == "postgresql+psycopg://app:***@db.internal:5432/intel"

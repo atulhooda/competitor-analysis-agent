@@ -2,9 +2,11 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
-from app.domain.competitors import CompetitorConfig
+from app.domain.content import ContentType
+from app.domain.history import RunView
+from app.domain.scan import ScanResult
 
 
 class ScanRequest(BaseModel):
@@ -13,24 +15,36 @@ class ScanRequest(BaseModel):
     include_text: bool = False
 
 
-class CompetitorOut(BaseModel):
-    slug: str
-    name: str
-    website: str
-    feeds: list[str]
-    sitemaps: list[str]
-    tracked_pages: list[str]
+class ScanRunResponse(BaseModel):
+    run: RunView
+    result: ScanResult | None = Field(
+        default=None, description="Present when the scan ran synchronously (?wait=true)"
+    )
 
-    @classmethod
-    def from_config(cls, competitor: CompetitorConfig) -> "CompetitorOut":
-        return cls(
-            slug=competitor.slug,
-            name=competitor.name,
-            website=str(competitor.website),
-            feeds=[str(u) for u in competitor.feeds],
-            sitemaps=[str(u) for u in competitor.sitemaps],
-            tracked_pages=[str(u) for u in competitor.tracked_pages],
-        )
+
+class CompetitorPatch(BaseModel):
+    """Partial update. Omitted fields are left unchanged; the slug cannot change."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    website: HttpUrl | None = None
+    active: bool | None = None
+    feeds: list[HttpUrl] | None = None
+    sitemaps: list[HttpUrl] | None = None
+    tracked_pages: list[HttpUrl] | None = None
+    allowed_domains: list[str] | None = None
+    include_patterns: list[str] | None = None
+    exclude_patterns: list[str] | None = None
+    exclude_types: list[ContentType] | None = None
+
+
+class DatabaseStatus(BaseModel):
+    reachable: bool
+    revision: str | None = None
+    head: str | None = None
+    up_to_date: bool = False
+    error: str | None = None
 
 
 class LLMStatus(BaseModel):
@@ -43,6 +57,7 @@ class LLMStatus(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    status: Literal["ok"] = "ok"
+    status: Literal["ok", "degraded"]
     version: str
+    database: DatabaseStatus
     llm: LLMStatus

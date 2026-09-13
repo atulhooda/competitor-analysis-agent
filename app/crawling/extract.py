@@ -12,7 +12,10 @@ from app.crawling.html import PageSignals, scan_html
 from app.domain.content import DateSource
 
 THIN_PAGE_WORDS = 50
+EXTRACTOR_VERSION = f"trafilatura-{trafilatura.__version__}/extract-v2"
 _WORD = re.compile(r"\w+")
+_HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+_MAX_HEADINGS = 200
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,7 @@ class ExtractedPage:
     content_hash: str | None
     is_thin: bool
     signals: PageSignals
+    headings: tuple[tuple[int, str], ...] = ()
 
 
 def extract_page(html: str, url: str) -> ExtractedPage:
@@ -63,7 +67,20 @@ def extract_page(html: str, url: str) -> ExtractedPage:
         content_hash=hashlib.sha256(normalized.encode()).hexdigest() if normalized else None,
         is_thin=word_count < THIN_PAGE_WORDS,
         signals=signals,
+        headings=markdown_headings(text),
     )
+
+
+def markdown_headings(text: str) -> tuple[tuple[int, str], ...]:
+    """(level, text) for each Markdown heading in the extracted main text."""
+    headings = []
+    for line in text.splitlines():
+        match = _HEADING.match(line.strip())
+        if match:
+            headings.append((len(match.group(1)), match.group(2).strip()))
+            if len(headings) >= _MAX_HEADINGS:
+                break
+    return tuple(headings)
 
 
 def _publication_date(
