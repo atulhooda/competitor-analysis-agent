@@ -1,0 +1,36 @@
+# Competitors to monitor. Copy to config/competitors.yaml (gitignored) and edit.
+#
+# Only `slug`, `name` and `website` are required. Feeds and sitemaps are discovered
+# automatically (robots.txt, <link rel="alternate">, conventional paths) when omitted.
+#
+# Before monitoring a site, review its Terms of Service. The crawler always obeys
+# robots.txt, identifies itself honestly, rate-limits itself, and never bypasses
+# logins, CAPTCHAs or other access controls.
+
+competitors:
+  - slug: example-competitor          # lowercase letters, digits and hyphens
+    name: Example Competitor Inc.
+    website: https://www.example.com
+
+    # Optional: fetched on every scan (pricing, product and messaging pages).
+    tracked_pages:
+      - https://www.example.com/pricing
+
+    # Optional: set these if auto-discovery misses them.
+    # feeds:
+    #   - https://www.example.com/blog/rss.xml
+    # sitemaps:
+    #   - https://www.example.com/sitemap_index.xml
+
+    # Optional: extra in-scope hosts, e.g. a blog on a different domain.
+    # allowed_domains:
+    #   - example-blog.com
+
+    # Optional URL filters (Python regular expressions, matched anywhere in the URL).
+    # include_patterns: ["/blog/", "/customers/"]
+    # exclude_patterns: ["/tag/", "/author/", "\\?replytocom="]
+
+    # Optional: content types to ignore. Default: [listing, careers, legal].
+    # Types: homepage, blog_post, pricing, case_study, product, landing_page,
+    #        resource, docs, changelog, press, listing, careers, legal, other
+    # exclude_types: [listing, careers, legal, docs]
