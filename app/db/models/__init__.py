@@ -10,7 +10,9 @@
                OpportunityEvent (content opportunities; Phase 4)
 - generation:  Article, ArticleStepRun, ArticleVersion, ArticleSource, ArticleCitation
                (article drafts; Phase 5), ArticleClaimCheck, ArticleOriginalityFlag,
-               ArticleQualityReport (validation; Phase 6). Never published
+               ArticleQualityReport (validation; Phase 6)
+- publishing:  ArticleApproval, Publication, PublicationAttempt (Phase 7: approved, ready
+               versions only; drafts by default)
 - ops:         Run, RunEvent, LLMCall (what ran, when, what happened, what it cost)
 
 LLM output lives in the analysis layer, in assessments' ``interpretation`` and in the
@@ -40,6 +42,7 @@ from app.db.models.article import (
 from app.db.models.config import CompanyProfileVersion, Competitor
 from app.db.models.content import ChangeEvent, ContentItem, ContentVersion
 from app.db.models.ops import LLMCall, Run, RunEvent
+from app.db.models.publishing import ArticleApproval, Publication, PublicationAttempt
 from app.db.models.raw import RawDocument
 from app.db.models.recommendation import (
     Opportunity,
@@ -50,6 +53,7 @@ from app.db.models.recommendation import (
 
 __all__ = [
     "Article",
+    "ArticleApproval",
     "ArticleCitation",
     "ArticleClaimCheck",
     "ArticleOriginalityFlag",
@@ -72,6 +76,8 @@ __all__ = [
     "OpportunityAssessment",
     "OpportunityEvent",
     "OpportunityEvidence",
+    "Publication",
+    "PublicationAttempt",
     "RawDocument",
     "Run",
     "RunEvent",

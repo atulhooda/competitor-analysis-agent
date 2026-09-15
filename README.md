@@ -4,13 +4,13 @@ An AI-powered competitor intelligence and content generation agent. It monitors 
 websites (and later their social channels), keeps a history of what they publish, finds content
 opportunities, and generates and publishes original blog posts.
 
-> **Status: Phase 6 of 10: article validation.** Scans are deterministic and stored in
-> PostgreSQL; Gemini analyzes what competitors publish (Phase 3); opportunities are scored
+> **Status: Phase 7 of 10: publishing.** Scans are deterministic and stored in PostgreSQL;
+> Gemini analyzes what competitors publish (Phase 3); opportunities are scored
 > deterministically (Phase 4); an **approved** opportunity becomes a researched, cited, edited
-> draft (Phase 5). Phase 6 fact-checks the draft against its sources, measures its similarity
-> to competitor pages, builds its SEO package, scores it and revises it within a bound, ending
-> `ready` or `needs_review`. **Phase 6 validates and prepares articles but does not publish
-> them**: nothing is sent to a CMS, scheduled or posted.
+> draft (Phase 5), which Phase 6 fact-checks, scores and revises until it is `ready` or
+> `needs_review`. Phase 7 sends a ready article to WordPress once a person approves its exact
+> version. **Phase 7 publishes only approved, ready article versions and defaults to
+> WordPress drafts. Scheduling is not included**, and nothing is posted to social media.
 > See [MIGRATION_PLAN.md](MIGRATION_PLAN.md) for the architecture and roadmap.
 
 ## What it does today
@@ -156,6 +156,23 @@ completed article → fact-check → originality → SEO package → metrics →
 
 **Phase 6 validates and prepares articles but does not publish them.** See
 [Article validation](#article-validation).
+
+**Publishing (Phase 7).** Sends an approved, ready article to WordPress:
+
+```
+ready article → approval (this exact version and quality report) → render (safe HTML)
+  → preflight → idempotency check → WordPress draft → verify → publication recorded
+```
+
+- **Approved, exactly.** An approval covers one version and one quality report. A new
+  version or a new validation voids it.
+- **Drafts by default.** A post is made public only when you ask for it and
+  `WORDPRESS_ALLOW_DIRECT_PUBLISH` is on.
+- **Never twice.** One publication per version and site; a lost response is reconciled,
+  never retried blindly.
+
+**Phase 7 publishes only approved, ready article versions and defaults to WordPress drafts.
+Scheduling is not included.** See [Publishing](#publishing).
 
 ### Dates: what they mean
 
@@ -320,6 +337,18 @@ uv run python -m app articles seo 1                  # keywords + evidence, meta
 uv run python -m app articles revisions 1            # the edited version and every revision, with scores
 uv run python -m app articles revise 1 --note "..."  # one more revision of the recommended version
 
+# Approval and publishing (WordPress drafts by default; nothing is scheduled)
+uv run python -m app articles approval 1             # recommended version, score, gates, approval state
+uv run python -m app articles approve 1 --note "..." # approve that exact version (asks to confirm; --yes)
+uv run python -m app articles reject 1 --note "..."  # reject it, with a reason
+uv run python -m app articles approvals 1            # every decision, and why it stopped applying
+uv run python -m app articles preflight 1            # every check, WordPress included (read-only)
+uv run python -m app articles publish 1 --dry-run    # preflight + rendered HTML + WordPress request; changes nothing
+uv run python -m app articles publish 1              # create or update the WordPress draft
+uv run python -m app articles publish 1 --status publish   # make it public (needs WORDPRESS_ALLOW_DIRECT_PUBLISH)
+uv run python -m app articles publication 1          # post id, URL, what was mapped, every attempt
+uv run python -m app articles publications 1         # every publication (one per version and site)
+
 # Database
 uv run python -m app db upgrade                      # apply migrations
 uv run python -m app db current                      # show the schema revision
@@ -380,6 +409,14 @@ uv run uvicorn app.main:create_app --factory --port 8000
 | GET | `/api/v1/articles/{id}/originality` | The similarity report: flagged passages, the page and the overlapping text (`?version_id=`) |
 | GET | `/api/v1/articles/{id}/seo` | The SEO package and its checks (`?version_id=`) |
 | GET | `/api/v1/articles/{id}/revisions` | The edited version and every revision: parent, reason, issues addressed, changes, tokens, score, whether it's recommended |
+| POST | `/api/v1/articles/{id}/approve` | Approve the recommended version and its quality report. Body: `{"note": "...", "approver": "..."}` (optional). `409` unless the article is `ready` |
+| POST | `/api/v1/articles/{id}/reject` | Reject it. Body: `{"note": "..."}` (required: the reason) |
+| GET | `/api/v1/articles/{id}/approval` | The approval as it stands (`not_ready`, `pending`, `approved`, `rejected`, `invalidated`), with the version, score, gates and what blocks publishing |
+| GET | `/api/v1/articles/{id}/approvals` | Every decision, oldest first, with why and when it stopped applying |
+| POST | `/api/v1/articles/{id}/preflight` | Every publishing check, WordPress included (read-only). Body: `{"status": "draft"}` (optional) |
+| POST | `/api/v1/articles/{id}/publish` | `202` with `{"publication_id": ..., "status": "queued"}`; the CMS work runs in the background (`?wait=true` to wait). `?dry_run=true`: preflight, rendered HTML and the WordPress request, changing nothing. Body: `{"status": "draft" / "pending" / "publish"}`. `409` if not ready or not approved, or if `publish` isn't allowed; `503` if WordPress isn't configured |
+| GET | `/api/v1/articles/{id}/publication` | The latest publication: status, post id, public URL, what was mapped, the last preflight, every attempt |
+| GET | `/api/v1/articles/{id}/publications` | Every publication, newest first |
 
 `/api/v1/*` requires the `X-API-Key` header whenever `API_KEY` is set. Outside development,
 requests are refused until it is. Interactive docs are served at `/docs`.
@@ -1028,6 +1065,238 @@ factual claims). One revision fixed them (29 of 30 claims supported), and the sc
 - **Your own site.** Your site is compared and linked only if it is monitored like a
   competitor.
 
+## Publishing
+
+Phase 7 turns an approved, ready article version into a WordPress post. **Phase 7 publishes
+only approved, ready article versions and defaults to WordPress drafts. Scheduling is not
+included.** Nothing is posted to social media.
+
+### The flow
+
+```
+article (ready)
+  → recommended version → its current quality report → a live approval of both
+  → render (CMS-neutral safe HTML + metadata)
+  → preflight (article, version, quality, approval, content, citations, links, SEO fields,
+               target status, CMS config, WordPress itself, the post, the slug, category,
+               tags, idempotency)
+  → idempotency check → create or update the WordPress draft → verify it → record it
+  (→ make it public, only if asked and allowed → verify → mark the opportunity used)
+```
+
+The API queues publishing in the background (`202`, `{"publication_id": ..., "status":
+"queued"}`); the CLI runs it straight away. One run per article at a time: publishing shares
+the article's lock with generation and validation, and a second request returns the
+publication already in progress.
+
+### Approval
+
+- **Explicit.** A person approves (`articles approve` / `POST …/approve`) or rejects (with a
+  reason) an article that is `ready`. `needs_review` must be resolved in Phase 6 first: there
+  is no manual override.
+- **Exact.** A decision records the article, **the recommended version, the quality report**,
+  the approver, the method (`manual` or `auto`), the channel (API, CLI, policy), the time and
+  a note. Decisions are never deleted or edited.
+- **Invalidated, never reused.** An approval authorizes publication only while the article's
+  recommended version and current quality report are the ones it names. Each of these voids
+  it, with the reason recorded:
+  - a new recommended version (a better revision);
+  - a new quality report for the same version (for example, new weights);
+  - a new Phase 5 edit;
+  - cancellation;
+  - a later decision.
+
+  Validating again with nothing changed keeps the same report, so the approval stands.
+- **States.** `not_ready`, `pending` (ready, no decision yet), `approved`, `rejected`,
+  `invalidated`. At most one decision per article is live, enforced by the database.
+- **Auto-approval** (`PUBLISH_AUTO_APPROVE`, off by default). A publish request for a ready
+  article with no decision records an automatic approval (method `auto`). It never overrides
+  a rejection, and it still needs an explicit publish request: nothing publishes by itself.
+
+### WordPress setup
+
+1. Use a WordPress site served over **HTTPS**. Application Passwords need HTTPS (http is
+   accepted here only for `localhost`).
+2. Create a user for publishing, or use your own: an **Author** can create drafts and
+   publish their own posts, an **Editor** can also create categories and tags. Drafts need
+   `edit_posts`; making posts public needs `publish_posts`.
+3. In WordPress, go to **Users → Profile → Application Passwords**. Name one (e.g.
+   "competitor agent"), click **Add New Application Password**, and copy the password shown
+   (it is shown once).
+4. Put it in `.env`, never in code or in git:
+
+   ```env
+   WORDPRESS_BASE_URL=https://blog.example.com
+   WORDPRESS_USERNAME=your-user
+   WORDPRESS_APPLICATION_PASSWORD=abcd efgh ijkl mnop qrst uvwx
+   ```
+
+5. Check it: `uv run python -m app articles preflight <id>` shows whether the site is
+   reachable, who you are signed in as, and what that user can do.
+
+The REST API only is used. Nothing scrapes WordPress or drives a browser. Your normal
+WordPress password is never used or stored, and credentials are sent only to
+`WORDPRESS_BASE_URL`, over HTTP Basic auth with the Application Password (redirects are
+never followed).
+
+### Drafts and direct publishing
+
+- **Draft by default.** `WORDPRESS_DEFAULT_STATUS=draft`. `pending` leaves the post "Pending
+  Review" in WordPress.
+- **Making a post public.** Use `--status publish` / `{"status": "publish"}`, which needs
+  **`WORDPRESS_ALLOW_DIRECT_PUBLISH=true`**. With `PUBLISH_DRAFT_FIRST=true` (default) the
+  draft is written and verified first, then made public and verified again.
+- **Fully automatic publication** needs both switches, `PUBLISH_AUTO_APPROVE=true` and
+  `WORDPRESS_ALLOW_DIRECT_PUBLISH=true` (plus `WORDPRESS_DEFAULT_STATUS=publish`), and still
+  an explicit publish request. Phase 7 has no scheduler.
+- **A public post is never taken back to draft.** Updating a public post needs the publish
+  target.
+
+### Preflight and dry run
+
+- **Preflight** (`articles preflight` / `POST …/preflight`) runs every check and prints
+  `READY` or `BLOCKED` with a line per check. It reads WordPress through a client that
+  refuses any change.
+- **Dry run** (`articles publish --dry-run` / `?dry_run=true`) adds the rendered HTML and the
+  exact WordPress request body, including the ownership marker, term ids, slug, status and
+  excerpt. It never includes credentials.
+
+Neither changes anything, in WordPress or in the database.
+
+### What is published, and how
+
+- **What.** Only `article.recommended_version_id`, rendered from its stored content, with its
+  approval valid at the moment WordPress is called (checked again right before the change).
+  Never an older or rejected version, and never content from a request.
+- **Rendering** (`app/services/article_render.py`, CMS-neutral). The structured article
+  becomes HTML built here tag by tag:
+  - every piece of text is escaped, so a model can't inject markup or scripts;
+  - H2 for sections, H3 for subheadings, paragraphs, ordered and unordered lists;
+  - citations: `[S2]` becomes `[1]`, linking to a **Sources** section that lists only the
+    sources this version cites, with their stored URLs (no internal ids are published);
+  - the FAQ from the SEO package.
+- **Links.** Only Phase 6's validated links, and only to allowed targets:
+  - internal links go to stored pages of your site;
+  - external links go to the article's stored research sources;
+  - http(s) only;
+  - each is placed on the first occurrence of its anchor text, and internal links that don't
+    fit are listed under "Related reading";
+  - no URL is ever added while publishing.
+- **SEO mapping.**
+
+  | Article / SEO package | WordPress |
+  |---|---|
+  | Title | Post title |
+  | SEO slug | Slug |
+  | Meta description | Excerpt |
+  | Category | Category id, looked up by name |
+  | Tags | Tag ids, looked up by name, without duplicates |
+  | `WORDPRESS_DEFAULT_AUTHOR_ID` | Author |
+
+  No SEO plugin is assumed. The meta title and description are kept in the publication
+  record and shown by `articles publication`.
+- **Categories.** A missing category **blocks** publishing, rather than filing the post in
+  the wrong one, unless `WORDPRESS_CREATE_MISSING_TERMS=true` (then it's created).
+  `WORDPRESS_DEFAULT_CATEGORY_ID` applies only when the SEO package has no category.
+- **Tags.** Missing tags are left out, with a warning, unless creation is allowed.
+- **Images.** Phase 6 suggests an image concept and alt text but doesn't generate images, so
+  posts go out without a featured image. The suggestion is kept in the publication record,
+  and no image URL is invented.
+- **Slug.** A slug used by a post this system didn't create **blocks** publishing: it is
+  never silently changed. A public post keeps its existing slug when a new version updates
+  it.
+
+### Idempotency and reconciliation
+
+- **One publication per version.** Each (article, version, CMS, site) has a single
+  publication row, keyed by a deterministic idempotency key.
+- **The post id is stored at once.** The WordPress post id is saved as soon as it is known,
+  so no later run creates another post.
+- **Ownership marker.** Every post carries an opaque marker (an HTML comment with a random
+  id, not a database id). A post without it is someone else's and is never updated.
+- **Lost responses.** If WordPress saves a post but the response is lost (a timeout), the
+  creation is **not retried blindly**:
+  1. the post is looked up by slug, then by marker;
+  2. if it's there, it is adopted;
+  3. only if it isn't is the creation retried.
+
+  If the lookup itself fails, the run stops and the next run reconciles first.
+- **Publishing the same version again** checks the post and changes nothing if it already
+  holds this version (`action: none`).
+- **Attempts are recorded.** Every change attempt (`create`, `update`, `publish`,
+  `reconcile`, `terms`) is logged with its outcome: `succeeded`, `failed`, or `unknown` (then
+  reconciled).
+
+### Version safety
+
+A new recommended version is never published automatically. If version 4 is published and
+a revision makes version 5 recommended:
+
+1. the approval of version 4 no longer applies;
+2. WordPress keeps version 4;
+3. version 5 needs its own approval and an explicit publish.
+
+Version 5 then **updates the same WordPress post**, through a new publication row. That
+requires the article's earlier publication record on that site, the post to still be this
+article's (its marker), and the new approval. The version 4 publication stays as history
+(`superseded_by`).
+
+### Publication lifecycle and the opportunity
+
+- **Statuses.**
+
+  | Status | Meaning |
+  |---|---|
+  | `queued` | Accepted; waiting for its run |
+  | `preflight` | Checks running |
+  | `blocked` | A check failed; nothing was sent |
+  | `submitting` | A change is in flight |
+  | `draft_created` | WordPress holds this version as a draft (or pending review) |
+  | `published` | This version is public |
+  | `failed` | The attempt failed; the post's own state is in `external_status` |
+  | `cancelled` | Stopped before completion |
+
+- **Recorded on success.** The CMS, the post id, the public URL, the published time and
+  what was mapped.
+- **The opportunity** becomes `used` only after a **confirmed** public publication. It stays
+  as it was while a publication is queued, preflighted, only a draft, or after a failure.
+
+### Failures
+
+- **Retried (transient):**
+  - timeouts, network errors, rate limits (`429`, honoring `Retry-After`) and server
+    errors: bounded retries with backoff (`CMS_REQUEST_TIMEOUT`, `CMS_MAX_RETRIES`);
+  - reads and updates are retried directly; a creation is retried only after
+    reconciliation.
+- **Never retried (fix the cause, then publish again):**
+  - wrong credentials (`401`), missing permissions (`403`) and invalid requests
+    (`400`/`422`);
+  - slug collisions and missing categories.
+- **What's kept.** Errors are saved on the publication and its attempts, without
+  credentials. A CMS that can't be reached during preflight fails the run without changing
+  anything.
+
+### Security
+
+- **Credentials come only from settings.** They never appear in logs, the database, API
+  responses, error messages or test output: the password is a secret setting, HTTP headers
+  and bodies are never logged, and errors carry only the method, path, status and
+  WordPress's own error code and message.
+- **The site URL** must be https (http only for localhost) and may not contain credentials.
+- **A dry-run client refuses every change** before it is sent.
+
+### Limitations
+
+- **SEO plugins.** Meta title and description aren't written to Yoast or Rank Math: no
+  plugin is assumed. The description goes to the excerpt.
+- **Images.** No featured image (none is generated).
+- **Removing the marker.** A post whose marker was removed in WordPress is treated as
+  someone else's and won't be updated. Deleted or trashed posts must be restored in WordPress.
+- **One CMS per run.** WordPress only, one site at a time (`WORDPRESS_BASE_URL`); changing
+  the site starts a new publication history.
+- **After publishing, the opportunity is `used`.** Phase 5 won't write to it again (use a
+  Phase 6 revision for changes).
+
 ## Data model
 
 PostgreSQL, managed with Alembic migrations (`migrations/`), in separate layers:
@@ -1041,6 +1310,7 @@ PostgreSQL, managed with Alembic migrations (`migrations/`), in separate layers:
 | Recommendations (Phase 4) | `company_profiles`, `opportunities`, `opportunity_assessments`, `opportunity_evidence`, `opportunity_events` | Versioned company profiles; one opportunity per topic with its status; immutable scored assessments (breakdown, gaps, signals, suggestion, Gemini interpretation); the evidence each assessment rests on; the status and scoring timeline |
 | Generation (Phase 5) | `articles`, `article_steps`, `article_versions`, `article_sources`, `article_citations` | Article drafts linked to their opportunity, assessment and company profile version; the checkpoint log; immutable outline/draft/edited versions; retrieved research sources with their facts; claim → source citations. Never published |
 | Validation (Phase 6) | `article_claim_checks`, `article_originality_flags`, `article_quality_reports`; revision rows in `article_versions` | One verdict per (claim, cited source) and per uncited factual claim, with evidence and provenance; flagged passages with the page they overlap; each version's score, breakdown, gates and issues, linked to the steps it came from. The article points at its recommended version and report. Never published |
+| Publishing (Phase 7) | `article_approvals`, `publications`, `publication_attempts` | Decisions on an exact article version and quality report (never deleted; invalidated with a reason; one live per article); one publication per article version and CMS site (idempotency key, post id, URL, status, what was mapped, last preflight); every CMS change attempted and its outcome. No credentials |
 | Operations | `runs`, `run_events`, `llm_calls` | What ran, when, with what result (article runs carry `article_id`); every LLM call with its tokens |
 
 LLM output lives in the analysis layer, in the `interpretation` of opportunity assessments and
@@ -1099,8 +1369,9 @@ topics = await llm.generate_structured(LLMRequest(prompt="..."), TopicList)  # a
 | 3 · Competitor analysis | **Yes:** per-page analysis, change summaries, profiles, landscape briefings, topic consolidation. Metrics, trends and gaps stay deterministic. |
 | 4 · Content opportunities | **Yes, top candidates only:** title, angle, why now, format, audience, rationale. Signals, relevance, gaps, scores and ranking are deterministic; works without a key. |
 | 5 · Article drafts | **Yes:** research (Google Search grounding and URL context), outline, draft, editorial pass. The brief, URL screening, citation checks and completion checks are deterministic. Nothing is published. |
-| 6 · Article validation (current) | **Yes:** claim verdicts (with URL context re-reads), uncited-claim classification, SEO wording, the quality rubric, revisions. Evidence checks, originality, metrics, the score, gates and version selection are deterministic. Nothing is published. |
-| 7–10 · Publishing, scheduling, social, dashboard | Publishing itself never uses an LLM |
+| 6 · Article validation | **Yes:** claim verdicts (with URL context re-reads), uncited-claim classification, SEO wording, the quality rubric, revisions. Evidence checks, originality, metrics, the score, gates and version selection are deterministic. Nothing is published. |
+| 7 · Publishing (current) | **No.** Approval, rendering, preflight, WordPress calls and reconciliation are deterministic. |
+| 8–10 · Scheduling, social, dashboard | Publishing itself never uses an LLM |
 
 ## Configuration reference
 
@@ -1150,6 +1421,16 @@ All settings are environment variables (or `.env`); see [`.env.example`](.env.ex
 | `ORIGINALITY_COMMON_DOC_FREQUENCY` / `_MIN_PASSAGE_WORDS` | `3` / `12` | Pages that make a phrase common; shortest passage checked |
 | `SEO_TITLE_MAX_CHARS` / `SEO_DESCRIPTION_MIN_CHARS` / `_MAX_CHARS` | `60` / `70` / `160` | Meta tag lengths |
 | `SEO_MAX_KEYWORD_DENSITY` | `0.03` | Keyword density above which repetition is stuffing |
+| `CMS_PROVIDER` | `wordpress` | The CMS publishing goes to (WordPress only, so far) |
+| `CMS_REQUEST_TIMEOUT` / `CMS_MAX_RETRIES` | `30` / `2` | Seconds per CMS request; retries of transient failures only |
+| `WORDPRESS_BASE_URL` | *(empty)* | Your site (https; http only for localhost; no credentials in it) |
+| `WORDPRESS_USERNAME` / `WORDPRESS_APPLICATION_PASSWORD` | *(empty)* | The WordPress user and an Application Password (secret; never logged or stored) |
+| `WORDPRESS_DEFAULT_STATUS` | `draft` | `draft`, `pending` or `publish` (`publish` needs `WORDPRESS_ALLOW_DIRECT_PUBLISH`) |
+| `WORDPRESS_DEFAULT_AUTHOR_ID` / `WORDPRESS_DEFAULT_CATEGORY_ID` | *(empty)* | Post author; category when the SEO package has none |
+| `WORDPRESS_ALLOW_DIRECT_PUBLISH` | `false` | Required to make a post public |
+| `WORDPRESS_CREATE_MISSING_TERMS` | `false` | Create missing categories and tags (else a missing category blocks; missing tags are left out) |
+| `PUBLISH_AUTO_APPROVE` | `false` | Approve ready articles automatically when publishing (never over a rejection) |
+| `PUBLISH_DRAFT_FIRST` | `true` | Going public: a verified draft first |
 
 ## Development
 
@@ -1185,6 +1466,18 @@ uv run pytest -m llm_live            # opt-in: one real Gemini call (needs GEMIN
   failure, cancellation, dependency boundaries between steps, the API and the CLI.
   `uv run pytest -m llm_live tests/live/test_live_quality.py` validates one article with the
   real Gemini (about 20-30k tokens).
+- Approval and publishing are tested end to end against `tests/fakewordpress.py`, an
+  in-memory WordPress REST API. It behaves like WordPress for auth, slugs, terms and statuses,
+  and can inject failures (`401`, `403`, `400`, `429`, `5xx`, timeouts, lost responses,
+  malformed answers, redirects). The tests cover:
+  - approval and each kind of invalidation;
+  - rendering and escaping;
+  - dry runs (no change), preflight, drafts, going public;
+  - idempotency (one post after a lost response), reconciliation;
+  - version safety, slug collisions, terms, locking, and credentials never leaking.
+
+  `LIVE_WORDPRESS=1 uv run pytest -m cms_live tests/live/test_live_wordpress.py` writes,
+  updates and trashes one test draft on a real site (never publishes).
 - CI runs lint, format, type checks and tests against a PostgreSQL service
   (`.github/workflows/ci.yml`).
 
@@ -1230,6 +1523,12 @@ app/
     quality_metrics.py         structure, length, readability, citation metrics (no LLM)
     quality_decision.py        score, gates, issue order, best-version choice (no LLM)
     quality_review.py          the Gemini judge and revisions
+    approvals.py, approval_rules.py   approval decisions and when they stop applying
+    article_render.py          CMS-neutral safe HTML: citations, sources, links, FAQ (no LLM)
+    publishing.py              publishing runs: preflight, idempotency, reconciliation, verify
+  cms/                         CMS-neutral interface (CMSPublisher) and the WordPress adapter
+    wordpress/client.py        REST API: auth, bounded retries, error mapping, read-only mode
+    wordpress/publisher.py     posts, categories, tags, payloads, ownership, verification
   prompts/                     versioned prompts + their structured-output schemas
   db/                          models (by layer), sessions, advisory locks, queries, migrations
   llm/                         provider-agnostic LLM interface + Gemini provider

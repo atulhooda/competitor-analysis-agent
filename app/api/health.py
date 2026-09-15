@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app import __version__
 from app.api.deps import SettingsDep
-from app.api.schemas import DatabaseStatus, HealthResponse, LLMStatus
+from app.api.schemas import CMSStatus, DatabaseStatus, HealthResponse, LLMStatus
 
 router = APIRouter(tags=["health"])
 
@@ -31,4 +31,5 @@ async def health(request: Request, settings: SettingsDep) -> HealthResponse:
         version=__version__,
         database=database,
         llm=LLMStatus(model=settings.gemini_model, configured=settings.llm_configured),
+        cms=CMSStatus(provider=settings.cms_provider, configured=settings.cms_configured),
     )

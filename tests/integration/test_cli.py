@@ -410,3 +410,91 @@ def test_quality_commands(configured: Path, monkeypatch: pytest.MonkeyPatch, tmp
     )
     assert runner.invoke(cli, ["articles", "seo", "999999"]).exit_code == 2
     assert "article_quality" in runner.invoke(cli, ["runs"]).output
+
+
+# ── Phase 7 ──────────────────────────────────────────────────────────────────
+
+
+def test_publishing_commands(configured: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:  # fmt: skip
+    import yaml
+    from pydantic import SecretStr
+
+    import app.cli as cli_module
+    from app.llm import LazyLLM
+    from app.services.articles import ArticleService
+    from app.services.quality import QualityService
+    from tests.fakellm import FakeLLM
+    from tests.fakewordpress import BASE, PASSWORD, USERNAME, FakeWordPress
+    from tests.pipeline import ARTICLE_COMPANY
+
+    settings = cli_module.get_settings().model_copy(update={"wordpress_base_url": BASE, "wordpress_username": USERNAME, "wordpress_application_password": SecretStr(PASSWORD), "cms_max_retries": 0})  # fmt: skip
+    monkeypatch.setattr("app.cli.get_settings", lambda: settings)
+    fake = FakeLLM()
+    monkeypatch.setattr("app.cli.LazyLLM", functools.partial(LazyLLM, provider=fake))
+    monkeypatch.setattr("app.cli.ArticleService", functools.partial(ArticleService, resolver=public_resolver))  # fmt: skip
+    monkeypatch.setattr("app.cli.QualityService", functools.partial(QualityService, resolver=public_resolver))  # fmt: skip
+    _scan_acme()
+    assert runner.invoke(cli, ["analyze", "acme", "--no-profile"]).exit_code == 0
+    company = tmp_path / "company.yaml"
+    company.write_text(yaml.safe_dump({"company": ARTICLE_COMPANY}), encoding="utf-8")
+    assert runner.invoke(cli, ["company", "import", "--file", str(company)]).exit_code == 0
+    assert runner.invoke(cli, ["opportunities", "generate"]).exit_code == 0
+    payload = json.loads(runner.invoke(cli, ["opportunities", "list", "--json"]).stdout)
+    opportunity = str(next(o["id"] for o in payload if o["topic_label"].casefold() == "ai agents"))  # fmt: skip
+    assert runner.invoke(cli, ["opportunities", "approve", opportunity]).exit_code == 0
+    assert runner.invoke(cli, ["articles", "generate", opportunity]).exit_code == 0
+    article = str(json.loads(runner.invoke(cli, ["articles", "list", "--json"]).stdout)[0]["id"])
+    not_ready = runner.invoke(cli, ["articles", "approve", article, "--yes"])
+    assert not_ready.exit_code == 2  # completed, not validated: not ready
+    assert runner.invoke(cli, ["articles", "validate", article]).exit_code == 0
+
+    wp = FakeWordPress()
+    with respx.mock(assert_all_called=False) as router:
+        wp.mount(router)
+        shown = runner.invoke(cli, ["articles", "approval", article])
+        assert shown.exit_code == 0, shown.output
+        assert "approval pending" in shown.output
+        assert "every gate passes" in shown.output
+        assert "score" in shown.output
+        blocked = runner.invoke(cli, ["articles", "preflight", article])
+        assert blocked.exit_code == 1
+        assert "BLOCKED" in blocked.output
+        assert "approve it first" in blocked.output
+        declined = runner.invoke(cli, ["articles", "approve", article], input="n\n")
+        assert declined.exit_code == 1  # asked, and declined: nothing recorded
+        approved = runner.invoke(cli, ["articles", "approve", article, "--note", "Looks good"], input="y\n")  # fmt: skip
+        assert approved.exit_code == 0, approved.output
+        assert "recommended version" in approved.output
+        assert "approved (decision #" in approved.output
+        ready = runner.invoke(cli, ["articles", "preflight", article])
+        assert ready.exit_code == 0, ready.output
+        assert "READY" in ready.output
+        dry = runner.invoke(cli, ["articles", "publish", article, "--dry-run"])
+        assert dry.exit_code == 0, dry.output
+        assert "dry run: nothing sent" in dry.output
+        assert '"status": "draft"' in dry.output
+        assert PASSWORD not in dry.output
+        assert wp.mutations == []
+        published = runner.invoke(cli, ["articles", "publish", article])
+        assert published.exit_code == 0, published.output
+        assert "draft_created" in published.output
+        assert len(wp.posts) == 1
+        again = runner.invoke(cli, ["articles", "publish", article, "--json"])
+        assert json.loads(again.stdout)["action"] == "none"
+        overview = runner.invoke(cli, ["articles", "show", article, "--no-content"])
+        assert "approval: approved" in overview.output
+        assert "publication: draft_created" in overview.output
+        details = runner.invoke(cli, ["articles", "publication", article])
+        assert "meta description" in details.output
+        assert "create → succeeded" in details.output
+        assert "draft_created" in runner.invoke(cli, ["articles", "publications", article]).output
+        rejected = runner.invoke(cli, ["articles", "reject", article, "--note", "Needs another review"])  # fmt: skip
+        assert rejected.exit_code == 0
+        history = runner.invoke(cli, ["articles", "approvals", article])
+        assert "superseded by rejection" in history.output
+        refused = runner.invoke(cli, ["articles", "publish", article])
+        assert refused.exit_code == 2
+        assert "rejected" in refused.output
+        assert runner.invoke(cli, ["articles", "publication", "999999"]).exit_code == 2
+        assert "article_publish" in runner.invoke(cli, ["runs"]).output
+    assert PASSWORD not in "".join(r.output for r in (shown, blocked, approved, ready, dry, published, again, details, history, refused))  # fmt: skip

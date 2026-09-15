@@ -15,6 +15,8 @@ from rich.table import Table
 from sqlalchemy.exc import DBAPIError, OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.cms import LazyCMS
+from app.cms.errors import CMSConfigurationError
 from app.config import get_settings, load_company_profile, load_competitors, load_topic_seeds
 from app.core.errors import ConfigurationError
 from app.core.logging import configure_logging
@@ -25,6 +27,7 @@ from app.db import (
     article_queries,
     migrate,
     opportunity_queries,
+    publishing_queries,
     quality_queries,
     queries,
 )
@@ -35,6 +38,15 @@ from app.domain.competitor_profile import Claim
 from app.domain.content import ContentType
 from app.domain.history import ChangeType, RunStatus, RunTrigger
 from app.domain.opportunities import OpportunityStatus
+from app.domain.publishing import (
+    ApprovalChannel,
+    ApprovalRecord,
+    ApprovalView,
+    DryRunReport,
+    PreflightReport,
+    PublicationView,
+    TargetStatus,
+)
 from app.domain.quality import ClaimVerdict
 from app.domain.scan import ScanResult
 from app.llm import LazyLLM, LLMConfigurationError
@@ -44,6 +56,7 @@ from app.services.analysis import (
     AnalysisOutcome,
     AnalysisService,
 )
+from app.services.approvals import ApprovalService
 from app.services.articles import (
     ArticleBudgetExhaustedError,
     ArticleConflictError,
@@ -73,6 +86,7 @@ from app.services.opportunities import (
     OpportunityRunAlreadyActiveError,
     OpportunityService,
 )
+from app.services.publishing import PublishingService, PublishOutcome, PublishRequestResult
 from app.services.quality import QualityOutcome, QualityService
 from app.services.scans import CompetitorNotFoundError, ScanError, ScanOutcome, ScanService
 from app.services.topic_admin import TopicAdminService
@@ -82,8 +96,8 @@ cli = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
     help="Competitor intelligence agent: compliant website monitoring, persisted history, "
-    "AI analysis (Gemini), content opportunities, article drafts and their validation "
-    "(never published).",
+    "AI analysis (Gemini), content opportunities, article drafts, their validation, and "
+    "publishing approved, ready versions (WordPress drafts by default; no scheduling).",
 )
 db_cli = typer.Typer(no_args_is_help=True, help="Database migrations.")
 competitors_cli = typer.Typer(help="Manage monitored competitors (stored in the database).")
@@ -1518,6 +1532,8 @@ def show_article(
     async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
         async with sessions() as session:
             detail = await article_queries.get_article(session, article_id, token_budget=settings.article_max_tokens, include_markdown=content)  # fmt: skip
+            publication = await publishing_queries.current_publication(session, article_id)
+        approval = await ApprovalService(sessions, settings).view(article_id) if detail is not None else None  # fmt: skip
         if detail is None:
             err.print(f"[red]Unknown article {article_id}[/red]")
             raise typer.Exit(code=2)
@@ -1539,6 +1555,10 @@ def show_article(
             console.print(f"quality: {detail.quality_score:.1f}/100 · recommended version {detail.recommended_version_id} · {detail.revision_count} revision(s) · validated {detail.validated_at:%Y-%m-%d %H:%M} (`articles quality {detail.id}`)")  # fmt: skip
         elif detail.status.value == "completed":
             console.print(f"[dim]not validated yet: `articles validate {detail.id}`[/dim]")
+        if approval is not None and approval.state.value != "not_ready":
+            console.print(f"approval: {approval.state.value}" + (f" (#{approval.decision.id} by {escape(approval.decision.approver)})" if approval.decision else f" (`articles approve {detail.id}`)"))  # fmt: skip
+        if publication is not None:
+            console.print(f"publication: {publication.status.value} · {publication.cms} post {publication.external_id or '—'} ({publication.external_status or '—'})" + (f" · {publication.url}" if publication.url else "") + f" (`articles publication {detail.id}`)")  # fmt: skip
         if detail.issues:
             console.print(f"[bold]Issues[/bold] ({len(detail.issues)}, for review)")
             for issue in detail.issues[:12]:
@@ -1928,3 +1948,310 @@ def article_revisions_cmd(article_id: int, json_output: bool = typer.Option(Fals
         console.print(table)
 
     _run_db(work)
+
+
+# ── approval and publishing (Phase 7: approved, ready versions only; drafts by default) ─
+
+
+def _publishing_errors() -> tuple[type[Exception], ...]:
+    return (*_article_errors(), CMSConfigurationError)
+
+
+def _print_approval(view: ApprovalView) -> None:
+    color = {"approved": "green", "pending": "yellow", "rejected": "red", "invalidated": "yellow"}.get(view.state.value, "red")  # fmt: skip
+    console.print(f"[bold]article {view.article_id}[/bold] · {view.article_status} · approval [{color}]{view.state.value}[/{color}]")  # fmt: skip
+    if view.recommended_version_id is not None:
+        score = f"{view.quality_score:.1f}/100" if view.quality_score is not None else "—"
+        gates = "every gate passes" if view.gates_passed else "fails: " + ", ".join(g.name for g in view.gates if not g.passed)  # fmt: skip
+        console.print(f"recommended version {view.recommended_version_id} ({view.version_kind} v{view.version_number}) · quality report #{view.quality_report_id} · score {score} · {gates}")  # fmt: skip
+    if view.decision is not None:
+        d = view.decision
+        console.print(f"decision #{d.id}: {d.decision.value} by {escape(d.approver)} ({d.method.value}, {d.channel.value}) {d.created_at:%Y-%m-%d %H:%M}" + (f" — {escape(d.note)}" if d.note else ""))  # fmt: skip
+    elif view.last_decision is not None:
+        d = view.last_decision
+        console.print(f"last decision #{d.id}: {d.decision.value} for version {d.version_id} — no longer applies: {escape(d.invalidated_reason or '')}")  # fmt: skip
+    for reason in view.blocking:
+        err.print(f"[yellow]• {escape(reason)}[/yellow]")
+    if view.auto_approve:
+        console.print("[dim]PUBLISH_AUTO_APPROVE is on: publishing a ready article records an automatic approval[/dim]")  # fmt: skip
+
+
+def _approval_view(article_id: int) -> ApprovalView:
+    settings = get_settings()
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> ApprovalView:
+        return await ApprovalService(sessions, settings).view(article_id)
+
+    try:
+        return _run_db(work)
+    except _publishing_errors() as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+
+
+@articles_cli.command("approval")
+def article_approval_cmd(article_id: int, json_output: bool = typer.Option(False, "--json")) -> None:  # fmt: skip
+    """The approval as it stands: recommended version, quality score, gates, decision."""
+    view = _approval_view(article_id)
+    if json_output:
+        sys.stdout.write(view.model_dump_json(indent=2) + "\n")
+        return
+    _print_approval(view)
+
+
+@articles_cli.command("approve")
+def approve_article_cmd(
+    article_id: int,
+    note: str | None = typer.Option(None, help="Why (recorded with the approval)."),
+    approver: str | None = typer.Option(None, help="Who approves (default: cli)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask for confirmation."),
+) -> None:
+    """Approve the recommended version and its quality report for publication (ready
+    articles only). A new version or validation needs a new approval."""
+    settings = get_settings()
+    view = _approval_view(article_id)
+    _print_approval(view)
+    if view.state.value == "not_ready":
+        raise typer.Exit(code=2)
+    if not yes:
+        typer.confirm(f"Approve version {view.recommended_version_id} (quality report #{view.quality_report_id}) for publication?", abort=True)  # fmt: skip
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> tuple[ApprovalRecord, bool]:
+        return await ApprovalService(sessions, settings).approve(article_id, channel=ApprovalChannel.CLI, approver=approver, note=note)  # fmt: skip
+
+    try:
+        record, created = _run_db(work)
+    except _publishing_errors() as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    console.print(f"[green]approved[/green] (decision #{record.id})" if created else f"already approved (decision #{record.id}): nothing changed")  # fmt: skip
+
+
+@articles_cli.command("reject")
+def reject_article_cmd(
+    article_id: int,
+    note: str = typer.Option(..., help="Why it's rejected (required)."),
+    approver: str | None = typer.Option(None, help="Who rejects (default: cli)."),
+) -> None:
+    """Reject the recommended version: it can't be published until approved, or until a
+    new version is validated and approved."""
+    settings = get_settings()
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> tuple[ApprovalRecord, bool]:
+        return await ApprovalService(sessions, settings).reject(article_id, channel=ApprovalChannel.CLI, approver=approver, note=note)  # fmt: skip
+
+    try:
+        record, created = _run_db(work)
+    except _publishing_errors() as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    console.print(f"[red]rejected[/red] (decision #{record.id}): {escape(note)}" if created else f"already rejected (decision #{record.id})")  # fmt: skip
+
+
+@articles_cli.command("approvals")
+def article_approvals_cmd(article_id: int, json_output: bool = typer.Option(False, "--json")) -> None:  # fmt: skip
+    """Every decision, oldest first, and why each stopped applying."""
+    settings = get_settings()
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> list[ApprovalRecord]:
+        return await ApprovalService(sessions, settings).history(article_id)
+
+    try:
+        rows = _run_db(work)
+    except _publishing_errors() as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    if json_output:
+        sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
+        return
+    table = Table("ID", "Decision", "Version", "Report", "Method", "By", "When", "Live", "Note / why it stopped applying")  # fmt: skip
+    for r in rows:
+        table.add_row(str(r.id), r.decision.value, str(r.version_id), f"#{r.quality_report_id}", f"{r.method.value} ({r.channel.value})", escape(r.approver), f"{r.created_at:%Y-%m-%d %H:%M}", "yes" if r.live else "", escape((r.invalidated_reason or r.note or "")[:70]))  # fmt: skip
+    console.print(table if rows else f"No decisions yet: `articles approve {article_id}`.")
+
+
+def _print_preflight(report: PreflightReport) -> None:
+    verdict = "[green]READY[/green]" if report.ready else "[red]BLOCKED[/red]"
+    console.print(f"{verdict} · article {report.article_id} · version {report.version_id} · {report.cms} {report.site or '(not configured)'} · target {report.target_status.value} · action {report.action}")  # fmt: skip
+    for c in report.checks:
+        mark = "[green]✓[/green]" if c.passed else ("[red]✗[/red]" if c.blocking else "[yellow]![/yellow]")  # fmt: skip
+        console.print(f"  {mark} {c.name}: {escape(c.detail)}")
+
+
+def _publishing(engine: AsyncEngine, sessions: SessionFactory) -> tuple[PublishingService, LazyCMS]:  # fmt: skip
+    settings = get_settings()
+    cms = LazyCMS(settings)
+    return PublishingService(engine, sessions, settings, cms), cms
+
+
+@articles_cli.command("preflight")
+def article_preflight_cmd(
+    article_id: int,
+    status: Annotated[
+        TargetStatus | None,
+        typer.Option(
+            "--status", help="draft, pending or publish (default: WORDPRESS_DEFAULT_STATUS)."
+        ),
+    ] = None,
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Every publishing check, the CMS included (read-only): nothing is changed."""
+
+    async def work(engine: AsyncEngine, sessions: SessionFactory) -> PreflightReport:
+        service, cms = _publishing(engine, sessions)
+        try:
+            return await service.preflight(article_id, target=status)
+        finally:
+            await cms.aclose()
+
+    try:
+        report = _run_db(work)
+    except _publishing_errors() as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    if json_output:
+        sys.stdout.write(report.model_dump_json(indent=2) + "\n")
+    else:
+        _print_preflight(report)
+    if not report.ready:
+        raise typer.Exit(code=1)
+
+
+@articles_cli.command("publish")
+def publish_article_cmd(
+    article_id: int,
+    status: Annotated[
+        TargetStatus | None,
+        typer.Option(
+            "--status",
+            help="draft, pending or publish (publish needs WORDPRESS_ALLOW_DIRECT_PUBLISH).",
+        ),
+    ] = None,
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Preflight, render and show the CMS request; change nothing."
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Publish the approved recommended version to the CMS (runs now). Leaves a draft by
+    default; the same version is never published twice. Nothing is scheduled."""
+    if dry_run:
+        _publish_dry_run(article_id, status, json_output)
+        return
+
+    async def work(engine: AsyncEngine, sessions: SessionFactory) -> tuple[PublishRequestResult, PublishOutcome | None]:  # fmt: skip
+        service, cms = _publishing(engine, sessions)
+        try:
+            return await service.publish_now(article_id, trigger=RunTrigger.CLI, target=status)
+        finally:
+            await cms.aclose()
+
+    try:
+        result, outcome = _run_db(work)
+    except _publishing_errors() as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    status_value = (outcome.status if outcome else result.status).value if (outcome or result.status) else None  # type: ignore[union-attr]  # fmt: skip
+    if json_output:
+        payload = {"publication_id": result.publication_id, "created": result.created, "message": result.message, "run_id": result.run_id, "run_status": outcome.run_status.value if outcome else None, "status": status_value, "action": outcome.action if outcome else None, "external_id": outcome.external_id if outcome else None, "url": outcome.url if outcome else None, "error": outcome.error if outcome else None, "warnings": outcome.warnings if outcome else []}  # fmt: skip
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+    else:
+        if result.message:
+            console.print(escape(result.message))
+        if outcome is not None:
+            color = {"published": "green", "draft_created": "green"}.get(
+                outcome.status.value, "red"
+            )
+            console.print(f"publication {outcome.publication_id} run {outcome.run_id} → [{color}]{outcome.status.value}[/{color}]" + (f" · {outcome.action}" if outcome.action else "") + (f" · post {outcome.external_id}" if outcome.external_id else "") + (f" · {outcome.url}" if outcome.url else ""))  # fmt: skip
+            for warning in outcome.warnings:
+                err.print(f"[yellow]! {escape(warning)}[/yellow]")
+            if outcome.error:
+                err.print(f"[red]{escape(outcome.error)}[/red]")
+            console.print(f"[dim]details: `articles publication {article_id}`[/dim]")
+    if outcome is not None and outcome.run_status == RunStatus.FAILED:
+        raise typer.Exit(code=1)
+
+
+def _publish_dry_run(article_id: int, status: TargetStatus | None, json_output: bool) -> None:
+    async def work(engine: AsyncEngine, sessions: SessionFactory) -> DryRunReport:
+        service, cms = _publishing(engine, sessions)
+        try:
+            return await service.dry_run(article_id, target=status)
+        finally:
+            await cms.aclose()
+
+    try:
+        report = _run_db(work)
+    except _publishing_errors() as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    if json_output:
+        sys.stdout.write(report.model_dump_json(indent=2) + "\n")
+        return
+    _print_preflight(report.preflight)
+    console.rule("CMS request (dry run: nothing sent)")
+    console.print_json(json.dumps(report.payload))
+    doc = report.document
+    if doc is not None:
+        console.print(f"meta title: {escape(doc.meta_title)} · meta description: {escape(doc.excerpt)}")  # fmt: skip
+        if doc.image is not None:
+            console.print(f"image suggestion (not generated): {escape(doc.image.concept)} · alt: {escape(doc.image.alt_text)}")  # fmt: skip
+        for note in doc.notes:
+            console.print(f"[dim]{escape(note)}[/dim]")
+
+
+def _print_publication(p: PublicationView) -> None:
+    color = {"published": "green", "draft_created": "green", "blocked": "red", "failed": "red"}.get(p.status.value, "yellow")  # fmt: skip
+    console.print(f"[bold]publication {p.id}[/bold] · article {p.article_id} version {p.version_id} · approval #{p.approval_id} · [{color}]{p.status.value}[/{color}] (target {p.target_status.value})")  # fmt: skip
+    console.print(f"{p.cms} {p.site} · post {p.external_id or '—'} ({p.external_status or '—'})" + (f" · {p.url}" if p.url else "") + (f" · edit: {p.edit_url}" if p.edit_url else ""))  # fmt: skip
+    d = p.details
+    if d:
+        console.print(f"title: {escape(str(d.get('title', '')))} · slug: {d.get('slug')} · meta title: {escape(str(d.get('meta_title', '')))}")  # fmt: skip
+        console.print(f"meta description: {escape(str(d.get('meta_description', '')))}")
+        category = d.get("category") or {}
+        console.print(f"category: {escape(str(category.get('name', '—')))} · tags: {escape(', '.join(t['name'] for t in d.get('tags', [])) or '—')}" + (f" · left out: {escape(', '.join(d['missing_tags']))}" if d.get("missing_tags") else ""))  # fmt: skip
+        if d.get("image_suggestion"):
+            console.print(f"image suggestion (no image published): {escape(str(d['image_suggestion'].get('concept')))}")  # fmt: skip
+    console.print(f"attempts {p.attempt_count} · created {p.created_at:%Y-%m-%d %H:%M} · updated {p.updated_at:%Y-%m-%d %H:%M}" + (f" · published {p.published_at:%Y-%m-%d %H:%M}" if p.published_at else "") + (f" · superseded by #{p.superseded_by_id}" if p.superseded_by_id else ""))  # fmt: skip
+    for a in p.attempts:
+        console.print(f"  {a.started_at:%H:%M:%S} {a.action.value} → {a.outcome.value}" + (f" ({a.http_status})" if a.http_status else "") + (f" post {a.external_id}" if a.external_id else "") + (f" — {escape(a.error[:120])}" if a.error else ""))  # fmt: skip
+    if p.last_error:
+        err.print(f"[yellow]{escape(p.last_error)}[/yellow]")
+
+
+@articles_cli.command("publication")
+def article_publication_cmd(article_id: int, json_output: bool = typer.Option(False, "--json")) -> None:  # fmt: skip
+    """The latest publication: status, CMS post, URL, what was mapped, every attempt."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> PublicationView | None:
+        async with sessions() as session:
+            return await publishing_queries.current_publication(session, article_id)
+
+    view = _run_db(work)
+    if view is None:
+        err.print(f"[red]Article {article_id} has no publication[/red]")
+        raise typer.Exit(code=2)
+    if json_output:
+        sys.stdout.write(view.model_dump_json(indent=2) + "\n")
+        return
+    _print_publication(view)
+
+
+@articles_cli.command("publications")
+def article_publications_cmd(article_id: int, json_output: bool = typer.Option(False, "--json")) -> None:  # fmt: skip
+    """Every publication (one per version and site), newest first."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> list[PublicationView] | None:
+        async with sessions() as session:
+            return await publishing_queries.list_publications(session, article_id)
+
+    rows = _run_db(work)
+    if rows is None:
+        err.print(f"[red]Unknown article {article_id}[/red]")
+        raise typer.Exit(code=2)
+    if json_output:
+        sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
+        return
+    table = Table("ID", "Version", "Approval", "Status", "Target", "Post", "URL", "Attempts", "Updated", "Superseded")  # fmt: skip
+    for r in rows:
+        table.add_row(str(r.id), str(r.version_id), f"#{r.approval_id}", r.status.value, r.target_status.value, f"{r.external_id or '—'} ({r.external_status or '—'})", r.url or "—", str(r.attempt_count), f"{r.updated_at:%Y-%m-%d %H:%M}", f"#{r.superseded_by_id}" if r.superseded_by_id else "")  # fmt: skip
+    console.print(table if rows else f"No publications yet: `articles publish {article_id}` (a draft by default).")  # fmt: skip

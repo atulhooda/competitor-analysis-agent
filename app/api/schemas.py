@@ -10,6 +10,7 @@ from app.domain.content import ContentType
 from app.domain.history import RunView
 from app.domain.intelligence import Landscape, LandscapeReportView
 from app.domain.opportunities import OpportunityStatus
+from app.domain.publishing import ApprovalRecord, ApprovalView, PublicationStatus, TargetStatus
 from app.domain.scan import ScanResult
 
 
@@ -128,6 +129,48 @@ class ArticleRunResponse(BaseModel):
     message: str | None = None
 
 
+class ApproveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str | None = Field(default=None, max_length=2_000, examples=["Reviewed and approved for publication."])  # fmt: skip
+    approver: str | None = Field(default=None, max_length=200, description="Who decided (default: api)")  # fmt: skip
+
+
+class RejectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str = Field(min_length=1, max_length=2_000, description="Why (required)", examples=["Needs another review"])  # fmt: skip
+    approver: str | None = Field(default=None, max_length=200)
+
+
+class ApprovalDecisionResponse(BaseModel):
+    approval: ApprovalRecord
+    created: bool = Field(description="False: the same decision already stood for this version and report")  # fmt: skip
+    state: ApprovalView
+
+
+class PublishRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: TargetStatus | None = Field(default=None, description="draft (default: WORDPRESS_DEFAULT_STATUS), pending, or publish (needs WORDPRESS_ALLOW_DIRECT_PUBLISH)")  # fmt: skip
+
+
+class PublishResponse(BaseModel):
+    publication_id: int | None
+    status: PublicationStatus | None
+    created: bool = Field(description="A new publication (else this version's existing one)")
+    message: str | None = None
+    external_id: str | None = None
+    url: str | None = None
+    error: str | None = None
+    run: RunView | None = None
+
+
+class CMSStatus(BaseModel):
+    provider: str
+    configured: bool = Field(description="URL and credentials set (their values are never exposed)")  # fmt: skip
+
+
 class DatabaseStatus(BaseModel):
     reachable: bool
     revision: str | None = None
@@ -150,3 +193,4 @@ class HealthResponse(BaseModel):
     version: str
     database: DatabaseStatus
     llm: LLMStatus
+    cms: CMSStatus | None = None

@@ -92,6 +92,7 @@ from app.llm import (
 from app.prompts import fact_check as fact_check_prompt
 from app.prompts import quality_judge, revision
 from app.prompts import seo as seo_prompt
+from app.services.approval_rules import invalidate_stale
 from app.services.article_brief import domain_of
 from app.services.article_content import citations, word_count
 from app.services.article_writing import ContentRejectedError, WritingConfig
@@ -766,6 +767,8 @@ class QualityService:
             slug = best.seo.package.slug  # the SEO slug, made unique like Phase 5's (slug-2, ...)
             if slug and not re.fullmatch(re.escape(slug) + r"(-\d+)?", article.slug):
                 article.slug = await ArticleService._free_slug(session, slug, exclude_id=article_id)
+            # An approval covers one version and one report (Phase 7): a new one voids it.
+            await invalidate_stale(session, article, now)
         log.info("quality.finished", article_id=article_id, recommended=best.version_id, score=best.assessment.overall_score, passed=best.assessment.passed)  # fmt: skip
 
     async def _set_failed(self, article_id: int, step: ArticleStep | None, error: str) -> None:

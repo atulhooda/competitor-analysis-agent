@@ -10,10 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.db.session import SessionFactory
 from app.services.analysis import AnalysisService
+from app.services.approvals import ApprovalService
 from app.services.articles import ArticleService
 from app.services.intelligence import IntelligenceService
 from app.services.landscape import LandscapeService
 from app.services.opportunities import OpportunityService
+from app.services.publishing import PublishingService
 from app.services.quality import QualityService
 from app.services.scans import ScanService
 from app.services.topic_admin import TopicAdminService
@@ -114,3 +116,17 @@ def get_quality_service(request: Request) -> QualityService:
 
 
 QualityServiceDep = Annotated[QualityService, Depends(get_quality_service)]
+
+
+def get_approval_service(request: Request) -> ApprovalService:
+    service: ApprovalService = request.app.state.approvals
+    return service
+
+
+def get_publishing_service(request: Request) -> PublishingService:
+    service: PublishingService = request.app.state.publishing
+    return service
+
+
+ApprovalServiceDep = Annotated[ApprovalService, Depends(get_approval_service)]
+PublishingServiceDep = Annotated[PublishingService, Depends(get_publishing_service)]

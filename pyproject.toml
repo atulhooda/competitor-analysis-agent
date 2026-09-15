@@ -43,10 +43,11 @@ testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-ra -m 'not live and not llm_live'"
+addopts = "-ra -m 'not live and not llm_live and not cms_live'"
 markers = [
     "live: hits real third-party websites; opt in with `pytest -m live`",
     "llm_live: calls the real Gemini API (costs a little); opt in with `pytest -m llm_live`",
+    "cms_live: writes a test draft to a real WordPress site (never publishes); opt in with `LIVE_WORDPRESS=1 pytest -m cms_live`",
 ]
 
 [tool.ruff]

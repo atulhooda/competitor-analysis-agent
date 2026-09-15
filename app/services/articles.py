@@ -71,6 +71,7 @@ from app.domain.opportunities import OpportunityStatus
 from app.llm import LazyLLM, LLMConfigurationError, LLMError
 from app.prompts import article_draft, article_edit, article_outline, article_research
 from app.services import article_brief
+from app.services.approval_rules import invalidate_all
 from app.services.article_brief import domain_of
 from app.services.article_content import (
     citations,
@@ -360,6 +361,7 @@ class ArticleService:
             article.cancelled_at = self._now()
             article.current_step = None
             article.error = (note or "cancelled")[:2_000]
+            await invalidate_all(session, article.id, article.cancelled_at, "the article was cancelled")  # fmt: skip
 
     async def generate(self, opportunity_id: int, *, trigger: RunTrigger, regenerate: bool = False) -> tuple[ArticleRequestResult, ArticleOutcome | None]:  # fmt: skip
         """Create and run synchronously (the CLI). No run for an existing article."""
@@ -565,9 +567,11 @@ class ArticleService:
                 else:
                     chain.final_version_id = version.id
                     article.final_version_id, article.word_count = version.id, words
-                    # A new edited version must be validated again (Phase 6).
+                    # A new edited version must be validated again (Phase 6), and approved
+                    # again before it can be published (Phase 7).
                     article.recommended_version_id = article.quality_report_id = None
                     article.quality_score = article.validated_at = None
+                    await invalidate_all(session, article.id, now, f"a new edited version ({version.id}) replaced the validated content")  # fmt: skip
 
     @staticmethod
     async def _add_version(session: AsyncSession, article_id: int, step_id: int, kind: VersionKind, title: str, content: dict[str, Any], words: int | None, issues: list[ContentIssue], changes: list[str], model: str, now: datetime) -> ArticleVersion:  # fmt: skip

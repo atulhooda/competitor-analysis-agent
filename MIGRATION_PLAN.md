@@ -9,6 +9,12 @@
 - r4 (2026-09-13): Phase 2 approved. Phase 3 (AI competitor intelligence, the first Gemini calls) implemented; see the implementation notes under §12, Phase 3.
 - r5 (2026-09-14): Phase 3 approved. Phase 4 (content opportunities) implemented; see the implementation notes under §12, Phase 4. Relevance is now deterministic rather than an LLM judgment (§8.3); Gemini only interprets the top candidates.
 - r6 (2026-09-14): Phase 4 approved. Phase 5 (article drafts) implemented; see the implementation notes under §12, Phase 5. LangGraph was evaluated and **not** adopted: a plain checkpoint table gives the same resumability for this linear pipeline, without a new dependency (§8.4). Drafts only; nothing is published.
+- r8 (2026-09-15): Phase 6 approved. Phase 7 (approval and CMS publishing, WordPress first) implemented; see the implementation notes under §12, Phase 7. It differs from §8.5–8.6 in three ways:
+  - approvals are records tied to an exact version and quality report, not an article state;
+  - HTML is built from the structured article with escaping (no Markdown conversion or sanitizer needed);
+  - no SEO mu-plugin is assumed.
+
+  Phase 7 publishes only approved, ready article versions and defaults to WordPress drafts. Scheduling is not included.
 - r7 (2026-09-14): Phase 5 approved. Phase 6 (article validation: fact-checking, originality, SEO package, metrics, Gemini judge, combined score and gates, bounded revisions) implemented on the Phase 5 checkpoint system; see the implementation notes under §12, Phase 6. LangGraph still isn't needed: the bounded loop is a few lines over the same checkpoints. Phase 6 validates and prepares articles but does not publish them.
 
 The three source repositories were cloned to a temporary scratch directory for analysis only. They are not vendored, submoduled, or left beside the project.
@@ -883,6 +889,39 @@ At every phase: run the tests → run the app → verify against real inputs →
 ### Phase 7 — CMS publishing
 - `CMSPublisher`, `WordPressPublisher` (draft/publish/schedule, taxonomy, slug, SEO meta via mu-plugin), idempotency and reconciliation.
 - `ApprovalPolicy` and the approve/reject API.
+
+**Implemented (2026-09-15). What was built, and where it differs from §8.5–8.6:**
+- **Layers.** `PublishingService` (approval, preflight, idempotency, lifecycle) → `CMSPublisher` protocol (`app/cms/base.py`, CMS-neutral: string post ids, neutral statuses, terms by name) → `WordPressPublisher` (mapping and publishing semantics) → `WordPressClient` (HTTP, Application Password auth, bounded retries, error mapping, read-only mode). Only `app/cms/wordpress/` knows WordPress's API, fields, ids and statuses.
+- **Approval (`article_approvals`), a record rather than an article state.**
+  - A decision (`approved` / `rejected`) on one exact **version and quality report**, with the approver, method (`manual` / `auto`), channel (API, CLI, policy), note and time.
+  - A partial unique index keeps one live decision per article.
+  - Decisions are never deleted or edited. A later decision, a new recommended version or report (Phase 6 `_finalize`), a new Phase 5 edit, or cancellation sets `invalidated_at` and the reason, once.
+  - Only `ready` articles can be decided; `needs_review` has no override.
+  - Auto-approval (`PUBLISH_AUTO_APPROVE`, off by default) runs at publish time, applies the same checks, and never overrides a rejection.
+  - §8.5's `awaiting_approval` state isn't needed: `pending` is derived (ready, with no live decision for the current version and report).
+- **Rendering, which differs from §8.6's Markdown → HTML + nh3.**
+  - The article is structured text, so `article_render.py` builds HTML tag by tag and escapes every piece of text. A model can't inject markup, so there's nothing to sanitize and no new dependency.
+  - Citations become numbered references to a Sources section listing only this version's cited sources.
+  - Only Phase 6-validated links to allowed targets (stored company pages, the article's stored sources) are placed; unplaced internal links go under "Related reading".
+  - The FAQ is included. No image is invented.
+- **SEO mapping, which differs from §8.6.** Title, slug, excerpt (the meta description), category and tags (resolved by name, never by model ids) and the author. No SEO plugin or mu-plugin is assumed; the meta title and description stay in the publication record.
+- **Terms.** A missing category **blocks** publishing unless `WORDPRESS_CREATE_MISSING_TERMS`. Missing tags are left out with a warning.
+- **Idempotency and reconciliation.**
+  - **`publications`:** one row per (article, version, CMS, site), with a unique SHA-256 idempotency key, the post id (saved as soon as known), status, target, what was mapped, the last preflight and `superseded_by`.
+  - **`publication_attempts`:** every change and its outcome (`succeeded` / `failed` / `unknown`).
+  - **The marker, which differs from §8.6's post meta.** Each post starts with an opaque random marker in an HTML comment, so no mu-plugin is needed. A post without it is never updated.
+  - **Lost responses.** A creation whose answer was lost (a timeout, a malformed 2xx, a 5xx) is reconciled by slug, then by marker search, before any retry, and the post is adopted if found. If the lookup fails, the run stops. Reads and updates of a known post are retried by the client (bounded, backoff, `Retry-After`); creations never are.
+- **Draft first.** Drafts by default. Making a post public needs `WORDPRESS_ALLOW_DIRECT_PUBLISH`. `PUBLISH_DRAFT_FIRST` writes and verifies a draft before going public. A public post is never set back to draft.
+- **Version safety.** A new recommended version is never pushed automatically. It needs its own approval and an explicit publish, and then updates the same post (the lineage is the article's earlier publication on the site, plus the marker). Earlier publications stay as history.
+- **The opportunity** becomes `used` only after a verified public post.
+- **Runs.** `runs.kind = article_publish`. Publishing shares the article's advisory lock and run slot with generation and validation, so a concurrent request returns the in-progress publication. The API queues in the background (`202`, `{"publication_id", "status": "queued"}`).
+- **Migration `0006`:** three new tables with foreign keys, CHECKs, indexes and the partial unique index. No existing rows change; the downgrade drops only these tables.
+- **Security.**
+  - Credentials come from settings only (the password is a `SecretStr`) and never appear in logs, the database, API responses or error messages.
+  - `WORDPRESS_BASE_URL` must be https (http only for loopback) without credentials, and redirects are never followed.
+  - Dry runs use a client that refuses any change.
+- **Verification.** The fake WordPress (`tests/fakewordpress.py`) injects `401`, `403`, `400`, `429`, `5xx`, timeouts, lost responses, malformed answers and redirects. The opt-in live test (`LIVE_WORDPRESS=1 pytest -m cms_live`) writes, updates and trashes one draft on a real site.
+- **Scope kept out.** Scheduling, daily limits and cadence (Phase 8); social publishing (Phase 9).
 
 ### Phase 8 — Scheduling and daily limits
 - Worker process, env-configured cron, advisory locks, the generate-N job, the publish-queue job, and the transactional daily limit, with its concurrency test.

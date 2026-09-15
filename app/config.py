@@ -5,10 +5,12 @@ The settings pattern — a pydantic-settings ``Settings`` class plus a cached
 (MIT, © 2026 Dravin Kumar Sharma). See THIRD_PARTY_NOTICES.md.
 """
 
+import ipaddress
 import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Self
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
@@ -178,7 +180,24 @@ class Settings(BaseSettings):
     seo_description_max_chars: int = Field(default=160, ge=50, le=320)
     seo_max_keyword_density: float = Field(default=0.03, gt=0, le=0.2)
 
-    @field_validator("api_key", "gemini_api_key", mode="before")
+    # ── Publishing (Phase 7: approved, ready versions only; drafts by default) ─
+    cms_provider: Literal["wordpress"] = "wordpress"
+    cms_request_timeout: float = Field(default=30.0, gt=0, le=300)  # seconds per CMS request
+    cms_max_retries: int = Field(default=2, ge=0, le=5)  # transient failures only
+    wordpress_base_url: str | None = None  # e.g. https://blog.example.com (no credentials)
+    wordpress_username: str | None = None
+    wordpress_application_password: SecretStr | None = None  # an Application Password
+    wordpress_default_status: Literal["draft", "pending", "publish"] = "draft"
+    wordpress_default_author_id: int | None = Field(default=None, ge=1)
+    wordpress_default_category_id: int | None = Field(
+        default=None, ge=1
+    )  # when the SEO package has none
+    wordpress_allow_direct_publish: bool = False  # required to make a post public
+    wordpress_create_missing_terms: bool = False  # create missing categories and tags
+    publish_auto_approve: bool = False  # approve ready articles automatically when publishing
+    publish_draft_first: bool = True  # going public: a verified draft first
+
+    @field_validator("api_key", "gemini_api_key", "wordpress_application_password", mode="before")
     @classmethod
     def _blank_secret_is_unset(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
@@ -211,6 +230,34 @@ class Settings(BaseSettings):
         if any(w < 0 for w in self.quality_weights.values()) or sum(self.quality_weights.values()) <= 0:  # fmt: skip
             raise ValueError("QUALITY_WEIGHTS must be non-negative with a positive total")
         return self
+
+    @model_validator(mode="after")
+    def _publishing_is_safe(self) -> Self:
+        if self.wordpress_base_url:
+            parts = urlsplit(self.wordpress_base_url.strip())
+            host = (parts.hostname or "").lower()
+            if parts.scheme not in ("https", "http") or not host:
+                raise ValueError("WORDPRESS_BASE_URL must be an http(s) URL, e.g. https://blog.example.com")  # fmt: skip
+            if parts.username or parts.password or parts.query or parts.fragment:
+                raise ValueError("WORDPRESS_BASE_URL must not contain credentials, a query or a fragment: set WORDPRESS_USERNAME and WORDPRESS_APPLICATION_PASSWORD")  # fmt: skip
+            if parts.scheme == "http" and not _is_loopback(host):
+                raise ValueError("WORDPRESS_BASE_URL must use https (http only for localhost): credentials are sent with every request")  # fmt: skip
+        if self.wordpress_default_status == "publish" and not self.wordpress_allow_direct_publish:
+            raise ValueError("WORDPRESS_DEFAULT_STATUS=publish needs WORDPRESS_ALLOW_DIRECT_PUBLISH=true")  # fmt: skip
+        return self
+
+    @property
+    def cms_configured(self) -> bool:
+        """True when the CMS URL and credentials are all set (their values are never shown)."""
+        return bool(self.wordpress_base_url and self.wordpress_username and self.wordpress_application_password)  # fmt: skip
+
+    @property
+    def cms_site(self) -> str | None:
+        """The CMS site, normalized (identifies where a publication lives)."""
+        if not self.wordpress_base_url:
+            return None
+        parts = urlsplit(self.wordpress_base_url.strip())
+        return f"{parts.scheme}://{(parts.hostname or '').lower()}{f':{parts.port}' if parts.port else ''}{parts.path.rstrip('/')}"  # fmt: skip
 
     @property
     def analysis_model(self) -> str:
@@ -245,6 +292,15 @@ class Settings(BaseSettings):
         """Product token used to match robots.txt groups, e.g. ``CompetitorMonitorBot``."""
         match = re.match(r"[A-Za-z0-9_.-]+", self.crawler_user_agent)
         return match.group(0).split("/")[0] if match else self.crawler_user_agent
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
 
 
 @lru_cache(maxsize=1)
