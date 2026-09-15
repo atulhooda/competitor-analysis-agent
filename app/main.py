@@ -13,14 +13,16 @@ from fastapi import FastAPI
 
 from app import __version__
 from app.api import health
-from app.api.v1 import competitors, history, intelligence, opportunities
+from app.api.v1 import articles, competitors, history, intelligence, opportunities
 from app.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.crawling.fetcher import PoliteFetcher
+from app.crawling.netguard import Resolver, system_resolver
 from app.db.migrate import head_revision
 from app.db.session import create_engine, create_session_factory
 from app.llm import LazyLLM, LLMProvider
 from app.services.analysis import AnalysisService
+from app.services.articles import ArticleService
 from app.services.intelligence import IntelligenceService
 from app.services.landscape import LandscapeService
 from app.services.opportunities import OpportunityService
@@ -35,10 +37,11 @@ def create_app(
     *,
     fetcher: PoliteFetcher | None = None,
     llm: LLMProvider | None = None,
+    resolver: Resolver = system_resolver,
 ) -> FastAPI:
-    """``fetcher`` and ``llm`` are injectable for tests; by default they're built from
-    settings. The LLM provider is created on first use, so the app starts (and scans)
-    without GEMINI_API_KEY."""
+    """``fetcher``, ``llm`` and ``resolver`` (DNS for the research URL check) are
+    injectable for tests; by default they're built from settings. The LLM provider is
+    created on first use, so the app starts (and scans) without GEMINI_API_KEY."""
     settings = settings or get_settings()
     configure_logging(settings.log_level, json_output=settings.log_json)
 
@@ -59,6 +62,7 @@ def create_app(
         app.state.landscapes = LandscapeService(engine, sessions, lazy_llm, settings)
         app.state.topic_admin = TopicAdminService(sessions, lazy_llm, settings)
         app.state.opportunities = OpportunityService(engine, sessions, lazy_llm, settings)
+        app.state.articles = ArticleService(engine, sessions, lazy_llm, settings, resolver=resolver)
         app.state.background_tasks = background
         _log_startup(settings)
         try:
@@ -82,6 +86,7 @@ def create_app(
     app.include_router(history.router)
     app.include_router(intelligence.router)
     app.include_router(opportunities.router)
+    app.include_router(articles.router)
     return app
 
 
@@ -94,6 +99,7 @@ def _log_startup(settings: Settings) -> None:
         llm_model=settings.gemini_model,
         llm_analysis_model=settings.analysis_model,
         llm_synthesis_model=settings.synthesis_model,
+        llm_writing_model=settings.writing_model,
         llm_configured=settings.llm_configured,  # never log the key itself
         llm_daily_token_budget=settings.llm_daily_token_budget,
     )

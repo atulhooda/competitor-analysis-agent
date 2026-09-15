@@ -116,6 +116,22 @@ class Settings(BaseSettings):
     company_file: Path = Path("config/company.yaml")
     scoring_file: Path = Path("config/scoring.yaml")
 
+    # ── Articles (Phase 5: drafts only, never published) ─────────────────────
+    gemini_writing_model: str | None = None  # research, outline, draft, edit (empty → GEMINI_MODEL)
+    writing_reasoning_effort: ReasoningLevel = "medium"  # outline, draft, edit
+    research_reasoning_effort: ReasoningLevel = "low"
+    # Whole-article token budget, across every step and every resume.
+    article_max_tokens: int = Field(default=400_000, ge=10_000)
+    article_target_words: int = Field(default=1_500, ge=300, le=6_000)
+    article_min_words: int = Field(default=600, ge=100, le=6_000)
+    # Research material (facts, sources, competitor context) sent to the writing prompts.
+    article_max_context_chars: int = Field(default=40_000, ge=5_000, le=400_000)
+    article_research_max_queries: int = Field(default=6, ge=1, le=20)
+    article_research_max_sources: int = Field(default=10, ge=1, le=40)
+    article_research_max_url_context_calls: int = Field(default=2, ge=1, le=10)
+    article_research_max_tokens: int = Field(default=150_000, ge=5_000)
+    article_research_min_sources: int = Field(default=2, ge=0, le=20)
+
     @field_validator("api_key", "gemini_api_key", mode="before")
     @classmethod
     def _blank_secret_is_unset(cls, value: object) -> object:
@@ -127,6 +143,16 @@ class Settings(BaseSettings):
             raise ValueError("ANALYSIS_ITEM_MAX_CHARS must not exceed ANALYSIS_BATCH_MAX_CHARS")
         return self
 
+    @model_validator(mode="after")
+    def _article_limits_are_consistent(self) -> Self:
+        if self.article_min_words > self.article_target_words:
+            raise ValueError("ARTICLE_MIN_WORDS must not exceed ARTICLE_TARGET_WORDS")
+        if self.article_research_max_tokens > self.article_max_tokens:
+            raise ValueError("ARTICLE_RESEARCH_MAX_TOKENS must not exceed ARTICLE_MAX_TOKENS")
+        if self.article_research_min_sources > self.article_research_max_sources:
+            raise ValueError("ARTICLE_RESEARCH_MIN_SOURCES must not exceed ARTICLE_RESEARCH_MAX_SOURCES")  # fmt: skip
+        return self
+
     @property
     def analysis_model(self) -> str:
         return self.gemini_analysis_model or self.gemini_model
@@ -134,6 +160,10 @@ class Settings(BaseSettings):
     @property
     def synthesis_model(self) -> str:
         return self.gemini_synthesis_model or self.gemini_model
+
+    @property
+    def writing_model(self) -> str:
+        return self.gemini_writing_model or self.gemini_model
 
     @property
     def database_url_display(self) -> str:

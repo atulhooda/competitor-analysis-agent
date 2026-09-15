@@ -1,5 +1,5 @@
 """Postgres advisory locks: one scan and one analysis per competitor; one landscape report
-and one opportunity generation at a time.
+and one opportunity generation at a time; one generation run per article.
 
 No Redis needed. A session-level lock lives exactly as long as the connection that holds
 it, so a crashed process can never leave anything locked.
@@ -15,6 +15,7 @@ _SCAN_NAMESPACE = 72_001
 _ANALYSIS_NAMESPACE = 72_002
 _LANDSCAPE_NAMESPACE = 72_003
 _OPPORTUNITY_NAMESPACE = 72_004
+_ARTICLE_NAMESPACE = 72_005
 # 72_010 / 72_011 are transaction-level locks: taxonomy writes, company profile versions.
 
 
@@ -59,3 +60,12 @@ def landscape_lock(engine: AsyncEngine) -> AbstractAsyncContextManager[bool]:
 
 def opportunity_lock(engine: AsyncEngine) -> AbstractAsyncContextManager[bool]:
     return try_advisory_lock(engine, OPPORTUNITY_LOCK_KEY)
+
+
+def article_lock_key(article_id: int) -> int:
+    return (_ARTICLE_NAMESPACE << 32) | article_id
+
+
+def article_lock(engine: AsyncEngine, article_id: int) -> AbstractAsyncContextManager[bool]:
+    """One generation run per article at a time (different articles run in parallel)."""
+    return try_advisory_lock(engine, article_lock_key(article_id))

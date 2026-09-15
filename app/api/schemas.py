@@ -4,6 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
+from app.domain.articles import ArticleSummary
 from app.domain.company import CompanyProfileView
 from app.domain.content import ContentType
 from app.domain.history import RunView
@@ -93,6 +94,28 @@ class OpportunityStatusUpdate(BaseModel):
 class CompanyProfileSaved(BaseModel):
     created: bool = Field(description="False when the profile equals the current version")
     version: CompanyProfileView
+
+
+class ArticleCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    opportunity_id: int = Field(ge=1, description="An approved opportunity")
+    regenerate: bool = Field(
+        default=False, description="Start a new attempt after a failed or cancelled article"
+    )
+
+
+class ArticleCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str | None = Field(default=None, max_length=2_000)
+
+
+class ArticleRunResponse(BaseModel):
+    article: ArticleSummary
+    run: RunView | None = Field(description="The queued (or finished, with ?wait=true) run")
+    created: bool = Field(description="A new article (create) or a new run (resume)")
+    message: str | None = None
 
 
 class DatabaseStatus(BaseModel):

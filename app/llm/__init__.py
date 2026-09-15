@@ -8,12 +8,16 @@ Importing this package does not import any provider SDK.
 """
 
 from app.llm.base import (
+    Citation,
+    Grounding,
     LLMProvider,
     LLMRequest,
     LLMResponse,
     LLMUsage,
     ReasoningEffort,
+    RetrievedURL,
     StructuredResponse,
+    Tool,
 )
 from app.llm.errors import (
     LLMAuthenticationError,
@@ -28,6 +32,8 @@ from app.llm.errors import (
 from app.llm.factory import LazyLLM, create_llm_provider, get_llm
 
 __all__ = [
+    "Citation",
+    "Grounding",
     "LLMAuthenticationError",
     "LLMBudgetExceededError",
     "LLMConfigurationError",
@@ -42,7 +48,9 @@ __all__ = [
     "LLMUsage",
     "LazyLLM",
     "ReasoningEffort",
+    "RetrievedURL",
     "StructuredResponse",
+    "Tool",
     "create_llm_provider",
     "get_llm",
 ]

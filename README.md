@@ -4,11 +4,11 @@ An AI-powered competitor intelligence and content generation agent. It monitors 
 websites (and later their social channels), keeps a history of what they publish, finds content
 opportunities, and generates and publishes original blog posts.
 
-> **Status: Phase 4 of 10: content opportunities.** Scans stay deterministic (no LLM) and are
-> stored in PostgreSQL. Gemini analyzes what competitors publish (Phase 3). Phase 4 turns that
-> into a ranked list of content opportunities for *your* company. Signals, gaps and scores are
-> computed deterministically from stored data; Gemini only writes the angle and rationale for
-> the top candidates. Nothing is written or published yet.
+> **Status: Phase 5 of 10: article drafts.** Scans are deterministic and stored in PostgreSQL;
+> Gemini analyzes what competitors publish (Phase 3); opportunities are scored
+> deterministically (Phase 4). Phase 5 turns an **approved** opportunity into a researched,
+> cited, edited article draft. **Phase 5 generates drafts but does not publish them**:
+> nothing is sent to a CMS, scheduled or posted.
 > See [MIGRATION_PLAN.md](MIGRATION_PLAN.md) for the architecture and roadmap.
 
 ## What it does today
@@ -118,6 +118,21 @@ create next?" with a ranked list of opportunities. Each one has:
 
 See [Content opportunities](#content-opportunities) for the methodology.
 
+**Article drafts (Phase 5).** Writes an article for an opportunity you approved:
+
+```
+approved opportunity → brief (deterministic) → research (Google Search + URL context)
+  → outline → draft → editorial pass → stored article, with sources and citations
+```
+
+- **Traceable.** Every article links to its opportunity, the assessment it was briefed from,
+  the company profile version it was written with, and the evidence behind them.
+- **Cited.** Each research-backed statement cites a stored source that Gemini actually read.
+- **Checkpointed.** A failed or interrupted article resumes where it stopped.
+
+**Phase 5 generates drafts but does not publish them.** See
+[Article drafts](#article-drafts).
+
 ### Dates: what they mean
 
 | Field | Meaning |
@@ -177,6 +192,16 @@ cp config/company.example.yaml config/company.yaml  # your company profile (giti
 uv run python -m app company import
 uv run python -m app opportunities generate         # works without GEMINI_API_KEY (no interpretation)
 uv run python -m app opportunities                  # the ranked list
+```
+
+To write a draft, approve an opportunity, check its brief, then generate (needs
+`GEMINI_API_KEY`):
+
+```bash
+uv run python -m app opportunities approve 12
+uv run python -m app articles brief 12              # the deterministic brief (no Gemini)
+uv run python -m app articles generate 12           # research, outline, draft, edit
+uv run python -m app articles show 1                # the draft, with its sources (not published)
 ```
 
 The database is the source of truth for competitors; the YAML file is an import format.
@@ -250,6 +275,18 @@ uv run python -m app opportunities evidence 12       # the stored evidence behin
 uv run python -m app opportunities history 12        # every assessment, with why the score changed
 uv run python -m app opportunities approve 12 --note "for Q4"   # also: review, reject, use, expire, reopen
 
+# Article drafts (needs GEMINI_API_KEY, except `brief`; nothing is published)
+uv run python -m app articles brief 12               # preview the brief for opportunity 12
+uv run python -m app articles generate 12            # write a draft for approved opportunity 12
+uv run python -m app articles generate 12 --regenerate   # a new attempt after a failed or cancelled one
+uv run python -m app articles                        # list (also: --status, --opportunity, --since)
+uv run python -m app articles show 1                 # status, steps, brief, issues, Markdown preview
+uv run python -m app articles sources 1              # retrieved sources, their facts, citation counts
+uv run python -m app articles versions 1             # outline, draft and edited versions (--show ID)
+uv run python -m app articles steps 1                # the checkpoint log (fingerprints, prompts, tokens)
+uv run python -m app articles resume 1               # continue from the first unfinished step
+uv run python -m app articles cancel 1               # stop for good
+
 # Database
 uv run python -m app db upgrade                      # apply migrations
 uv run python -m app db current                      # show the schema revision
@@ -294,6 +331,15 @@ uv run uvicorn app.main:create_app --factory --port 8000
 | GET | `/api/v1/opportunities/{id}/evidence` | Evidence rows of the current assessment, or of a past one (`?assessment_id=`) |
 | GET | `/api/v1/opportunities/{id}/history` | Every assessment: score, company profile version, what changed |
 | PATCH | `/api/v1/opportunities/{id}` | Change status: `{"status": "approved", "note": "..."}`. `409` if the transition isn't allowed |
+| GET | `/api/v1/opportunities/{id}/brief` | The deterministic brief an article would get (no Gemini, nothing stored) |
+| POST | `/api/v1/articles` | Write a draft for an approved opportunity: `202` with the article and its queued run (runs in the background), or `?wait=true`. Body: `{"opportunity_id": 12, "regenerate": false}`. `200` with the existing article if the opportunity already has one; `409` if the opportunity isn't approved; `503` without `GEMINI_API_KEY` |
+| GET | `/api/v1/articles` | Newest first. Filters: `status` (repeatable), `opportunity_id`, `created_since`, `created_until`, `limit`/`offset` |
+| GET | `/api/v1/articles/{id}` | Status, progress, current step, brief, steps (prompt versions, models, tokens), runs, content (edited version, or the draft until then), outline, issues, failure details (`?include_markdown=true` for a preview) |
+| GET | `/api/v1/articles/{id}/sources` | Retrieved sources with their facts and citation counts (`?all=true` for earlier research runs) |
+| GET | `/api/v1/articles/{id}/versions`, `…/versions/{version_id}` | Every outline, draft and edited version / one version with its claim → source citations and editor notes |
+| GET | `/api/v1/articles/{id}/steps` | The checkpoint log |
+| POST | `/api/v1/articles/{id}/resume` | Continue from the first step needing work (`202`), or `200` when nothing needs redoing. `409` while running, for a cancelled article, or when the article's token budget is spent |
+| POST | `/api/v1/articles/{id}/cancel` | Stop for good; a run in progress stops before its next step |
 
 `/api/v1/*` requires the `X-API-Key` header whenever `API_KEY` is set. Outside development,
 requests are refused until it is. Interactive docs are served at `/docs`.
@@ -519,6 +565,174 @@ only:
   results. Gemini's confidence is the model's own estimate.
 - **Digits only.** The number check only works on digits; "three times" isn't caught.
 
+## Article drafts
+
+Phase 5 turns an approved opportunity into a complete blog draft and stores it.
+**Phase 5 generates drafts but does not publish them.** Publishing is Phase 7.
+
+### Flow
+
+| Step | Status | How |
+|---|---|---|
+| brief | stored when the article is created | Deterministic, from stored data. No Gemini |
+| research | `researching` | Gemini with Google Search finds sources; Gemini's URL context tool reads them |
+| outline | `outlining` | Gemini, structured sections |
+| draft | `drafting` | Gemini, structured content with citation markers |
+| edit | `editing` | Gemini editorial pass, then the completion checks |
+| | `completed` | Stored; a person reviews it |
+
+Only an opportunity with status `approved` can get an article. Its generation runs in the
+background (`POST /api/v1/articles`, or synchronously with `articles generate`).
+
+### One live article per opportunity
+
+- An opportunity has at most one article that is in progress or completed. A database
+  constraint enforces it, even for concurrent requests.
+- Asking again returns the existing article.
+- A **failed** article is resumed (`articles resume`).
+- A **cancelled** article is final.
+- `regenerate` starts a new attempt after a failed or cancelled one; the old attempt is kept.
+- A generation run stops if its opportunity stops being approved.
+
+### The brief
+
+The brief is built from stored data only:
+
+- the opportunity and its score;
+- the assessment's gaps and suggestion;
+- Gemini's Phase 4 interpretation, if there is one;
+- the evidence rows (competitor pages and positioning);
+- the company profile (description, products, audiences, positioning, differentiators, tone).
+
+It defines:
+
+- the topic, working title, target audience and search intent;
+- the angle, content type and desired outcome;
+- the key points to cover and the competitor weaknesses to address;
+- the differentiation strategy and things to avoid;
+- the evidence: competitor pages, as context, never as facts.
+
+`provenance` names the input behind each choice. The same inputs always give the same brief.
+Preview it with `articles brief` before spending anything. It's stored when the article is
+created.
+
+### Research
+
+1. **Discover.** One Gemini call with Google Search grounding.
+   - Gemini identifies the claims that need evidence (at most `ARTICLE_RESEARCH_MAX_QUERIES`
+     research questions) and proposes candidate sources.
+   - It prefers official documentation, primary sources, research, regulators and reputable
+     organizations, and avoids vendor marketing.
+   - The actual Google queries are recorded.
+2. **Screen** (deterministic). Each URL must be a public http(s) address:
+   - no credentials, non-standard ports, `javascript:`/`file:` URLs, or private, loopback or
+     link-local hosts;
+   - the domain must resolve, checked with the Phase 1 SSRF guard.
+
+   Duplicates are dropped. Your site and competitors' sites are recognized by domain. The most
+   authoritative candidates come first, capped at `ARTICLE_RESEARCH_MAX_SOURCES`.
+3. **Read.** Gemini's URL context tool retrieves the pages (at most
+   `ARTICLE_RESEARCH_MAX_URL_CONTEXT_CALLS` calls) and extracts facts with supporting excerpts.
+   This process never fetches a page itself.
+
+A URL becomes a source **only if the URL tool reports that it retrieved the page**, so a made-up
+or broken URL never reaches the article. Every candidate's outcome is recorded (retrieved, not
+retrieved, rejected, skipped) with the reason. Research needs at least
+`ARTICLE_RESEARCH_MIN_SOURCES` usable sources, or the step fails and keeps what it found.
+Facts from competitor or company pages are marked `attribution_required`: the article may
+state them only as attributed claims.
+
+### Citations and provenance
+
+- **The chain.** `article claim → source label → stored source → URL`.
+  - The content marks research-backed statements with inline labels such as `[S3]`.
+  - Every draft and edited version stores each claim with the sources it cites
+    (`article_citations`, with foreign keys to `article_sources`).
+  - Phase 6 fact-checking can read these directly.
+- **Unknown labels.** A citation label that doesn't match a stored source is removed and
+  recorded as an issue. Sources are never invented.
+- **Numbers.** Sentences with a number found in neither the research nor the brief are flagged
+  for review.
+- **Format.** The content is structured JSON (sections → paragraphs, lists, subheadings), not
+  HTML, so Phase 7 can render HTML, Markdown or CMS formats. The Markdown preview in
+  `articles show` is a review aid only.
+
+### Safety
+
+- **Untrusted content.** Web pages, competitor context and drafts are untrusted content. They
+  are wrapped in delimiters they can't close or imitate. Every prompt separates the system
+  instructions from them and says to ignore instructions embedded in them.
+- **Tools.** Only research calls have tools (search, URL reading). The outline, draft and edit
+  calls have none, and nothing in the pipeline executes or publishes anything.
+- **Competitor text.** Competitor pages inform differentiation only. The writing prompts get
+  Phase 3 summaries and angles, never competitor page text. Copying, close paraphrase and
+  unattributed competitor claims are forbidden in the prompts.
+- **Company facts.** These come only from the company profile; anything else is treated as
+  unknown.
+
+### Resumability, idempotency and prompt versions
+
+- **Checkpoints.** Every step execution is a row in `article_steps`. It holds a fingerprint
+  of the step's inputs (the upstream outputs, the step's prompt version, the model and the
+  relevant settings), plus its output, tokens and status.
+- **When a step runs.** A run executes a step only if no succeeded execution matches its
+  fingerprint.
+  - A failure or crash after research resumes at the outline.
+  - A failed draft is retried with the same research and outline.
+  - Running a finished article again makes no Gemini call.
+- **Crashes.** A run whose process died is detected (its lock is free) and marked
+  interrupted, and the article resumes.
+- **Prompt versions.** Each prompt has its own version (`article-research/1`,
+  `article-outline/1`, `article-draft/1`, `article-edit/1`; the brief builder is
+  `article-brief/1`).
+  - A new editorial prompt version re-runs only the edit.
+  - A new outline version re-runs the outline, then the draft and edit only if the outline
+    actually changed.
+- **Versions.** Outline, draft and edited versions are immutable. Re-running adds a version,
+  so "what did the model write before the latest edit?" is always answerable.
+- **Slugs.** Deterministic from the title (ASCII, collision-safe). A slug is not a public URL.
+
+### Token budget
+
+- **Per article.** `ARTICLE_MAX_TOKENS` limits the whole article, across every step and
+  resume, within the daily budget.
+- **Research.** Research has its own cap, `ARTICLE_RESEARCH_MAX_TOKENS`.
+- **Checking.** Budgets are checked before every call.
+- **When it runs out.** The step fails safely: finished steps are kept, the article is
+  `failed`, and resuming requires raising the budget.
+- **Recording.** Every call is recorded in `llm_calls` (purposes `article_research`,
+  `article_outline`, `article_draft`, `article_edit`) with its prompt version and tokens.
+
+In a live run, a 1,900-word article with 3 sources and 28 citations used 6 calls and about
+47k tokens.
+
+### Completion checks
+
+Before an article is `completed`, deterministic checks require:
+
+- a non-empty title and content;
+- at least two sections, including a body section, each with a heading;
+- no empty blocks;
+- at least `ARTICLE_MIN_WORDS` words;
+- every citation matching a stored source;
+- the opportunity and company profile version still existing.
+
+These checks are a baseline, not a quality score (that's Phase 6). An edit that fails them
+fails the step, and a resume retries it.
+
+### Limitations
+
+- **Sources.** Research depends on what Google Search and URL context return. Paywalled,
+  script-rendered or blocked pages can't be read. With fewer usable sources than the minimum,
+  research fails rather than writing without evidence.
+- **No fact-checking yet.** Citations show which source a claim relies on, but whether the
+  source supports the claim isn't verified until Phase 6. The number check only sees digits.
+- **Titles.** The URL tool doesn't report page titles, so a source's title is as Gemini read
+  it from the page.
+- **Query cap.** The cap is enforced on research questions and in the prompt, while Gemini
+  decides the exact queries. The queries it ran are recorded.
+- **One language.** Articles are written in English.
+
 ## Data model
 
 PostgreSQL, managed with Alembic migrations (`migrations/`), in separate layers:
@@ -530,10 +744,11 @@ PostgreSQL, managed with Alembic migrations (`migrations/`), in separate layers:
 | Normalized | `content_items`, `content_versions`, `change_events` | One row per URL (lifecycle + reliable dates); immutable snapshots; the change log |
 | Analysis (Phase 3) | `topics`, `topic_aliases`, `content_analyses`, `content_analysis_topics`, `change_summaries`, `competitor_profiles`, `landscape_reports` | Model-produced interpretations, each with its run, model and prompt version; profiles and reports stored with the metrics they were grounded on |
 | Recommendations (Phase 4) | `company_profiles`, `opportunities`, `opportunity_assessments`, `opportunity_evidence`, `opportunity_events` | Versioned company profiles; one opportunity per topic with its status; immutable scored assessments (breakdown, gaps, signals, suggestion, Gemini interpretation); the evidence each assessment rests on; the status and scoring timeline |
-| Operations | `runs`, `run_events`, `llm_calls` | What ran, when, with what result; every LLM call with its tokens |
+| Generation (Phase 5) | `articles`, `article_steps`, `article_versions`, `article_sources`, `article_citations` | Article drafts linked to their opportunity, assessment and company profile version; the checkpoint log; immutable outline/draft/edited versions; retrieved research sources with their facts; claim → source citations. Never published |
+| Operations | `runs`, `run_events`, `llm_calls` | What ran, when, with what result (article runs carry `article_id`); every LLM call with its tokens |
 
-LLM output lives only in the analysis layer and in the `interpretation` of opportunity
-assessments. Neither modifies the layers below it, and no score depends on it.
+LLM output lives in the analysis layer, in the `interpretation` of opportunity assessments and
+in the generation layer. None of it modifies the layers below it, and no score depends on it.
 
 ## LLM provider: Google Gemini
 
@@ -586,8 +801,8 @@ topics = await llm.generate_structured(LLMRequest(prompt="..."), TopicList)  # a
 | 1 · Website monitoring | **No.** Deterministic. Works with `GEMINI_API_KEY` empty. |
 | 2 · Persisted history | **No.** Storage, incremental scans and change detection are deterministic. |
 | 3 · Competitor analysis | **Yes:** per-page analysis, change summaries, profiles, landscape briefings, topic consolidation. Metrics, trends and gaps stay deterministic. |
-| 4 · Content opportunities (current) | **Yes, top candidates only:** title, angle, why now, format, audience, rationale. Signals, relevance, gaps, scores and ranking are deterministic; works without a key. |
-| 5 · Blog research and generation | Yes |
+| 4 · Content opportunities | **Yes, top candidates only:** title, angle, why now, format, audience, rationale. Signals, relevance, gaps, scores and ranking are deterministic; works without a key. |
+| 5 · Article drafts (current) | **Yes:** research (Google Search grounding and URL context), outline, draft, editorial pass. The brief, URL screening, citation checks and completion checks are deterministic. Nothing is published. |
 | 6 · SEO, editing, fact-checking, quality | Yes |
 | 7–10 · Publishing, scheduling, social, dashboard | Publishing itself never uses an LLM |
 
@@ -617,6 +832,16 @@ All settings are environment variables (or `.env`); see [`.env.example`](.env.ex
 | `ANALYSIS_TAXONOMY_PROMPT_LIMIT` | `150` | Existing topics shown to the analyzer |
 | `COMPANY_FILE` | `config/company.yaml` | Company profile YAML for `company import` |
 | `SCORING_FILE` | `config/scoring.yaml` | Optional opportunity scoring configuration (weights, thresholds, Gemini candidates); built-in defaults without it |
+| `GEMINI_WRITING_MODEL` | `GEMINI_MODEL` | Model for article research, outline, draft and editing |
+| `WRITING_REASONING_EFFORT` / `RESEARCH_REASONING_EFFORT` | `medium` / `low` | Gemini `thinking_level` for writing and for research |
+| `ARTICLE_MAX_TOKENS` | `400000` | Token budget per article, across every step and resume |
+| `ARTICLE_TARGET_WORDS` / `ARTICLE_MIN_WORDS` | `1500` / `600` | Length the writer aims for / the minimum to complete |
+| `ARTICLE_MAX_CONTEXT_CHARS` | `40000` | Research material (facts, sources) included in writing prompts |
+| `ARTICLE_RESEARCH_MAX_QUERIES` | `6` | Research questions (Google Search queries requested) |
+| `ARTICLE_RESEARCH_MAX_SOURCES` | `10` | Candidate sources read and kept |
+| `ARTICLE_RESEARCH_MAX_URL_CONTEXT_CALLS` | `2` | Page-reading calls (URL context; up to 20 pages each) |
+| `ARTICLE_RESEARCH_MAX_TOKENS` | `150000` | Research token cap (within the article budget) |
+| `ARTICLE_RESEARCH_MIN_SOURCES` | `2` | Usable sources required to continue (0 allows an article without external sources) |
 
 ## Development
 
@@ -640,6 +865,11 @@ uv run pytest -m llm_live            # opt-in: one real Gemini call (needs GEMIN
   invalid output or invent numbers on demand.
 - Opportunity scoring is unit-tested on synthetic facts (no database), then end to end on
   PostgreSQL through the CLI and API.
+- Article generation is tested end to end with the fake Gemini and a controlled fake "web".
+  It includes authoritative pages, a redirect, a made-up URL, a prompt-injection page, a
+  competitor page and unsafe URLs. The tests cover failure and resume at every step, crash
+  recovery, concurrency, budgets and prompt-version changes. `uv run pytest -m llm_live
+  tests/live/test_live_article.py` writes one real article (about 40k tokens).
 - CI runs lint, format, type checks and tests against a PostgreSQL service
   (`.github/workflows/ci.yml`).
 
@@ -672,6 +902,11 @@ app/
     opportunity_signals.py     signals, gaps, score, suggestion, change reasons (no LLM)
     opportunities.py           generation runs: score → store → interpret; status changes
     numbers.py                 drops model sentences whose numbers aren't in the evidence
+    articles.py                article runs: checkpoints, resume, budgets, one live article
+    article_brief.py           the deterministic brief
+    research.py                search → URL screening → URL-context reading → sources and facts
+    article_writing.py         outline, draft and editorial pass (Gemini)
+    article_content.py         citations, completion checks, slugs, Markdown preview (no LLM)
   prompts/                     versioned prompts + their structured-output schemas
   db/                          models (by layer), sessions, advisory locks, queries, migrations
   llm/                         provider-agnostic LLM interface + Gemini provider

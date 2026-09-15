@@ -16,7 +16,10 @@ from app.domain.history import ACTIVE_RUN_STATUSES, RunStatus
 QUEUED_GRACE = timedelta(minutes=5)
 
 
-def _for_competitor(competitor_id: int | None) -> ColumnElement[bool]:
+def _scope(competitor_id: int | None, article_id: int | None) -> ColumnElement[bool]:
+    """Runs of one article (article runs), or of one competitor (or none): the others."""
+    if article_id is not None:
+        return Run.article_id == article_id
     if competitor_id is None:
         return Run.competitor_id.is_(None)
     return Run.competitor_id == competitor_id
@@ -29,13 +32,14 @@ async def run_slot_free(
     competitor_id: int | None,
     lock: AbstractAsyncContextManager[bool],
     now: datetime,
+    article_id: int | None = None,
 ) -> bool:
     """Whether a new run of ``kind`` may start. Runs left behind by a crashed process
     (their lock is free) are marked failed on the way."""
     query = select(Run.status, Run.created_at).where(
         Run.kind == kind, Run.status.in_(ACTIVE_RUN_STATUSES)
     )
-    active = (await session.execute(query.where(_for_competitor(competitor_id)))).all()
+    active = (await session.execute(query.where(_scope(competitor_id, article_id)))).all()
     if not active:
         return True
     async with lock as free:
@@ -47,7 +51,7 @@ async def run_slot_free(
     )
     if starting:
         return False
-    await fail_abandoned_runs(session, kind=kind, competitor_id=competitor_id, now=now)
+    await fail_abandoned_runs(session, kind=kind, competitor_id=competitor_id, now=now, article_id=article_id)  # fmt: skip
     return True
 
 
@@ -58,11 +62,14 @@ async def fail_abandoned_runs(
     competitor_id: int | None,
     now: datetime,
     keep: int | None = None,
+    article_id: int | None = None,
 ) -> None:
     """Mark queued/running runs of this kind failed. Call only while holding the kind's
     lock (or after checking it is free): then nobody is executing them."""
     query = update(Run).where(
-        Run.kind == kind, Run.status.in_(ACTIVE_RUN_STATUSES), _for_competitor(competitor_id)
+        Run.kind == kind,
+        Run.status.in_(ACTIVE_RUN_STATUSES),
+        _scope(competitor_id, article_id),
     )
     if keep is not None:
         query = query.where(Run.id != keep)

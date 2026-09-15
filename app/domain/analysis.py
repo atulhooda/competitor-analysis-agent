@@ -124,6 +124,10 @@ class LLMPurpose(StrEnum):
     LANDSCAPE = "landscape"
     TOPIC_CONSOLIDATION = "topic_consolidation"
     OPPORTUNITY_INTERPRETATION = "opportunity_interpretation"  # Phase 4
+    ARTICLE_RESEARCH = "article_research"  # Phase 5
+    ARTICLE_OUTLINE = "article_outline"
+    ARTICLE_DRAFT = "article_draft"
+    ARTICLE_EDIT = "article_edit"
 
 
 class LLMCallStatus(StrEnum):

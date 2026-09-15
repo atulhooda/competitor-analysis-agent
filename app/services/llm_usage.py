@@ -77,12 +77,18 @@ class BudgetedLLM:
         *,
         run_id: int | None,
         now: Callable[[], datetime] = utcnow,
+        token_limit: int | None = None,
+        token_limit_name: str = "LLM_MAX_TOKENS_PER_RUN",  # noqa: S107 - a setting name
     ) -> None:
+        """``token_limit`` lowers the per-run budget (e.g. what's left of an article's
+        budget); ``token_limit_name`` names it in the error."""
         self._provider = provider
         self._sessions = sessions
         self._settings = settings
         self._run_id = run_id
         self._now = now
+        self._token_limit = token_limit
+        self._token_limit_name = token_limit_name
         self.usage = RunUsage()
 
     async def structured[T: BaseModel](
@@ -95,8 +101,7 @@ class BudgetedLLM:
         items: int = 1,
     ) -> StructuredResponse[T]:
         request_chars = len(request.prompt) + len(request.system or "")
-        estimate = estimate_tokens(request_chars) + (request.max_output_tokens or 0) // 4
-        await self._check_budget(estimate)
+        await self._check_budget(self.estimate(request))
         model = request.model or self._provider.default_model
         started = time.monotonic()
         try:
@@ -114,12 +119,21 @@ class BudgetedLLM:
         )  # fmt: skip
         return result
 
+    def estimate(self, request: LLMRequest) -> int:
+        """Tokens a call is budgeted at before it's made: the prompt plus a quarter of the
+        output ceiling. Tool output (pages read, search results) isn't known in advance."""
+        request_chars = len(request.prompt) + len(request.system or "")
+        return estimate_tokens(request_chars) + (request.max_output_tokens or 0) // 4
+
     async def _check_budget(self, estimate: int) -> None:
-        run_budget = self._settings.llm_max_tokens_per_run
+        run_budget, name = self._settings.llm_max_tokens_per_run, "LLM_MAX_TOKENS_PER_RUN"
+        kind = "per-run"
+        if self._token_limit is not None and self._token_limit < run_budget:
+            run_budget, name, kind = self._token_limit, self._token_limit_name, "remaining"
         if self.usage.total_tokens + estimate > run_budget:
             raise LLMBudgetExceededError(
-                f"per-run LLM token budget reached ({self.usage.total_tokens:,} used, "
-                f"next call ≈{estimate:,}, LLM_MAX_TOKENS_PER_RUN={run_budget:,})"
+                f"{kind} LLM token budget reached ({self.usage.total_tokens:,} used this run, "
+                f"next call ≈{estimate:,}, {name}={run_budget:,})"
             )
         daily_budget = self._settings.llm_daily_token_budget
         if daily_budget <= 0:

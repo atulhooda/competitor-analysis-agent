@@ -224,3 +224,72 @@ async def test_invalid_structured_output_still_reports_billed_usage(provider: Ge
             await provider.generate_structured(LLMRequest(prompt="x"), Topic)
     assert caught.value.usage is not None
     assert caught.value.usage.total_tokens == 20
+
+
+async def test_tools_are_requested_and_what_they_did_is_reported(provider: GeminiProvider) -> None:
+    body = interaction(
+        '{"name": "AI support agents", "score": 87}',
+        steps=[
+            {
+                "type": "google_search_call",
+                "id": "c1",
+                "arguments": {"queries": ["ai agents handoff", "ai agents handoff"]},
+            },
+            {
+                "type": "google_search_result",
+                "call_id": "c1",
+                "result": [{"search_suggestions": "<div/>"}],
+            },
+            {
+                "type": "url_context_call",
+                "id": "c2",
+                "arguments": {"urls": ["https://a.example/x", "https://b.example/y"]},
+            },
+            {
+                "type": "url_context_result",
+                "call_id": "c2",
+                "result": [
+                    {"url": "https://a.example/x", "status": "success"},
+                    {"url": "https://b.example/y", "status": "paywall"},
+                ],
+            },
+            {
+                "type": "model_output",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": '{"name": "AI support agents", "score": 87}',
+                        "annotations": [
+                            {
+                                "type": "url_citation",
+                                "url": "https://a.example/x",
+                                "title": "a.example",
+                                "start_index": 0,
+                                "end_index": 10,
+                            }
+                        ],
+                    }
+                ],
+            },
+        ],
+    )
+    with respx.mock() as router:
+        route = router.post(url__regex=INTERACTIONS).respond(200, json=body)
+        result = await provider.generate_structured(
+            LLMRequest(prompt="Research this", tools=("google_search", "url_context")), Topic
+        )
+    assert json.loads(route.calls.last.request.content)["tools"] == [{"type": "google_search"}, {"type": "url_context"}]  # fmt: skip
+    grounding = result.raw.grounding
+    assert grounding.search_queries == ("ai agents handoff",)
+    assert grounding.requested_urls == ("https://a.example/x", "https://b.example/y")
+    assert [(r.url, r.status) for r in grounding.retrieved_urls] == [("https://a.example/x", "success"), ("https://b.example/y", "paywall")]  # fmt: skip
+    assert [(c.url, c.title, c.start_index) for c in grounding.citations] == [("https://a.example/x", "a.example", 0)]  # fmt: skip
+
+
+async def test_requests_without_tools_send_none_and_report_no_grounding(provider: GeminiProvider) -> None:  # fmt: skip
+    with respx.mock() as router:
+        route = router.post(url__regex=INTERACTIONS).respond(200, json=interaction('{"name": "x", "score": 1}'))  # fmt: skip
+        result = await provider.generate_structured(LLMRequest(prompt="x"), Topic)
+    assert "tools" not in json.loads(route.calls.last.request.content)
+    assert result.raw.grounding.search_queries == ()
+    assert result.raw.grounding.retrieved_urls == ()

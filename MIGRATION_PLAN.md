@@ -8,6 +8,7 @@
 - r3 (2026-09-13): Phase 1 approved. Phase 2 (persisted history) implemented; see the implementation notes under §12, Phase 2.
 - r4 (2026-09-13): Phase 2 approved. Phase 3 (AI competitor intelligence, the first Gemini calls) implemented; see the implementation notes under §12, Phase 3.
 - r5 (2026-09-14): Phase 3 approved. Phase 4 (content opportunities) implemented; see the implementation notes under §12, Phase 4. Relevance is now deterministic rather than an LLM judgment (§8.3); Gemini only interprets the top candidates.
+- r6 (2026-09-14): Phase 4 approved. Phase 5 (article drafts) implemented; see the implementation notes under §12, Phase 5. LangGraph was evaluated and **not** adopted: a plain checkpoint table gives the same resumability for this linear pipeline, without a new dependency (§8.4). Drafts only; nothing is published.
 
 The three source repositories were cloned to a temporary scratch directory for analysis only. They are not vendored, submoduled, or left beside the project.
 
@@ -783,6 +784,53 @@ At every phase: run the tests → run the app → verify against real inputs →
 ### Phase 5 — Blog generation
 - The LangGraph workflow (plan → research → outline → draft → edit) with the Postgres checkpointer.
 - Research sources persisted; claims tagged with source IDs (Gemini grounding metadata for web sources).
+
+**Implemented (2026-09-14). What was built, and where it differs from §7.1 and §8.4:**
+- **Pipeline** (`app/services/articles.py`, one run per article at a time, advisory lock `72_005` per article, recorded in `runs` with kind `article` and a new `runs.article_id`):
+  1. **brief** (`article_brief.py`): deterministic, built when the article is created, and previewable (`articles brief`, `GET /opportunities/{id}/brief`). No Gemini;
+  2. **research** (`research.py`): discover → screen → read, described below;
+  3. **outline**, **draft** and **edit** (`article_writing.py`): one structured Gemini call each, with no tools, then deterministic post-checks (`article_content.py`);
+  4. the completion gate: deterministic baseline checks, then `completed`.
+
+  The API runs generation in the background (`202` plus the article; `?wait=true` to run synchronously); the CLI runs it synchronously. Only `approved` opportunities are written, and a run stops if its opportunity stops being approved.
+- **LangGraph, evaluated and not adopted.** The pipeline is linear with no branching or loops in Phase 5. A table of step executions (`article_steps`) with input fingerprints provides the same checkpoint/resume semantics and idempotency as the LangGraph Postgres checkpointer. It needs no new dependency or extra checkpoint tables, and it's queryable (`GET /articles/{id}/steps`). Revisit if Phase 6's bounded revision loop needs graph routing.
+- **Research, which differs from the plan's "grounding metadata" approach.** Live probes of the Interactions API (google-genai 2.23) showed three things:
+  - Search results carry no URLs, only a search-suggestions widget.
+  - Text answers cite only `vertexaisearch.cloud.google.com` redirect links, titled with a bare domain.
+  - Structured output with search carries no citation annotations at all.
+
+  So model-written URLs can't be trusted, and search metadata can't verify them. Instead:
+  1. **discover** (Google Search grounding, structured): research questions and candidate URLs; the queries actually run are recorded from the tool steps;
+  2. **screen** (deterministic): public http(s) URLs only, via the Phase 1 SSRF guard with DNS resolution; no credentials or odd ports; deduplicated; typed (your site and competitors' by domain); most authoritative first; capped;
+  3. **read** (URL context, structured): Gemini retrieves the pages. The tool reports a status per URL, redirects are matched to their requests, and only retrieved pages with facts become sources. A made-up URL therefore never reaches the article. This process fetches no page itself.
+
+  Limits: questions, sources, URL-context calls, research tokens and a minimum number of sources (`ARTICLE_RESEARCH_*`).
+- **Tables (migration `0004`).**
+  - **`articles`**: links to the opportunity, assessment and company profile version (all `RESTRICT`); status and current step; the brief; pointers to the current research step and outline/draft/final versions; slug (unique); tokens used; failure details.
+  - **`article_steps`**: the checkpoint log (fingerprint, prompt version, model, output and its hash, calls, tokens, status, error).
+  - **`article_versions`**: immutable outline, draft and final versions, with issues and editor notes.
+  - **`article_sources`**: retrieved pages with facts, excerpts, type, attribution flag and retrieval metadata.
+  - **`article_citations`**: claim → source per version, with foreign keys.
+  - A partial unique index allows one live (in progress or completed) article per opportunity. The `llm_calls` purposes gained `article_research`, `article_outline`, `article_draft` and `article_edit`.
+- **Differences from §7.1 `generated_articles`.**
+  - Split into the tables above. Statuses are `queued` · `researching` · `outlining` · `drafting` · `editing` · `completed` · `failed` · `cancelled`.
+  - The review, approval, scheduling and publication states (`needs_review`, `awaiting_approval`, `scheduled`, `published`) and SEO fields (meta, keywords, FAQ, internal links, image suggestion) belong to Phases 6–7 and aren't created.
+  - The opportunity's status is left `approved`; Phase 7 marks it `used` when the article is published.
+- **Idempotency and prompt versions.**
+  - Each step's fingerprint covers its upstream outputs, its prompt version, the model and the relevant settings. A run reuses any succeeded execution with the same fingerprint.
+  - So a resume continues from the first missing or outdated step, and a finished article is never regenerated by mistake.
+  - A new editorial prompt re-runs only the edit. A new outline prompt re-runs the outline, and then the draft and edit only if the outline changed.
+  - A crashed run is detected by its free lock and marked interrupted.
+- **Token budget.** `ARTICLE_MAX_TOKENS` per article, across runs, is enforced by `BudgetedLLM` (which gained a `token_limit`) before every call. Research has its own cap. When the budget runs out, the step fails safely and finished steps are kept; resuming needs a higher budget.
+- **Content.** Structured JSON (sections → paragraphs, lists, subheadings) with inline `[S#]` citation labels:
+  - labels without a stored source are removed and recorded;
+  - sentences with numbers not in the research or the brief are flagged;
+  - the editor's removed, qualified and flagged claims are stored as issues.
+- **Live verification.**
+  - **Opt-in test** (`pytest -m llm_live tests/live/test_live_article.py`): completed in 89 s and 40k tokens, with 2 sources and 34 citations.
+  - **Real run** (dev database, "Data privacy" opportunity from the PostHog/Plausible analyses, default settings): completed in 6 calls and 46.7k tokens. It ran 6 Google queries, retrieved 4 authoritative candidates (EDPB, CNIL, European Parliament, arXiv), kept 3 with facts, and wrote a 1,877-word comparison with 28 citations. The editor qualified an invented "40–60%" range and an unsupported technical claim, and fixed a mis-cited source.
+  - **Idempotency held:** repeating the run made no call.
+- **Scope kept out:** SEO optimization, fact-checking, originality and quality scoring (Phase 6); CMS publishing, scheduling and social posting (Phases 7–9).
 
 ### Phase 6 — SEO and quality checks
 - SEO packaging (all the blog output fields you listed), fact-check, originality, LLM judge, the bounded revision loop, and the quality report.

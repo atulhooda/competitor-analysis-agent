@@ -8,11 +8,13 @@
                CompetitorProfileSnapshot, LandscapeReport (interpretations; Phase 3)
 - recommendation: Opportunity, OpportunityAssessment, OpportunityEvidence,
                OpportunityEvent (content opportunities; Phase 4)
+- generation:  Article, ArticleStepRun, ArticleVersion, ArticleSource, ArticleCitation
+               (article drafts; Phase 5; never published)
 - ops:         Run, RunEvent, LLMCall (what ran, when, what happened, what it cost)
 
-LLM output lives only in the analysis layer and in assessments' ``interpretation``, and
-every such row records its run, model and prompt version. Opportunity *scores* are
-deterministic.
+LLM output lives in the analysis layer, in assessments' ``interpretation`` and in the
+generation layer, and every such row records its run, model and prompt version.
+Opportunity *scores* and article briefs are deterministic.
 """
 
 from app.db.models.analysis import (
@@ -23,6 +25,13 @@ from app.db.models.analysis import (
     LandscapeReport,
     Topic,
     TopicAlias,
+)
+from app.db.models.article import (
+    Article,
+    ArticleCitation,
+    ArticleSource,
+    ArticleStepRun,
+    ArticleVersion,
 )
 from app.db.models.config import CompanyProfileVersion, Competitor
 from app.db.models.content import ChangeEvent, ContentItem, ContentVersion
@@ -36,6 +45,11 @@ from app.db.models.recommendation import (
 )
 
 __all__ = [
+    "Article",
+    "ArticleCitation",
+    "ArticleSource",
+    "ArticleStepRun",
+    "ArticleVersion",
     "ChangeEvent",
     "ChangeSummary",
     "CompanyProfileVersion",

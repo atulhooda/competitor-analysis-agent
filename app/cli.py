@@ -10,6 +10,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 from sqlalchemy.exc import DBAPIError, OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -19,9 +20,10 @@ from app.core.errors import ConfigurationError
 from app.core.logging import configure_logging
 from app.core.timeutils import parse_since, utcnow
 from app.crawling.fetcher import PoliteFetcher
-from app.db import analysis_queries, migrate, opportunity_queries, queries
+from app.db import analysis_queries, article_queries, migrate, opportunity_queries, queries
 from app.db.session import SessionFactory, create_engine, create_session_factory
 from app.domain.analysis import MixShift, Share, TopicTrend
+from app.domain.articles import ArticleBrief, ArticleStatus
 from app.domain.competitor_profile import Claim
 from app.domain.content import ContentType
 from app.domain.history import ChangeType, RunStatus, RunTrigger
@@ -33,6 +35,16 @@ from app.services.analysis import (
     AnalysisOptions,
     AnalysisOutcome,
     AnalysisService,
+)
+from app.services.articles import (
+    ArticleBudgetExhaustedError,
+    ArticleConflictError,
+    ArticleNotFoundError,
+    ArticleOutcome,
+    ArticleRequestResult,
+    ArticleRunActiveError,
+    ArticleService,
+    OpportunityNotApprovedError,
 )
 from app.services.company import (
     company_view,
@@ -61,18 +73,22 @@ cli = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
     help="Competitor intelligence agent: compliant website monitoring, persisted history, "
-    "and AI analysis (Gemini).",
+    "AI analysis (Gemini), content opportunities and article drafts (never published).",
 )
 db_cli = typer.Typer(no_args_is_help=True, help="Database migrations.")
 competitors_cli = typer.Typer(help="Manage monitored competitors (stored in the database).")
 topics_cli = typer.Typer(help="The topic taxonomy: list, inspect, seed, merge, consolidate.")
 company_cli = typer.Typer(no_args_is_help=True, help="Your company profile (what opportunities are scored against).")  # fmt: skip
 opportunities_cli = typer.Typer(help="Content opportunities: generate, rank, inspect, decide.")
+articles_cli = typer.Typer(
+    help="Article drafts from approved opportunities. Drafts only: nothing is published."
+)
 cli.add_typer(db_cli, name="db")
 cli.add_typer(competitors_cli, name="competitors")
 cli.add_typer(topics_cli, name="topics")
 cli.add_typer(company_cli, name="company")
 cli.add_typer(opportunities_cli, name="opportunities")
+cli.add_typer(articles_cli, name="articles")
 console = Console()
 err = Console(stderr=True)
 
@@ -156,6 +172,8 @@ def check() -> None:
     )
     table.add_row("Analysis model", f"{settings.analysis_model} (reasoning: {settings.analysis_reasoning_effort})")  # fmt: skip
     table.add_row("Synthesis model", f"{settings.synthesis_model} (reasoning: {settings.synthesis_reasoning_effort})")  # fmt: skip
+    table.add_row("Writing model", f"{settings.writing_model} (writing: {settings.writing_reasoning_effort}; research: {settings.research_reasoning_effort})")  # fmt: skip
+    table.add_row("Article budget", f"{settings.article_max_tokens:,} tokens per article ({settings.article_research_max_tokens:,} for research)")  # fmt: skip
     budget = settings.llm_daily_token_budget
     table.add_row("LLM token budgets", f"{settings.llm_max_tokens_per_run:,} per run; {f'{budget:,}' if budget else 'unlimited'} per day")  # fmt: skip
     table.add_row("API_KEY", "set" if settings.api_key else "not set (allowed in development only)")
@@ -1294,3 +1312,319 @@ def expire_opportunity(opportunity_id: int, note: str | None = typer.Option(None
 def reopen_opportunity(opportunity_id: int, note: str | None = typer.Option(None)) -> None:
     """Reopen an expired opportunity."""
     _set_opportunity_status(opportunity_id, OpportunityStatus.NEW, note)
+
+
+# ── articles (Phase 5: drafts only, never published) ─────────────────────────
+
+
+def _article_errors() -> tuple[type[Exception], ...]:
+    return (
+        LLMConfigurationError,
+        OpportunityNotFoundError,
+        ArticleNotFoundError,
+        OpportunityNotApprovedError,
+        ArticleConflictError,
+        ArticleRunActiveError,
+        ArticleBudgetExhaustedError,
+    )
+
+
+def _print_article_run(result: ArticleRequestResult, outcome: ArticleOutcome | None, json_output: bool) -> None:  # fmt: skip
+    if json_output:
+        payload = {
+            "article_id": result.article_id,
+            "created": result.created,
+            "message": result.message,
+            "run_id": outcome.run_id if outcome else result.run_id,
+            "run_status": outcome.run_status.value if outcome else None,
+            "article_status": outcome.status.value if outcome else None,
+            "steps": outcome.steps if outcome else {},
+            "usage": outcome.usage.as_dict() if outcome and outcome.usage else None,
+            "error": outcome.error if outcome else None,
+        }
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return
+    if result.message:
+        console.print(f"article {result.article_id}: {escape(result.message)}")
+    if outcome is None:
+        return
+    color = {"succeeded": "green", "partial": "yellow"}.get(outcome.run_status.value, "red")
+    steps = " · ".join(f"{step} {state}" for step, state in outcome.steps.items())
+    console.print(f"article {outcome.article_id} run {outcome.run_id} [{color}]{outcome.run_status.value}[/{color}] → article {outcome.status.value}")  # fmt: skip
+    if steps:
+        console.print(f"steps: {steps}")
+    if outcome.usage is not None and outcome.usage.calls:
+        console.print(f"gemini: {outcome.usage.calls} call(s), {outcome.usage.total_tokens:,} tokens")  # fmt: skip
+    if outcome.error:
+        err.print(f"[yellow]{escape(outcome.error)}[/yellow]")
+
+
+@articles_cli.callback(invoke_without_command=True)
+def articles_main(ctx: typer.Context) -> None:
+    """List articles when no subcommand is given."""
+    if ctx.invoked_subcommand is None:
+        list_articles_cmd(status=None, opportunity=None, since=None, limit=25, json_output=False)
+
+
+@articles_cli.command("brief")
+def article_brief_cmd(opportunity_id: int, json_output: bool = typer.Option(False, "--json")) -> None:  # fmt: skip
+    """Preview the deterministic brief an article for this opportunity would get (no
+    Gemini, nothing stored)."""
+    settings = get_settings()
+
+    async def work(engine: AsyncEngine, sessions: SessionFactory) -> ArticleBrief:
+        return await ArticleService(engine, sessions, LazyLLM(settings), settings).preview_brief(opportunity_id)  # fmt: skip
+
+    try:
+        brief = _run_db(work)
+    except _article_errors() as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    if json_output:
+        sys.stdout.write(brief.model_dump_json(indent=2) + "\n")
+        return
+    console.print(f"[bold]{escape(brief.working_title)}[/bold]")
+    console.print(f"opportunity #{brief.opportunity_id} (score {brief.opportunity_score}) · assessment {brief.assessment_id} · company profile v{brief.company_profile_version}")  # fmt: skip
+    for label, value in (("Topic", brief.topic), ("Audience", brief.target_audience), ("Intent", brief.search_intent.value), ("Content type", brief.content_type.value), ("Angle", brief.primary_angle), ("Outcome", brief.desired_outcome), ("Why now", brief.why_now or "—"), ("Differentiation", brief.differentiation_strategy)):  # fmt: skip
+        console.print(f"[bold]{label}:[/bold] {escape(value)}")
+    for label, values in (("Key points", brief.key_points), ("Competitor weaknesses", brief.competitor_weaknesses), ("Avoid", brief.things_to_avoid)):  # fmt: skip
+        console.print(f"[bold]{label}[/bold]")
+        for value in values:
+            console.print(f"  • {escape(value)}")
+    console.print(f"[bold]Evidence[/bold] {len(brief.evidence)} competitor page(s) (context, not facts)")  # fmt: skip
+    for e in brief.evidence:
+        console.print(f"  #{e.evidence_id} {e.competitor or '?'} · {escape(e.title or '')} · {e.url or ''}")  # fmt: skip
+    console.print("[dim]provenance: " + "; ".join(f"{k} ← {v}" for k, v in brief.provenance.items()) + "[/dim]")  # fmt: skip
+
+
+@articles_cli.command("generate")
+def generate_article(
+    opportunity_id: int,
+    regenerate: bool = typer.Option(
+        False, help="Start a new attempt after a failed or cancelled article."
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Research, outline, draft and edit an article for an approved opportunity (runs
+    now). An opportunity has one live article: this returns it if it exists."""
+    settings = get_settings()
+
+    async def work(engine: AsyncEngine, sessions: SessionFactory) -> tuple[ArticleRequestResult, ArticleOutcome | None]:  # fmt: skip
+        llm = LazyLLM(settings)
+        try:
+            return await ArticleService(engine, sessions, llm, settings).generate(opportunity_id, trigger=RunTrigger.CLI, regenerate=regenerate)  # fmt: skip
+        finally:
+            await llm.aclose()
+
+    try:
+        result, outcome = _run_db(work)
+    except _article_errors() as exc:
+        raise _llm_error(exc) from exc
+    _print_article_run(result, outcome, json_output)
+    if not json_output:
+        console.print(f"[dim]details: `articles show {result.article_id}`[/dim]")
+    if outcome is not None and outcome.run_status == RunStatus.FAILED:
+        raise typer.Exit(code=1)
+
+
+@articles_cli.command("resume")
+def resume_article(article_id: int, json_output: bool = typer.Option(False, "--json")) -> None:
+    """Continue a failed or interrupted article from its first unfinished step (earlier
+    steps are reused); on a completed article, redo only steps whose prompt or settings
+    changed."""
+    settings = get_settings()
+
+    async def work(engine: AsyncEngine, sessions: SessionFactory) -> tuple[ArticleRequestResult, ArticleOutcome | None]:  # fmt: skip
+        llm = LazyLLM(settings)
+        try:
+            return await ArticleService(engine, sessions, llm, settings).resume_now(article_id, trigger=RunTrigger.CLI)  # fmt: skip
+        finally:
+            await llm.aclose()
+
+    try:
+        result, outcome = _run_db(work)
+    except _article_errors() as exc:
+        raise _llm_error(exc) from exc
+    _print_article_run(result, outcome, json_output)
+    if outcome is not None and outcome.run_status == RunStatus.FAILED:
+        raise typer.Exit(code=1)
+
+
+@articles_cli.command("cancel")
+def cancel_article(article_id: int, note: str | None = typer.Option(None)) -> None:
+    """Stop an article for good (regenerate from the opportunity for a new attempt)."""
+    settings = get_settings()
+
+    async def work(engine: AsyncEngine, sessions: SessionFactory) -> None:
+        await ArticleService(engine, sessions, LazyLLM(settings), settings).cancel(article_id, note=note)  # fmt: skip
+
+    try:
+        _run_db(work)
+    except _article_errors() as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    console.print(f"article {article_id}: cancelled")
+
+
+@articles_cli.command("list")
+def list_articles_cmd(
+    status: Annotated[
+        list[ArticleStatus] | None, typer.Option("--status", help="Repeatable.")
+    ] = None,
+    opportunity: int | None = typer.Option(None, help="Opportunity id."),
+    since: str | None = typer.Option(None, help="Created since: 24h, 7d, 2w or an ISO date."),
+    limit: int = typer.Option(25, min=1, max=200),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Articles, newest first."""
+    created_since = _since(since)
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            rows = await article_queries.list_articles(session, statuses=status, opportunity_id=opportunity, created_since=created_since, limit=limit)  # fmt: skip
+        if json_output:
+            sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
+            return
+        table = Table("ID", "Opp.", "Try", "Status", "Step", "Words", "Tokens", "Created", "Title")
+        for r in rows:
+            state = r.status.value + (f" ({r.failed_step.value})" if r.failed_step and r.status.value == "failed" else "")  # fmt: skip
+            table.add_row(str(r.id), str(r.opportunity_id), str(r.attempt), state, r.current_step.value if r.current_step else "—", str(r.word_count or "—"), f"{r.tokens_used:,}", _date(r.created_at), escape(r.title[:60]))  # fmt: skip
+        console.print(table if rows else "No articles yet: approve an opportunity, then `articles generate <opportunity-id>`.")  # fmt: skip
+
+    _run_db(work)
+
+
+@articles_cli.command("show")
+def show_article(
+    article_id: int,
+    content: bool = typer.Option(
+        True, "--content/--no-content", help="Print the article (Markdown preview)."
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """One article: status, progress, steps, brief, issues and the content."""
+    settings = get_settings()
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            detail = await article_queries.get_article(session, article_id, token_budget=settings.article_max_tokens, include_markdown=content)  # fmt: skip
+        if detail is None:
+            err.print(f"[red]Unknown article {article_id}[/red]")
+            raise typer.Exit(code=2)
+        if json_output:
+            sys.stdout.write(detail.model_dump_json(indent=2) + "\n")
+            return
+        console.print(f"[bold]#{detail.id} {escape(detail.title)}[/bold] · {detail.status.value}")
+        console.print(f"opportunity #{detail.opportunity_id} ({detail.opportunity_status}) · attempt {detail.attempt} · assessment {detail.assessment_id} · company profile v{detail.company_profile_version}")  # fmt: skip
+        console.print(f"slug: {detail.slug} · {detail.content_type.value} · audience: {escape(detail.target_audience or '—')} · intent: {detail.search_intent.value if detail.search_intent else '—'} · words: {detail.word_count or '—'} · tokens: {detail.tokens_used:,} of {detail.token_budget:,}")  # fmt: skip
+        done = {s.value for s in detail.progress.completed_steps}
+        console.print("progress: " + " → ".join(f"{s}{' ✓' if s in done else ''}" for s in ("brief", "research", "outline", "draft", "edit")) + f" ({detail.progress.percent}%)")  # fmt: skip
+        table = Table("Step", "Status", "Prompt", "Model", "Calls", "Tokens", "Finished", "Error")
+        for s in detail.steps:
+            table.add_row(s.step.value, s.status.value + ("" if s.current else " (old)"), s.prompt_version or "—", s.model or "—", str(s.llm_calls), f"{s.tokens:,}", f"{s.finished_at:%Y-%m-%d %H:%M}" if s.finished_at else "—", escape((s.error or "")[:60]))  # fmt: skip
+        console.print(table)
+        console.print(f"[bold]Angle:[/bold] {escape(detail.brief.primary_angle)}")
+        console.print(f"sources: {detail.sources} (`articles sources {detail.id}`) · versions: `articles versions {detail.id}`")  # fmt: skip
+        if detail.issues:
+            console.print(f"[bold]Issues[/bold] ({len(detail.issues)}, for review)")
+            for issue in detail.issues[:12]:
+                console.print(f"  • {issue.kind}: {escape(issue.detail)}" + (f" — “{escape(issue.excerpt[:100])}”" if issue.excerpt else ""))  # fmt: skip
+        if detail.error:
+            err.print(f"[yellow]{detail.status.value}{f' at {detail.failed_step.value}' if detail.failed_step else ''}: {escape(detail.error)}[/yellow]")  # fmt: skip
+            if detail.status.value == "failed":
+                err.print(f"resume with `articles resume {detail.id}`")
+        if content and detail.markdown:
+            label = "edited article" if detail.content_version and detail.content_version.kind.value == "final" else "draft"  # fmt: skip
+            console.rule(f"{label} (preview; not published)")
+            console.print(detail.markdown, markup=False, highlight=False)
+
+    _run_db(work)
+
+
+@articles_cli.command("sources")
+def article_sources_cmd(
+    article_id: int,
+    all_runs: bool = typer.Option(False, "--all", help="Include earlier research runs."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Research sources Gemini actually retrieved, with their facts and citation counts."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            rows = await article_queries.get_sources(session, article_id, include_all=all_runs)
+        if rows is None:
+            err.print(f"[red]Unknown article {article_id}[/red]")
+            raise typer.Exit(code=2)
+        if json_output:
+            sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
+            return
+        table = Table("Label", "Type", "Facts", "Cited", "Relevance", "Source", "URL")
+        for r in rows:
+            label = r.label + ("" if r.current else f" (step {r.step_id})")
+            table.add_row(label, r.source_type.value + (" *" if r.attribution_required else ""), str(len(r.facts)), str(r.citations), f"{r.relevance:.2f}", escape((r.title or r.domain)[:50]), r.url)  # fmt: skip
+        console.print(table if rows else "No sources (research hasn't run yet).")
+        if any(r.attribution_required for r in rows):
+            console.print("[dim]* competitor or company source: its facts may only be stated with attribution[/dim]")  # fmt: skip
+
+    _run_db(work)
+
+
+@articles_cli.command("versions")
+def article_versions_cmd(
+    article_id: int,
+    show: int | None = typer.Option(None, "--show", help="Print this version (id)."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Every outline, draft and edited version (none is ever overwritten)."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            if show is not None:
+                detail = await article_queries.get_version(session, article_id, show, include_markdown=True)  # fmt: skip
+                if detail is None:
+                    err.print("[red]Unknown article or version[/red]")
+                    raise typer.Exit(code=2)
+                if json_output:
+                    sys.stdout.write(detail.model_dump_json(indent=2) + "\n")
+                    return
+                console.print(f"[bold]{detail.kind.value} v{detail.number}[/bold] · {detail.prompt_version} · {detail.model} · {len(detail.citations)} citation(s)")  # fmt: skip
+                for change in detail.changes:
+                    console.print(f"  change: {escape(change)}")
+                for issue in detail.issue_details:
+                    console.print(f"  issue: {issue.kind}: {escape(issue.detail)}")
+                console.print(detail.markdown or json.dumps(detail.content, indent=2), markup=False, highlight=False)  # fmt: skip
+                return
+            rows = await article_queries.list_versions(session, article_id)
+        if rows is None:
+            err.print(f"[red]Unknown article {article_id}[/red]")
+            raise typer.Exit(code=2)
+        if json_output:
+            sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
+            return
+        table = Table("ID", "Kind", "No.", "Current", "Words", "Issues", "Prompt", "Model", "Created", "Title")  # fmt: skip
+        for r in rows:
+            table.add_row(str(r.id), r.kind.value, str(r.number), "yes" if r.current else "", str(r.word_count or "—"), str(r.issues), r.prompt_version or "—", r.model or "—", f"{r.created_at:%Y-%m-%d %H:%M}", escape(r.title[:50]))  # fmt: skip
+        console.print(table)
+
+    _run_db(work)
+
+
+@articles_cli.command("steps")
+def article_steps_cmd(article_id: int, json_output: bool = typer.Option(False, "--json")) -> None:  # fmt: skip
+    """The checkpoint log: every step execution, with fingerprint, prompt, model and tokens."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            rows = await article_queries.list_steps(session, article_id)
+        if rows is None:
+            err.print(f"[red]Unknown article {article_id}[/red]")
+            raise typer.Exit(code=2)
+        if json_output:
+            sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
+            return
+        table = Table("ID", "Run", "Step", "Status", "Current", "Fingerprint", "Prompt", "Calls", "Tokens", "Error")  # fmt: skip
+        for r in rows:
+            table.add_row(str(r.id), str(r.run_id or "—"), r.step.value, r.status.value, "yes" if r.current else "", r.fingerprint[:12], r.prompt_version or "—", str(r.llm_calls), f"{r.tokens:,}", escape((r.error or "")[:50]))  # fmt: skip
+        console.print(table)
+
+    _run_db(work)

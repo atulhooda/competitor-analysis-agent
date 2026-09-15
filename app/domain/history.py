@@ -166,6 +166,7 @@ class RunView(BaseModel):
     trigger: RunTrigger
     status: RunStatus
     competitor: str | None
+    article_id: int | None = None  # article generation runs (Phase 5)
     params: dict[str, Any]
     stats: dict[str, Any]
     summary: dict[str, Any]

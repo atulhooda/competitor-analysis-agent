@@ -97,3 +97,15 @@ def test_an_item_must_fit_in_a_batch() -> None:
 
     with pytest.raises(ValidationError, match="ANALYSIS_ITEM_MAX_CHARS"):
         make_settings(analysis_item_max_chars=50_000, analysis_batch_max_chars=10_000)
+
+
+def test_article_settings_defaults_and_consistency() -> None:
+    from app.config import Settings
+
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.writing_model == settings.gemini_model
+    assert (settings.article_max_tokens, settings.article_target_words, settings.article_min_words) == (400_000, 1_500, 600)  # fmt: skip
+    assert Settings(_env_file=None, gemini_writing_model="gemini-x").writing_model == "gemini-x"  # type: ignore[call-arg]
+    for bad in ({"article_min_words": 2_000, "article_target_words": 1_000}, {"article_research_max_tokens": 500_000}, {"article_research_min_sources": 12}):  # fmt: skip
+        with pytest.raises(ValueError, match="ARTICLE_"):
+            Settings(_env_file=None, **bad)  # type: ignore[arg-type]

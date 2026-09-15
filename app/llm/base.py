@@ -10,6 +10,8 @@ from typing import Literal, Protocol, runtime_checkable
 from pydantic import BaseModel
 
 ReasoningEffort = Literal["minimal", "low", "medium", "high"]
+# Built-in tools the provider runs itself: web search and reading the pages at given URLs.
+Tool = Literal["google_search", "url_context"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,12 +21,42 @@ class LLMRequest:
     model: str | None = None  # None → the provider's default (GEMINI_MODEL)
     max_output_tokens: int | None = None
     reasoning_effort: ReasoningEffort | None = None  # how hard the model should think
+    tools: tuple[Tool, ...] = ()  # none by default: the model can only read the prompt
 
     def __post_init__(self) -> None:
         if not self.prompt.strip():
             raise ValueError("LLMRequest.prompt must not be empty")
         if self.max_output_tokens is not None and self.max_output_tokens < 1:
             raise ValueError("LLMRequest.max_output_tokens must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class Citation:
+    """A source the provider attributed a span of its output to (search grounding)."""
+
+    url: str
+    title: str | None = None
+    start_index: int | None = None
+    end_index: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievedURL:
+    """A URL the provider tried to read with its URL tool, and how that went."""
+
+    url: str
+    status: str  # "success", "error", "paywall", "unsafe", ...
+
+
+@dataclass(frozen=True, slots=True)
+class Grounding:
+    """What the provider's tools actually did during a call: the evidence that search and
+    page reads happened, independent of what the model's text claims."""
+
+    search_queries: tuple[str, ...] = ()
+    citations: tuple[Citation, ...] = ()
+    requested_urls: tuple[str, ...] = ()
+    retrieved_urls: tuple[RetrievedURL, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +76,7 @@ class LLMResponse:
     usage: LLMUsage
     finish_reason: str | None = None
     response_id: str | None = None
+    grounding: Grounding = Grounding()  # empty unless the request enabled tools
 
 
 @dataclass(frozen=True, slots=True)

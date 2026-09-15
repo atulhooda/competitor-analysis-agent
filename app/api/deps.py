@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.db.session import SessionFactory
 from app.services.analysis import AnalysisService
+from app.services.articles import ArticleService
 from app.services.intelligence import IntelligenceService
 from app.services.landscape import LandscapeService
 from app.services.opportunities import OpportunityService
@@ -96,3 +97,11 @@ def get_opportunity_service(request: Request) -> OpportunityService:
 
 
 OpportunityServiceDep = Annotated[OpportunityService, Depends(get_opportunity_service)]
+
+
+def get_article_service(request: Request) -> ArticleService:
+    service: ArticleService = request.app.state.articles
+    return service
+
+
+ArticleServiceDep = Annotated[ArticleService, Depends(get_article_service)]

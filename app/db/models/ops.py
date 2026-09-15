@@ -1,4 +1,5 @@
-"""Operations layer: runs (scans, analyses, reports) with their events, and LLM calls."""
+"""Operations layer: runs (scans, analyses, reports, opportunity generation, article
+generation) with their events, and LLM calls."""
 
 from datetime import datetime
 from typing import Any
@@ -25,6 +26,8 @@ class Run(Base):
     trigger: Mapped[str] = mapped_column(String(16))
     status: Mapped[str] = mapped_column(String(16))
     competitor_id: Mapped[int | None] = mapped_column(ForeignKey("competitors.id"))
+    # use_alter: runs → articles → opportunity_assessments → runs is a foreign-key cycle.
+    article_id: Mapped[int | None] = mapped_column(ForeignKey("articles.id", ondelete="SET NULL", use_alter=True), index=True)  # fmt: skip
     params: Mapped[dict[str, Any]] = mapped_column(default=dict, server_default=text("'{}'::jsonb"))
     stats: Mapped[dict[str, Any]] = mapped_column(default=dict, server_default=text("'{}'::jsonb"))
     summary: Mapped[dict[str, Any]] = mapped_column(

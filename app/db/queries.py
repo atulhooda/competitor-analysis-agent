@@ -307,6 +307,7 @@ def _run_view(run: Run, slug: str | None, events: list[RunEvent] | None = None) 
         trigger=RunTrigger(run.trigger),
         status=RunStatus(run.status),
         competitor=slug,
+        article_id=run.article_id,
         params=run.params,
         stats=run.stats,
         summary=run.summary,

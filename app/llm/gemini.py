@@ -12,7 +12,15 @@ from google import genai
 from google.genai import types as genai_types
 from pydantic import BaseModel, ValidationError
 
-from app.llm.base import LLMRequest, LLMResponse, LLMUsage, StructuredResponse
+from app.llm.base import (
+    Citation,
+    Grounding,
+    LLMRequest,
+    LLMResponse,
+    LLMUsage,
+    RetrievedURL,
+    StructuredResponse,
+)
 from app.llm.errors import (
     LLMAuthenticationError,
     LLMConfigurationError,
@@ -106,6 +114,9 @@ class GeminiProvider:
             body["generation_config"] = generation_config
         if response_format is not None:
             body["response_format"] = response_format
+        if request.tools:
+            # Built-in tools run on Google's side; this process never fetches the pages.
+            body["tools"] = [{"type": tool} for tool in request.tools]
 
         try:
             # Non-streaming create() returns an Interaction. Its fields are read defensively
@@ -134,6 +145,7 @@ class GeminiProvider:
             usage=_usage(getattr(interaction, "usage", None)),
             finish_reason=status,
             response_id=getattr(interaction, "id", None) or None,
+            grounding=_grounding(interaction) if request.tools else Grounding(),
         )
 
 
@@ -195,6 +207,38 @@ def _usage(usage: Any) -> LLMUsage:
         reasoning_tokens=reasoning_tokens,
         cached_input_tokens=count("total_cached_tokens"),
         total_tokens=count("total_tokens") or input_tokens + output_tokens + reasoning_tokens,
+    )
+
+
+def _grounding(interaction: Any) -> Grounding:
+    """What the tools did, from the interaction's steps: search queries, URL reads and their
+    statuses, and URL citations on the output text. Read defensively: steps are optional."""
+    queries: list[str] = []
+    citations: list[Citation] = []
+    requested: list[str] = []
+    retrieved: list[RetrievedURL] = []
+    for step in getattr(interaction, "steps", None) or []:
+        kind = getattr(step, "type", None)
+        arguments = getattr(step, "arguments", None)
+        if kind == "google_search_call":
+            queries += [str(q) for q in getattr(arguments, "queries", None) or [] if q]
+        elif kind == "url_context_call":
+            requested += [str(u) for u in getattr(arguments, "urls", None) or [] if u]
+        elif kind == "url_context_result":
+            for result in getattr(step, "result", None) or []:
+                url = getattr(result, "url", None)
+                if url:
+                    retrieved.append(RetrievedURL(str(url), str(getattr(result, "status", None) or "unknown")))  # fmt: skip
+        elif kind == "model_output":
+            for content in getattr(step, "content", None) or []:
+                for note in getattr(content, "annotations", None) or []:
+                    if getattr(note, "type", None) == "url_citation" and getattr(note, "url", None):
+                        citations.append(Citation(str(note.url), getattr(note, "title", None), getattr(note, "start_index", None), getattr(note, "end_index", None)))  # fmt: skip
+    return Grounding(
+        search_queries=tuple(dict.fromkeys(queries)),
+        citations=tuple(citations),
+        requested_urls=tuple(dict.fromkeys(requested)),
+        retrieved_urls=tuple(retrieved),
     )
 
 

@@ -277,3 +277,65 @@ def test_company_and_opportunity_commands(configured: Path, monkeypatch: pytest.
     assert listing.exit_code == 0
     assert "approved" in listing.output
     assert "opportunities" in runner.invoke(cli, ["runs"]).output
+
+
+# ── Phase 5 ──────────────────────────────────────────────────────────────────
+
+
+def test_article_commands(configured: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:  # fmt: skip
+    import yaml
+
+    from app.llm import LazyLLM
+    from app.services.articles import ArticleService
+    from tests.fakellm import FakeLLM
+    from tests.pipeline import ARTICLE_COMPANY
+
+    fake = FakeLLM()
+    monkeypatch.setattr("app.cli.LazyLLM", functools.partial(LazyLLM, provider=fake))
+    monkeypatch.setattr("app.cli.ArticleService", functools.partial(ArticleService, resolver=public_resolver))  # fmt: skip
+    _scan_acme()
+    assert runner.invoke(cli, ["analyze", "acme", "--no-profile"]).exit_code == 0
+    company = tmp_path / "company.yaml"
+    company.write_text(yaml.safe_dump({"company": ARTICLE_COMPANY}), encoding="utf-8")
+    assert runner.invoke(cli, ["company", "import", "--file", str(company)]).exit_code == 0
+    assert runner.invoke(cli, ["opportunities", "generate"]).exit_code == 0
+    payload = json.loads(runner.invoke(cli, ["opportunities", "list", "--json"]).stdout)
+    opportunity = str(next(o["id"] for o in payload if o["topic_label"].casefold() == "ai agents"))  # fmt: skip
+
+    refused = runner.invoke(cli, ["articles", "generate", opportunity])
+    assert refused.exit_code == 2  # not approved yet
+    assert "only approved opportunities" in refused.output
+    brief = runner.invoke(cli, ["articles", "brief", opportunity])
+    assert brief.exit_code == 0, brief.output
+    assert "Angle:" in brief.output
+    assert "provenance" in brief.output
+    assert json.loads(runner.invoke(cli, ["articles", "brief", opportunity, "--json"]).stdout)["opportunity_id"] == int(opportunity)  # fmt: skip
+    assert runner.invoke(cli, ["opportunities", "approve", opportunity]).exit_code == 0
+
+    generated = runner.invoke(cli, ["articles", "generate", opportunity])
+    assert generated.exit_code == 0, generated.output
+    assert "article completed" in generated.output
+    articles = json.loads(runner.invoke(cli, ["articles", "list", "--json"]).stdout)
+    article = str(articles[0]["id"])
+    assert articles[0]["status"] == "completed"
+    shown = runner.invoke(cli, ["articles", "show", article])
+    assert shown.exit_code == 0, shown.output
+    assert "edited article (preview; not published)" in shown.output
+    assert "## Sources" in shown.output
+    assert "article-edit/1" in shown.output
+    sources = runner.invoke(cli, ["articles", "sources", article])
+    assert "S1" in sources.output
+    assert "competitor or company source" in sources.output
+    versions = json.loads(runner.invoke(cli, ["articles", "versions", article, "--json"]).stdout)
+    assert [v["kind"] for v in versions] == ["outline", "draft", "final"]
+    draft = runner.invoke(cli, ["articles", "versions", article, "--show", str(versions[1]["id"])])
+    assert draft.exit_code == 0
+    assert "draft v1" in draft.output
+    assert "edit" in runner.invoke(cli, ["articles", "steps", article]).output
+    assert "nothing to do" in runner.invoke(cli, ["articles", "resume", article]).output
+    again = runner.invoke(cli, ["articles", "generate", opportunity])
+    assert "already exists" in again.output
+    assert "cancelled" in runner.invoke(cli, ["articles", "cancel", article]).output
+    assert "cancelled" in runner.invoke(cli, ["articles"]).output
+    assert runner.invoke(cli, ["articles", "show", "999999"]).exit_code == 2
+    assert "article" in runner.invoke(cli, ["runs"]).output
