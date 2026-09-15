@@ -1,4 +1,5 @@
-"""Postgres advisory locks: one scan, one analysis per competitor, one landscape report.
+"""Postgres advisory locks: one scan and one analysis per competitor; one landscape report
+and one opportunity generation at a time.
 
 No Redis needed. A session-level lock lives exactly as long as the connection that holds
 it, so a crashed process can never leave anything locked.
@@ -13,7 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 _SCAN_NAMESPACE = 72_001
 _ANALYSIS_NAMESPACE = 72_002
 _LANDSCAPE_NAMESPACE = 72_003
-# 72_010 is the taxonomy's transaction-level lock (app.services.topics).
+_OPPORTUNITY_NAMESPACE = 72_004
+# 72_010 / 72_011 are transaction-level locks: taxonomy writes, company profile versions.
 
 
 def scan_lock_key(competitor_id: int) -> int:
@@ -25,6 +27,7 @@ def analysis_lock_key(competitor_id: int) -> int:
 
 
 LANDSCAPE_LOCK_KEY = (_LANDSCAPE_NAMESPACE << 32) | 1
+OPPORTUNITY_LOCK_KEY = (_OPPORTUNITY_NAMESPACE << 32) | 1
 
 
 @asynccontextmanager
@@ -52,3 +55,7 @@ def competitor_analysis_lock(engine: AsyncEngine, competitor_id: int) -> Abstrac
 
 def landscape_lock(engine: AsyncEngine) -> AbstractAsyncContextManager[bool]:
     return try_advisory_lock(engine, LANDSCAPE_LOCK_KEY)
+
+
+def opportunity_lock(engine: AsyncEngine) -> AbstractAsyncContextManager[bool]:
+    return try_advisory_lock(engine, OPPORTUNITY_LOCK_KEY)

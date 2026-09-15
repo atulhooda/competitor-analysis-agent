@@ -13,7 +13,7 @@ from fastapi import FastAPI
 
 from app import __version__
 from app.api import health
-from app.api.v1 import competitors, history, intelligence
+from app.api.v1 import competitors, history, intelligence, opportunities
 from app.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.crawling.fetcher import PoliteFetcher
@@ -23,6 +23,7 @@ from app.llm import LazyLLM, LLMProvider
 from app.services.analysis import AnalysisService
 from app.services.intelligence import IntelligenceService
 from app.services.landscape import LandscapeService
+from app.services.opportunities import OpportunityService
 from app.services.scans import ScanService
 from app.services.topic_admin import TopicAdminService
 
@@ -57,6 +58,7 @@ def create_app(
         app.state.intelligence = IntelligenceService(sessions, settings)
         app.state.landscapes = LandscapeService(engine, sessions, lazy_llm, settings)
         app.state.topic_admin = TopicAdminService(sessions, lazy_llm, settings)
+        app.state.opportunities = OpportunityService(engine, sessions, lazy_llm, settings)
         app.state.background_tasks = background
         _log_startup(settings)
         try:
@@ -79,6 +81,7 @@ def create_app(
     app.include_router(competitors.router)
     app.include_router(history.router)
     app.include_router(intelligence.router)
+    app.include_router(opportunities.router)
     return app
 
 

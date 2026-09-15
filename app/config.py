@@ -15,8 +15,10 @@ from pydantic import Field, SecretStr, ValidationError, field_validator, model_v
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.errors import ConfigurationError
+from app.domain.company import CompanyFile, CompanyProfile
 from app.domain.competitors import CompetitorConfig, CompetitorsFile
 from app.domain.content import DEFAULT_EXCLUDED_TYPES, ContentType
+from app.domain.opportunities import ScoringConfig, ScoringFile
 from app.domain.topics import TopicSeed, TopicsFile
 
 # Same values as app.llm.ReasoningEffort (not imported: app.llm imports this module).
@@ -110,6 +112,10 @@ class Settings(BaseSettings):
     analysis_max_change_summaries_per_run: int = Field(default=10, ge=0, le=200)
     analysis_taxonomy_prompt_limit: int = Field(default=150, ge=0, le=1_000)
 
+    # ── Opportunities (Phase 4) ──────────────────────────────────────────────
+    company_file: Path = Path("config/company.yaml")
+    scoring_file: Path = Path("config/scoring.yaml")
+
     @field_validator("api_key", "gemini_api_key", mode="before")
     @classmethod
     def _blank_secret_is_unset(cls, value: object) -> object:
@@ -174,18 +180,39 @@ def find_competitor(competitors: list[CompetitorConfig], slug: str) -> Competito
     return next((c for c in competitors if c.slug == slug), None)
 
 
-def load_topic_seeds(path: Path) -> list[TopicSeed]:
-    """Load and validate the optional seed taxonomy YAML file."""
+def _read_yaml(path: Path, example: str) -> object:
     if not path.exists():
-        raise ConfigurationError(
-            f"Topics file not found: {path}. "
-            "Copy config/topics.example.yaml to that path and edit it."
-        )
+        raise ConfigurationError(f"File not found: {path}. Copy {example} to that path and edit it.")  # fmt: skip
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except yaml.YAMLError as exc:
         raise ConfigurationError(f"Invalid YAML in {path}: {exc}") from exc
+
+
+def load_topic_seeds(path: Path) -> list[TopicSeed]:
+    """Load and validate the optional seed taxonomy YAML file."""
+    data = _read_yaml(path, "config/topics.example.yaml")
     try:
         return TopicsFile.model_validate(data).topics
     except ValidationError as exc:
         raise ConfigurationError(f"Invalid topics file {path}:\n{exc}") from exc
+
+
+def load_company_profile(path: Path) -> CompanyProfile:
+    """Load and validate your company profile (``company:`` key)."""
+    data = _read_yaml(path, "config/company.example.yaml")
+    try:
+        return CompanyFile.model_validate(data).company
+    except ValidationError as exc:
+        raise ConfigurationError(f"Invalid company profile {path}:\n{exc}") from exc
+
+
+def load_scoring_config(path: Path) -> ScoringConfig:
+    """The opportunity scoring configuration; built-in defaults when the file is absent."""
+    if not path.exists():
+        return ScoringConfig()
+    data = _read_yaml(path, "config/scoring.example.yaml")
+    try:
+        return ScoringFile.model_validate(data).scoring
+    except ValidationError as exc:
+        raise ConfigurationError(f"Invalid scoring file {path}:\n{exc}") from exc

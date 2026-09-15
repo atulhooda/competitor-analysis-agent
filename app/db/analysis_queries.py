@@ -205,6 +205,7 @@ async def load_facts(
             key_themes=tuple(analysis.key_themes),
             word_count=word_count,
             topics=tuple(links.get(analysis.id, ())),
+            keywords=tuple(analysis.keywords),
         )
         for analysis, slug, content_type, published_at, word_count in rows
     ]

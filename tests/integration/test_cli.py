@@ -225,3 +225,55 @@ def test_topics_example_file_is_valid() -> None:
 
     seeds = load_topic_seeds(Path(__file__).parents[2] / "config" / "topics.example.yaml")
     assert any(seed.name == "AI agents" for seed in seeds)
+
+
+# ── Phase 4 ──────────────────────────────────────────────────────────────────
+
+
+def test_company_and_opportunity_commands(configured: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:  # fmt: skip
+    from app.llm import LazyLLM
+    from tests.fakellm import FakeLLM
+
+    fake = FakeLLM()
+    monkeypatch.setattr("app.cli.LazyLLM", functools.partial(LazyLLM, provider=fake))
+    _scan_acme()
+    assert runner.invoke(cli, ["analyze", "acme", "--no-profile"]).exit_code == 0
+
+    assert runner.invoke(cli, ["opportunities", "generate"]).exit_code == 2  # no company profile
+    company = tmp_path / "company.yaml"
+    company.write_text(
+        "company:\n  name: Example Startup\n  description: Helps founders deploy AI agents.\n"
+        "  target_audiences: [founders]\n  core_topics: [AI agents]\n  excluded_topics: [Pricing]\n",
+        encoding="utf-8",
+    )
+    imported = runner.invoke(cli, ["company", "import", "--file", str(company)])
+    assert imported.exit_code == 0, imported.output
+    assert "company profile v1 created" in imported.output
+    assert "unchanged" in runner.invoke(cli, ["company", "import", "--file", str(company)]).output
+    assert "Example Startup" in runner.invoke(cli, ["company", "show"]).output
+    versions = runner.invoke(cli, ["company", "versions"]).output
+    assert "Example Startup" in versions
+    assert "file" in versions
+
+    generated = runner.invoke(cli, ["opportunities", "generate"])
+    assert generated.exit_code == 0, generated.output
+    assert "succeeded" in generated.output
+    assert "AI agents" in generated.output
+    payload = json.loads(runner.invoke(cli, ["opportunities", "list", "--json"]).stdout)
+    agents = next(o for o in payload if o["topic_label"].casefold() == "ai agents")
+    shown = runner.invoke(cli, ["opportunities", "show", str(agents["id"])])
+    assert shown.exit_code == 0, shown.output
+    assert "strategic fit" in shown.output
+    assert "Why" in shown.output
+    assert "Gemini" in shown.output
+    evidence = runner.invoke(cli, ["opportunities", "evidence", str(agents["id"])])
+    assert "topic_metrics" in evidence.output
+    assert "content" in evidence.output
+    assert "first assessment" in runner.invoke(cli, ["opportunities", "history", str(agents["id"])]).output  # fmt: skip
+    assert runner.invoke(cli, ["opportunities", "approve", str(agents["id"]), "--note", "go"]).exit_code == 0  # fmt: skip
+    assert runner.invoke(cli, ["opportunities", "reopen", str(agents["id"])]).exit_code == 2  # approved → new: invalid  # fmt: skip
+    assert runner.invoke(cli, ["opportunities", "show", "999999"]).exit_code == 2
+    listing = runner.invoke(cli, ["opportunities"])
+    assert listing.exit_code == 0
+    assert "approved" in listing.output
+    assert "opportunities" in runner.invoke(cli, ["runs"]).output

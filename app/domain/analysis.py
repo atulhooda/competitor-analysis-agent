@@ -123,6 +123,7 @@ class LLMPurpose(StrEnum):
     COMPETITOR_PROFILE = "competitor_profile"
     LANDSCAPE = "landscape"
     TOPIC_CONSOLIDATION = "topic_consolidation"
+    OPPORTUNITY_INTERPRETATION = "opportunity_interpretation"  # Phase 4
 
 
 class LLMCallStatus(StrEnum):

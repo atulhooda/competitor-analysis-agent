@@ -12,6 +12,7 @@ from app.db.session import SessionFactory
 from app.services.analysis import AnalysisService
 from app.services.intelligence import IntelligenceService
 from app.services.landscape import LandscapeService
+from app.services.opportunities import OpportunityService
 from app.services.scans import ScanService
 from app.services.topic_admin import TopicAdminService
 
@@ -87,3 +88,11 @@ AnalysisServiceDep = Annotated[AnalysisService, Depends(get_analysis_service)]
 IntelligenceDep = Annotated[IntelligenceService, Depends(get_intelligence_service)]
 LandscapeServiceDep = Annotated[LandscapeService, Depends(get_landscape_service)]
 TopicAdminDep = Annotated[TopicAdminService, Depends(get_topic_admin)]
+
+
+def get_opportunity_service(request: Request) -> OpportunityService:
+    service: OpportunityService = request.app.state.opportunities
+    return service
+
+
+OpportunityServiceDep = Annotated[OpportunityService, Depends(get_opportunity_service)]

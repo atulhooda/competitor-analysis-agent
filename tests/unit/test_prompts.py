@@ -23,6 +23,7 @@ from app.prompts import (
     competitor_profile,
     content_analysis,
     landscape,
+    opportunity,
     topic_consolidation,
 )
 from app.prompts.content_analysis import DocumentAnalysisOut
@@ -36,6 +37,7 @@ SCHEMAS: list[type[BaseModel]] = [
     competitor_profile.CompetitorProfileOut,
     landscape.LandscapeOut,
     topic_consolidation.ConsolidationOut,
+    opportunity.OpportunityInterpretationOut,
 ]
 
 
@@ -255,3 +257,17 @@ def test_the_analyzer_is_told_which_documents_to_answer() -> None:
         documents=['<document id="D1">\na\n</document>', '<document id="D2">\nb\n</document>'],
     )
     assert "Return exactly one analysis for each of: D1, D2." in rendered
+
+
+def test_opportunity_prompt_forbids_invented_numbers_and_lists_the_ids() -> None:
+    assert "never state a number that does not appear in the evidence" in opportunity.SYSTEM
+    rendered = opportunity.render(company=["- name: Acme"], opportunities=["O1 | topic: A", "O2 | topic: B"])  # fmt: skip
+    assert "Return exactly one entry for each of: O1, O2." in rendered
+    out = opportunity.OpportunityOut.model_validate(
+        {"opportunity_id": "O1", "title": "t", "recommended_angle": "a", "why_now": "w", "target_audience": "x",
+         "recommended_format": "blog post", "search_intent": "buying", "differentiation_strategy": "d",
+         "strategic_rationale": "r", "confidence": 3}
+    )  # fmt: skip
+    assert out.recommended_format == "article"  # unknown → article
+    assert out.search_intent is None
+    assert out.confidence == 1.0

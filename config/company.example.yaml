@@ -1,0 +1,44 @@
+# Your company profile: what content opportunities are scored against (Phase 4), and what
+# later phases will write for. Every value below is a placeholder: replace them all.
+#
+#   cp config/company.example.yaml config/company.yaml   # gitignored
+#   uv run python -m app company import
+#
+# Each import that changes the profile creates a new version. Opportunity assessments
+# record the version they were scored with, and the next `opportunities generate` re-scores
+# against the new one. No secrets belong here.
+company:
+  name: Your Startup
+  website: https://www.example.com
+  description: >
+    One or two sentences on what you sell and to whom. Topics whose words all appear
+    here (or in your products) count as somewhat relevant.
+
+  products:
+    - name: Your Product
+      description: What it does, in one sentence.
+
+  # Who you write for. Matched against the audiences of competitor pages.
+  target_audiences:
+    - your first audience
+    - your second audience
+
+  # Topics you want to be known for: the strongest relevance signal.
+  core_topics:
+    - your main topic
+    - another core topic
+
+  # Relevant, but not central (counts 60% of a core topic).
+  adjacent_topics: []
+
+  # Never recommended, whatever competitors do.
+  excluded_topics: []
+
+  # Formats you prefer to publish; they become the "valuable formats" for gap detection.
+  # Options: article, tutorial, guide, listicle, comparison, case_study, research, ...
+  preferred_formats: []
+
+  # Used to explain recommendations now, and for writing in later phases.
+  positioning: null
+  differentiators: []
+  tone: null

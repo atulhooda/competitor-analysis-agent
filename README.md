@@ -4,10 +4,11 @@ An AI-powered competitor intelligence and content generation agent. It monitors 
 websites (and later their social channels), keeps a history of what they publish, finds content
 opportunities, and generates and publishes original blog posts.
 
-> **Status: Phase 3 of 10: AI competitor intelligence.** Scans stay deterministic (no LLM)
-> and are stored in PostgreSQL. Gemini now analyzes what competitors publish: topics, formats,
-> audiences, intent, angles, positioning, changes. Deterministic metrics then show trends,
-> coverage and neglected subjects across competitors. Nothing is generated or published yet.
+> **Status: Phase 4 of 10: content opportunities.** Scans stay deterministic (no LLM) and are
+> stored in PostgreSQL. Gemini analyzes what competitors publish (Phase 3). Phase 4 turns that
+> into a ranked list of content opportunities for *your* company. Signals, gaps and scores are
+> computed deterministically from stored data; Gemini only writes the angle and rationale for
+> the top candidates. Nothing is written or published yet.
 > See [MIGRATION_PLAN.md](MIGRATION_PLAN.md) for the architecture and roadmap.
 
 ## What it does today
@@ -103,8 +104,19 @@ history ─► select what needs analysis ─► reuse analyses of minor edits (
   doesn't reach back to the previous window is reported as `insufficient_history` instead of
   "rising". Scans capture newest content first, so a first scan would otherwise look like a
   sudden surge.
-- **Descriptive, not prescriptive.** Phase 3 reports what competitors do. Scoring opportunities
-  (what *you* should write) is Phase 4.
+- **Descriptive, not prescriptive.** Phase 3 reports what competitors do. Phase 4 turns that
+  into recommendations for you.
+
+**Content opportunities (Phase 4).** Answers "given what competitors are doing, what should we
+create next?" with a ranked list of opportunities. Each one has:
+
+- a 0–100 score that breaks down into named parts;
+- the gaps behind it;
+- a suggested format, audience and intent;
+- the competitor pages it rests on;
+- a status you control (`new → reviewed → approved / rejected → used`).
+
+See [Content opportunities](#content-opportunities) for the methodology.
 
 ### Dates: what they mean
 
@@ -156,6 +168,15 @@ uv run python -m app scan --all
 uv run python -m app analyze --all --dry-run                # review what would be sent first
 uv run python -m app analyze --all
 uv run python -m app landscape --refresh
+```
+
+For content opportunities, describe your company, then generate:
+
+```bash
+cp config/company.example.yaml config/company.yaml  # your company profile (gitignored)
+uv run python -m app company import
+uv run python -m app opportunities generate         # works without GEMINI_API_KEY (no interpretation)
+uv run python -m app opportunities                  # the ranked list
 ```
 
 The database is the source of truth for competitors; the YAML file is an import format.
@@ -213,6 +234,22 @@ uv run python -m app topics consolidate              # Gemini proposes duplicate
 uv run python -m app topics consolidate --apply      # ...and applies them
 uv run python -m app topics merge agentic-ai ai-agents
 
+# Company profile (what opportunities are scored against)
+uv run python -m app company import                  # new version from COMPANY_FILE (no-op if unchanged)
+uv run python -m app company show                    # the current version
+uv run python -m app company versions                # version history
+
+# Content opportunities
+uv run python -m app opportunities generate          # score, store, interpret the top candidates
+uv run python -m app opportunities generate --no-interpret   # deterministic only, no Gemini call
+uv run python -m app opportunities generate --window-days 90 --force
+uv run python -m app opportunities                   # ranked list (new, reviewed, approved)
+uv run python -m app opportunities list --status approved --min-score 60 --topic ai-agents --competitor acme
+uv run python -m app opportunities show 12           # breakdown, gaps, why, interpretation, events
+uv run python -m app opportunities evidence 12       # the stored evidence behind the current score
+uv run python -m app opportunities history 12        # every assessment, with why the score changed
+uv run python -m app opportunities approve 12 --note "for Q4"   # also: review, reject, use, expire, reopen
+
 # Database
 uv run python -m app db upgrade                      # apply migrations
 uv run python -m app db current                      # show the schema revision
@@ -249,12 +286,238 @@ uv run uvicorn app.main:create_app --factory --port 8000
 | POST | `/api/v1/topics/merge`, `/api/v1/topics/consolidate` | Merge `{"source", "target"}` / Gemini-proposed merges (`?apply=true` to apply) |
 | GET / POST | `/api/v1/intelligence/landscape` | Cross-competitor metrics plus the latest briefing / generate a new briefing (`202` or `?wait=true`) |
 | GET | `/api/v1/llm/usage` | Gemini calls and tokens per day, purpose and model (`?days=7`) |
+| GET / PUT | `/api/v1/company-profile` | The current company profile / save it (a new version only if it changed: `{"created": false}` otherwise) |
+| GET | `/api/v1/company-profile/versions` | Company profile version history |
+| POST | `/api/v1/opportunities/generate` | Start a generation run: `202` plus a run to poll, or `?wait=true`. Body: `{"window_days": 60, "interpret": true, "force": false}`. `409` without a company profile or while a generation is running |
+| GET | `/api/v1/opportunities` | Ranked by score. Filters: `status` (repeatable; default `new`, `reviewed`, `approved`), `min_score`, `topic` (slug or part of the name), `competitor` (slug in the evidence), `created_since`, `scored_since`, `limit`/`offset` |
+| GET | `/api/v1/opportunities/{id}` | Current assessment (score breakdown, gaps, suggestion and reasons, Gemini interpretation) and the event timeline |
+| GET | `/api/v1/opportunities/{id}/evidence` | Evidence rows of the current assessment, or of a past one (`?assessment_id=`) |
+| GET | `/api/v1/opportunities/{id}/history` | Every assessment: score, company profile version, what changed |
+| PATCH | `/api/v1/opportunities/{id}` | Change status: `{"status": "approved", "note": "..."}`. `409` if the transition isn't allowed |
 
 `/api/v1/*` requires the `X-API-Key` header whenever `API_KEY` is set. Outside development,
 requests are refused until it is. Interactive docs are served at `/docs`.
 
 > Changed in Phase 2: the Phase 1 endpoint `POST /api/v1/competitors/{slug}/scan` is now
 > `POST /api/v1/competitors/{slug}/scans`, and scans are persisted.
+
+## Content opportunities
+
+Phase 4 answers one question: *given what competitors are doing, what should we create next?*
+
+### What is computed, and what Gemini writes
+
+| Computed deterministically (no LLM) | Written by Gemini (top candidates only) |
+|---|---|
+| Topic frequency, growth, and which competitors are growing on it | Working title |
+| Competitor coverage and count | Recommended angle |
+| Publishing frequency, recency | Why now |
+| Format, audience and intent distributions | Target audience, recommended format, search intent |
+| Saturation, overlap, seven gap types | Differentiation strategy, strategic rationale |
+| Strategic fit with your company profile | Confidence (the model's own estimate, 0–1) |
+| The 0–100 score, its breakdown and the ranking | |
+| A suggestion (format, audience, intent) with "why" bullets | |
+
+Gemini never computes a statistic or a score. It is shown the computed numbers and the
+competitor pages. Before anything is stored, every sentence it writes that contains a number
+not in that evidence is deleted. A title with an invented statistic falls back to the topic
+name. If Gemini isn't configured or fails, every opportunity is still complete: score,
+breakdown, gaps, suggestion and evidence.
+
+### Your company profile
+
+Opportunities are scored against your company profile, never a hardcoded industry.
+[`config/company.example.yaml`](config/company.example.yaml) documents every field:
+
+- description and products;
+- target audiences;
+- core, adjacent and excluded topics;
+- preferred formats;
+- positioning, differentiators and tone.
+
+Copy it to `config/company.yaml` (gitignored) and run `company import`, or send it with
+`PUT /api/v1/company-profile`. Keep secrets out of it.
+
+- **Versioned.** Saving an identical profile does nothing; any change creates a new version.
+- **Recorded per score.** Every assessment records the profile version it was scored with. The
+  next `generate` re-scores against the latest version, and the opportunity's history says
+  "company profile changed" where that moved the score.
+- **Scoring fields.** Description, products, audiences, topics and formats affect scoring.
+  Positioning and differentiators only feed Gemini's interpretation. Tone is kept for writing
+  in later phases.
+
+### Pipeline
+
+```
+latest page analyses + topic taxonomy + company profile + scoring config    (PostgreSQL)
+  ─► signal engine: one candidate per canonical topic, plus core topics nobody covers   (no LLM)
+  ─► qualify (relevance, pages, minimum score) ─► deduplicate ─► cap
+  ─► store: one opportunity per topic; a new assessment only if the score or its basis changed;
+     evidence rows; events; expire what no longer qualifies; reopen what qualifies again
+  ─► Gemini: interpret the top new or changed opportunities (batched, budgeted, reused when unchanged)
+  ─► API / CLI
+```
+
+- **One run at a time.** A Postgres advisory lock prevents overlapping runs.
+- **Recorded.** Each run is logged in `runs` with kind `opportunities`.
+- **Execution.** Runs happen in the background through the API, or synchronously from the CLI.
+
+### Scoring
+
+A candidate scores five positive dimensions, each a 0–1 value times its weight, minus a
+saturation penalty. The positive weights are rescaled to total 100, so:
+
+- the score is always 0–100;
+- the breakdown always adds up to the score.
+
+Defaults are below. Every weight and threshold can be changed in
+[`config/scoring.example.yaml`](config/scoring.example.yaml).
+
+| Dimension | Max points | Value (0–1) |
+|---|---|---|
+| momentum | 20 | 0.6 × growth + 0.4 × breadth. Growth = clamp(0.5 + log₂((recent+1)/(previous+1)) / 4): flat → 0.5, 4× → 1. Breadth = share of compared competitors publishing more in the last 60 days than in the 60 before. Reliable publication dates only; with too little history, a neutral 0.3 |
+| strategic_fit | 25 | Match with your profile. A core topic: 1.0 (same), 0.85 (contains), 0.7 (overlaps). An adjacent topic: 60% of that. A subtopic matching a core topic: 0.5. Words all in your description or products: 0.35. Plus up to 0.2 when the topic's competitor pages have keywords matching your core topics. An excluded topic scores 0 |
+| audience_fit | 15 | Share of the topic's pages aimed at your best-matched audience, where 15% of pages counts as full fit (0.5 if you list no audiences) |
+| content_gap | 25 | The strongest gap × its gap weight (below) |
+| recency | 15 | 0.5^(days since the last competitor page / 30) |
+| saturation | −15 | A penalty (below) |
+
+**Saturation** isn't simply "many pages":
+
+- raw = 0.35 × volume + 0.30 × breadth + 0.20 × frequency + 0.15 × format variety, where:
+  - volume is the log-scaled page count (30 pages ≈ full);
+  - breadth is the share of competitors covering the topic;
+  - frequency is pages per week in the window (1 per week = full);
+  - variety is the number of distinct formats / 5.
+- effective = raw × (1 − 0.5 × relief), where relief is the strongest of the freshness, depth,
+  audience and intent gaps.
+
+So a crowded topic whose coverage is stale, shallow, or misses your audience still leaves room.
+A crowded topic that competitors already cover well is penalized.
+
+**Gaps.** Each gap type is scored 0–1 and stored separately:
+
+| Gap | Score | Meaning |
+|---|---|---|
+| topic | 1 − covering / total competitors (with ≥ 2 competitors) | Few competitors cover it. Once ≥ 20 pages are analyzed, a core topic of yours that no competitor covers becomes its own candidate, with topic gap 1 |
+| audience | 1 − best audience share / 0.5 | Your audiences are underserved |
+| intent | 1 − valuable-intent share / 0.2 | Commercial and comparison intents (configurable) are rare |
+| format | 1 − valuable-format share / 0.2 | Your preferred formats are rare (default: tutorial, guide, comparison, case study) |
+| depth | max(fragmentation, shallowness) | Fragmentation: most subtopics (≥ 3) touched by a single page. Shallowness: the median page has under 800 words (full gap at 200) |
+| freshness | (median page age − 90) / (365 − 90) | Competitor content is old |
+| differentiation | (dominant format share − 0.5) / 0.5 | Everyone covers it the same way (≥ 2 competitors, ≥ 4 pages) |
+
+Audience, intent, format and depth gaps are scaled by min(1, pages / 4), so one or two pages
+can't make a strong gap. Low coverage alone is not an opportunity. Strategic fit must be at
+least 0.2, and a topic needs at least 2 competitor pages.
+
+**Qualification, deduplication, ranking.**
+
+- **Rejection.** A candidate is rejected when:
+  - your profile excludes it;
+  - its strategic fit is below 0.2;
+  - it has fewer than 2 pages;
+  - its score is below 40;
+  - it is a near-duplicate of a better candidate;
+  - it falls beyond the top 25.
+
+  Rejections are counted by reason in the run summary.
+- **Deduplication.** Candidates are canonical taxonomy topics (Phase 3 aliases and merges), so
+  spelling variants are already one topic. Near-duplicates the taxonomy kept apart ("Workflow
+  automation" and "Automating workflows") are detected from shared word stems (Jaccard ≥ 0.75
+  over names and aliases). The lower-scored one is folded into the other as a related topic.
+  No LLM is involved.
+- **Suggestion.** Every opportunity gets a deterministic suggestion:
+  - the valuable or preferred format competitors use least;
+  - the intent they neglect (when the intent gap ≥ 0.3);
+  - your most underserved audience, or your best-served one when no audience gap applies;
+  - "why" bullets with exact numbers, e.g. "topic growth: +200% (2 → 6 items, 60-day windows)"
+    or "covered by 2 of 3 competitors (8 pages)".
+
+### Gemini's role
+
+- **Top candidates only.** Only the top 10 (`interpretation.candidates`) opportunities are
+  sent. They must be `new`, `reviewed` or `approved`, and score at least 50. Calls go 4 per
+  batch to `GEMINI_SYNTHESIS_MODEL`. Everything else stays deterministic.
+- **What the prompt contains.** Your company profile and, per opportunity:
+  - its score breakdown, signals, gaps and deterministic suggestion;
+  - up to 8 competitor pages (summary, format, audiences, angle), wrapped in delimiters and
+    treated as untrusted data.
+- **How output is checked.** Output is structured (a Pydantic schema), then:
+  - sentences with numbers that aren't in the evidence are removed;
+  - cited pages must be evidence rows of that assessment;
+  - an answer left with no angle or "why now" is marked `failed`.
+- **Reuse.** An interpretation is reused, with no call, while the evidence pages, the
+  suggestion, the company profile, the prompt version and the model are all unchanged.
+- **Failures never touch scores.**
+  - Without `GEMINI_API_KEY`, interpretations are `skipped`.
+  - On a budget, rate-limit or outage error, the remaining ones are skipped and the run ends
+    `partial`.
+  - Unusable output is retried in halves, then marked `failed`.
+- **Budgets.** Calls share Phase 3's token budgets and the `llm_calls` ledger (purpose
+  `opportunity_interpretation`).
+
+### Provenance: why was this recommended?
+
+`opportunities show`, `GET /api/v1/opportunities/{id}` and `…/evidence` answer from stored data
+only:
+
+- **Score breakdown.** Points per dimension, with the value and the signal behind each.
+- **Gaps and reasons.** Every gap with its score and detail, plus the deterministic "why" bullets.
+- **Evidence rows**, stored per assessment:
+  - topic metrics and the topic trend;
+  - the competitor pages (URL, title, date, format, audiences, summary, angle, and the analysis
+    and content version ids);
+  - competitor positioning profiles and strong gaps;
+  - the company profile version and what matched;
+  - near-duplicate topics.
+- **The basis.** The scoring config fingerprint, company profile version, window, and the
+  analysis ids the score was computed from.
+- **Gemini's interpretation**, with its model, prompt version and the evidence it cited.
+
+### Lifecycle, history and idempotency
+
+| Status | Meaning | Can change to |
+|---|---|---|
+| `new` | Just found | reviewed, approved, rejected, expired |
+| `reviewed` | Looked at, undecided | new, approved, rejected, expired |
+| `approved` | To be written (Phase 5 will pick these up) | reviewed, rejected, used, expired |
+| `rejected` | Not for us | reviewed |
+| `used` | Turned into content | nothing (final) |
+| `expired` | No longer qualifies | new, reviewed |
+
+- **One opportunity per topic.** Re-running generation updates the existing opportunity instead
+  of adding a duplicate. It's keyed by canonical topic, or `core:<topic>` for a core topic
+  nobody covers.
+- **Immutable assessments.** A new assessment is stored only when the score moves by at least
+  1 point (`min_score_change`) or its basis changes: analyses, company profile, scoring config
+  or window. Each one records what changed, for example `72 → 88: momentum +9.1 pts (recent
+  items 2 → 6; growing competitors 1 → 2); analysed pages: 4 added, 0 dropped`. `opportunities
+  history` lists them all.
+- **Idempotent.** A re-run with nothing new creates no assessment, event or Gemini call.
+  `--force` re-assesses and re-interprets anyway, recorded as "recalculated on request".
+- **Expiry.** The next generation expires a `new` or `reviewed` opportunity that no longer
+  qualifies, and records why (for example "strategic fit 0.1 is below the minimum 0.2" or
+  "topic merged into 'AI agents'"). If it qualifies again, it's reopened as `new`. Approved,
+  rejected and used opportunities are re-scored but never changed automatically.
+- **Staleness.** An open opportunity that no generation has re-confirmed within 30 days
+  (`expires_after_days`) is flagged `stale` in listings.
+- **Events.** Every status change is an event: who, when, from → to, and a note.
+
+### Limitations
+
+- **Coverage.** Signals only reflect what was scanned and analyzed. Pages beyond the scan
+  limits and undated pages count only partly. Growth needs reliably dated history in both
+  windows.
+- **No demand data.** There's no search volume, keyword difficulty or traffic data; demand is
+  inferred from competitor activity alone.
+- **Your own content.** Your site isn't compared, so a topic you've already covered can still
+  be recommended. Mark it `used` or `rejected`.
+- **Lexical matching.** Relevance matching uses word stems, not meaning. Synonyms need taxonomy
+  aliases or `topics merge`.
+- **Uncalibrated.** Weights and thresholds are reasoned defaults, not calibrated against
+  results. Gemini's confidence is the model's own estimate.
+- **Digits only.** The number check only works on digits; "three times" isn't caught.
 
 ## Data model
 
@@ -266,10 +529,11 @@ PostgreSQL, managed with Alembic migrations (`migrations/`), in separate layers:
 | Raw | `raw_documents` | HTML exactly as fetched (gzip), stored only for captured versions |
 | Normalized | `content_items`, `content_versions`, `change_events` | One row per URL (lifecycle + reliable dates); immutable snapshots; the change log |
 | Analysis (Phase 3) | `topics`, `topic_aliases`, `content_analyses`, `content_analysis_topics`, `change_summaries`, `competitor_profiles`, `landscape_reports` | Model-produced interpretations, each with its run, model and prompt version; profiles and reports stored with the metrics they were grounded on |
+| Recommendations (Phase 4) | `company_profiles`, `opportunities`, `opportunity_assessments`, `opportunity_evidence`, `opportunity_events` | Versioned company profiles; one opportunity per topic with its status; immutable scored assessments (breakdown, gaps, signals, suggestion, Gemini interpretation); the evidence each assessment rests on; the status and scoring timeline |
 | Operations | `runs`, `run_events`, `llm_calls` | What ran, when, with what result; every LLM call with its tokens |
 
-Only the analysis layer holds LLM output, and it never modifies the layers below it.
-Recommendations (Phase 4+) get their own tables.
+LLM output lives only in the analysis layer and in the `interpretation` of opportunity
+assessments. Neither modifies the layers below it, and no score depends on it.
 
 ## LLM provider: Google Gemini
 
@@ -295,7 +559,7 @@ topics = await llm.generate_structured(LLMRequest(prompt="..."), TopicList)  # a
 |---|---|---|---|
 | `GEMINI_API_KEY` | For AI analysis | *(empty)* | Gemini API key. Create one in [Google AI Studio](https://aistudio.google.com/apikey). |
 | `GEMINI_MODEL` | No | `gemini-3.8-flash` | Model ID. Leave empty for the default. |
-| `GEMINI_ANALYSIS_MODEL` / `GEMINI_SYNTHESIS_MODEL` | No | `GEMINI_MODEL` | Per-route models: bulk per-page analysis vs. profiles, briefings, summaries, consolidation |
+| `GEMINI_ANALYSIS_MODEL` / `GEMINI_SYNTHESIS_MODEL` | No | `GEMINI_MODEL` | Per-route models: bulk per-page analysis vs. profiles, briefings, summaries, consolidation, opportunity interpretation |
 | `ANALYSIS_REASONING_EFFORT` / `SYNTHESIS_REASONING_EFFORT` | No | `low` / `medium` | Gemini `thinking_level` per route |
 | `LLM_MAX_TOKENS_PER_RUN` / `LLM_DAILY_TOKEN_BUDGET` | No | `400000` / `2000000` | Hard budgets checked before each call (`0` daily = unlimited) |
 | `LLM_TIMEOUT_SECONDS` | No | `120` | Per-request timeout |
@@ -321,8 +585,8 @@ topics = await llm.generate_structured(LLMRequest(prompt="..."), TopicList)  # a
 |---|---|
 | 1 · Website monitoring | **No.** Deterministic. Works with `GEMINI_API_KEY` empty. |
 | 2 · Persisted history | **No.** Storage, incremental scans and change detection are deterministic. |
-| 3 · Competitor analysis (current) | **Yes:** per-page analysis, change summaries, profiles, landscape briefings, topic consolidation. Metrics, trends and gaps stay deterministic. |
-| 4 · Opportunity detection | Yes: relevance judgments and angles (scores are deterministic) |
+| 3 · Competitor analysis | **Yes:** per-page analysis, change summaries, profiles, landscape briefings, topic consolidation. Metrics, trends and gaps stay deterministic. |
+| 4 · Content opportunities (current) | **Yes, top candidates only:** title, angle, why now, format, audience, rationale. Signals, relevance, gaps, scores and ranking are deterministic; works without a key. |
 | 5 · Blog research and generation | Yes |
 | 6 · SEO, editing, fact-checking, quality | Yes |
 | 7–10 · Publishing, scheduling, social, dashboard | Publishing itself never uses an LLM |
@@ -351,6 +615,8 @@ All settings are environment variables (or `.env`); see [`.env.example`](.env.ex
 | `ANALYSIS_EXCLUDE_TYPES` | `["careers","legal","listing"]` | Page types never analyzed (JSON list) |
 | `ANALYSIS_MAX_CHANGE_SUMMARIES_PER_RUN` | `10` | Significant changes explained per run |
 | `ANALYSIS_TAXONOMY_PROMPT_LIMIT` | `150` | Existing topics shown to the analyzer |
+| `COMPANY_FILE` | `config/company.yaml` | Company profile YAML for `company import` |
+| `SCORING_FILE` | `config/scoring.yaml` | Optional opportunity scoring configuration (weights, thresholds, Gemini candidates); built-in defaults without it |
 
 ## Development
 
@@ -370,8 +636,10 @@ uv run pytest -m llm_live            # opt-in: one real Gemini call (needs GEMIN
 - HTTP, including the Gemini API, is mocked with [respx]; an autouse guard blocks every
   non-loopback socket.
 - The analysis pipeline is tested end to end with `tests/fakellm.py`, a deterministic stand-in
-  for Gemini. It reads prompts like the real model, and can fail, omit documents or return
-  invalid output on demand.
+  for Gemini. It reads prompts like the real model, and can fail, omit documents, return
+  invalid output or invent numbers on demand.
+- Opportunity scoring is unit-tested on synthetic facts (no database), then end to end on
+  PostgreSQL through the CLI and API.
 - CI runs lint, format, type checks and tests against a PostgreSQL service
   (`.github/workflows/ci.yml`).
 
@@ -399,12 +667,17 @@ app/
     profiles.py, landscape.py  grounded syntheses (Gemini)
     change_summaries.py        explanations of significant changes (Gemini)
     llm_usage.py               token budgets and the LLM call ledger
+    company.py                 versioned company profiles
+    relevance.py               deterministic matching: stems, strategic fit, near-duplicates
+    opportunity_signals.py     signals, gaps, score, suggestion, change reasons (no LLM)
+    opportunities.py           generation runs: score → store → interpret; status changes
+    numbers.py                 drops model sentences whose numbers aren't in the evidence
   prompts/                     versioned prompts + their structured-output schemas
   db/                          models (by layer), sessions, advisory locks, queries, migrations
   llm/                         provider-agnostic LLM interface + Gemini provider
   api/                         HTTP routes and schemas
 migrations/                    Alembic migrations
-config/                        competitors.example.yaml, topics.example.yaml
+config/                        *.example.yaml: competitors, topics, company, scoring
 tests/                         unit, integration (incl. PostgreSQL) and opt-in live tests
 ```
 

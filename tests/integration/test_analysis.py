@@ -5,8 +5,7 @@ Scans the offline fake site (Phase 2), then analyzes, summarizes, profiles and r
 
 import asyncio
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import pytest
 import respx
@@ -29,10 +28,10 @@ from app.db.models import (
     Topic,
     TopicAlias,
 )
-from app.db.session import SessionFactory, create_session_factory
 from app.db.session import create_engine as create_async_db_engine
+from app.db.session import create_session_factory
 from app.domain.analysis import AnalysisMethod, LLMPurpose, TopicRole, TrendDirection
-from app.domain.history import ItemStatus, RunStatus, RunTrigger
+from app.domain.history import RunStatus, RunTrigger
 from app.domain.topics import TopicSeed
 from app.llm import (
     LazyLLM,
@@ -58,59 +57,10 @@ from tests.fakesite import (
     FakeClock,
     acme_competitor,
     article_html,
-    make_settings,
     mount_site,
     public_resolver,
 )
-
-
-class WallClock:
-    def __init__(self, start: datetime) -> None:
-        self.now = start
-
-    def __call__(self) -> datetime:
-        return self.now
-
-    def advance(self, **delta: float) -> None:
-        self.now += timedelta(**delta)
-
-
-@dataclass
-class Env:
-    settings: Settings
-    sessions: SessionFactory
-    engine: object
-    fetcher: PoliteFetcher
-    fake: FakeLLM
-    wall: WallClock
-
-    def analysis(self, **overrides: object) -> AnalysisService:
-        settings = make_settings(database_url=self.settings.database_url.get_secret_value(), **overrides)  # fmt: skip
-        return AnalysisService(self.engine, self.sessions, LazyLLM(settings, provider=self.fake), settings, now=self.wall)  # type: ignore[arg-type]  # fmt: skip
-
-    async def scan(self, **site: object) -> None:
-        scans = ScanService(self.engine, self.sessions, self.fetcher, self.settings, now=self.wall)  # type: ignore[arg-type]
-        with respx.mock(assert_all_called=False) as router:
-            mount_site(router, **site)  # type: ignore[arg-type]
-            outcome = await scans.run("acme", trigger=RunTrigger.CLI)
-        assert outcome.status is not RunStatus.FAILED, outcome.error
-
-    async def count(self, model: type, *where: object) -> int:
-        async with self.sessions() as session:
-            return int(await session.scalar(select(func.count()).select_from(model).where(*where)) or 0)  # type: ignore[arg-type]  # fmt: skip
-
-    async def eligible(self) -> int:
-        async with self.sessions() as session:
-            query = (
-                select(func.count())
-                .select_from(ContentItem)
-                .join(ContentVersion, ContentVersion.id == ContentItem.current_version_id)
-                .where(
-                    ContentItem.status == ItemStatus.ACTIVE.value,
-                    analysis_queries.eligible_clause(self.settings),
-                )
-            )
-            return int(await session.scalar(query) or 0)
+from tests.pipeline import Env, WallClock
 
 
 @pytest.fixture

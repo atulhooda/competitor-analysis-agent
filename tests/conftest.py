@@ -27,6 +27,8 @@ _SETTINGS_NAMES = {
     "COMPETITORS_FILE",
     "STORE_RAW_HTML",
     "TOPICS_FILE",
+    "COMPANY_FILE",
+    "SCORING_FILE",
 }
 
 TEST_DATABASE_URL = os.environ.get(
@@ -36,7 +38,8 @@ _DB_UNAVAILABLE = "PostgreSQL is not reachable"
 _TABLES = (
     "competitors, runs, run_events, raw_documents, content_items, content_versions, "
     "change_events, topics, topic_aliases, content_analyses, content_analysis_topics, "
-    "change_summaries, competitor_profiles, landscape_reports, llm_calls"
+    "change_summaries, competitor_profiles, landscape_reports, llm_calls, company_profiles, "
+    "opportunities, opportunity_assessments, opportunity_evidence, opportunity_events"
 )
 
 

@@ -22,6 +22,7 @@ from app.prompts.content_analysis import (
     TopicLabelOut,
 )
 from app.prompts.landscape import FindingOut, LandscapeOut, PositioningOut
+from app.prompts.opportunity import OpportunityInterpretationOut, OpportunityOut
 from app.prompts.topic_consolidation import ConsolidationOut, MergeGroupOut
 
 _DOCUMENT = re.compile(r'<document id="(D\d+)">\n(.*?)\n</document>', re.DOTALL)
@@ -102,6 +103,10 @@ class FakeLLM:
     omit_once: set[str] = field(default_factory=set)
     # Custom answers per schema: a callable taking the request.
     answers: dict[type[BaseModel], Callable[[LLMRequest], BaseModel]] = field(default_factory=dict)  # fmt: skip
+    # Opportunity interpretations: add a sentence with a number that isn't in the evidence.
+    fabricate_numbers: bool = False
+    # Opportunity topics (by label) to leave out of the answer.
+    omit_topics: set[str] = field(default_factory=set)
     closed: bool = False
 
     @property
@@ -160,6 +165,8 @@ class FakeLLM:
             data = _landscape(request.prompt)
         elif schema is ConsolidationOut:
             data = _consolidation(request.prompt)
+        elif schema is OpportunityInterpretationOut:
+            data = _opportunities(request.prompt, self.fabricate_numbers, self.omit_topics)
         else:  # pragma: no cover - a new schema needs an answer here
             raise AssertionError(f"FakeLLM has no answer for {schema.__name__}")
         return StructuredResponse(
@@ -242,3 +249,36 @@ def _consolidation(prompt: str) -> ConsolidationOut:
             )
         )
     return ConsolidationOut(merges=merges)
+
+
+def _opportunities(prompt: str, fabricate: bool, omit: set[str]) -> OpportunityInterpretationOut:
+    blocks = re.split(r"^(?=O\d+ \| topic: )", prompt, flags=re.MULTILINE)[1:]
+    answers = []
+    for block in blocks:
+        header = re.match(r"(O\d+) \| topic: (.+?) \| score (\S+)/100", block)
+        assert header is not None, block[:200]
+        ref, topic, score = header.groups()
+        if topic in omit:
+            continue
+        pages = re.findall(r"^(E\d+) \|", block, re.MULTILINE)
+        why = f"Competitors keep publishing on {topic}, and it scored {score}."
+        title = f"{topic}: the practical guide for founders"
+        if fabricate:
+            why += " Competitors published 987 posts on it last week."
+            title = f"Why 73% of founders get {topic} wrong"
+        answers.append(
+            OpportunityOut(
+                opportunity_id=ref,
+                title=title,
+                recommended_angle=f"Show founders how {topic} works in practice.",
+                why_now=why,
+                target_audience="founders",
+                recommended_format="comparison",
+                search_intent="comparison",
+                differentiation_strategy="Go deeper than the cited pages, with worked examples.",
+                strategic_rationale=f"It ties {topic} to the startup's core topics.",
+                evidence=[*pages[:1], "E999"],
+                confidence=0.7,
+            )
+        )
+    return OpportunityInterpretationOut(opportunities=answers)

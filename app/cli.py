@@ -14,17 +14,18 @@ from rich.table import Table
 from sqlalchemy.exc import DBAPIError, OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.config import get_settings, load_competitors, load_topic_seeds
+from app.config import get_settings, load_company_profile, load_competitors, load_topic_seeds
 from app.core.errors import ConfigurationError
 from app.core.logging import configure_logging
 from app.core.timeutils import parse_since, utcnow
 from app.crawling.fetcher import PoliteFetcher
-from app.db import analysis_queries, migrate, queries
+from app.db import analysis_queries, migrate, opportunity_queries, queries
 from app.db.session import SessionFactory, create_engine, create_session_factory
 from app.domain.analysis import MixShift, Share, TopicTrend
 from app.domain.competitor_profile import Claim
 from app.domain.content import ContentType
 from app.domain.history import ChangeType, RunStatus, RunTrigger
+from app.domain.opportunities import OpportunityStatus
 from app.domain.scan import ScanResult
 from app.llm import LazyLLM, LLMConfigurationError
 from app.services.analysis import (
@@ -33,10 +34,25 @@ from app.services.analysis import (
     AnalysisOutcome,
     AnalysisService,
 )
+from app.services.company import (
+    company_view,
+    latest_company_profile,
+    list_company_profiles,
+    save_company_profile,
+)
 from app.services.intelligence import IntelligenceService
 from app.services.landscape import LandscapeAlreadyRunningError, LandscapeService
 from app.services.llm_usage import usage_window_start, utc_day_start
 from app.services.monitoring import MonitoringService
+from app.services.opportunities import (
+    GenerationOptions,
+    GenerationOutcome,
+    InvalidStatusTransitionError,
+    NoCompanyProfileError,
+    OpportunityNotFoundError,
+    OpportunityRunAlreadyActiveError,
+    OpportunityService,
+)
 from app.services.scans import CompetitorNotFoundError, ScanError, ScanOutcome, ScanService
 from app.services.topic_admin import TopicAdminService
 from app.services.topics import TopicMergeError
@@ -50,9 +66,13 @@ cli = typer.Typer(
 db_cli = typer.Typer(no_args_is_help=True, help="Database migrations.")
 competitors_cli = typer.Typer(help="Manage monitored competitors (stored in the database).")
 topics_cli = typer.Typer(help="The topic taxonomy: list, inspect, seed, merge, consolidate.")
+company_cli = typer.Typer(no_args_is_help=True, help="Your company profile (what opportunities are scored against).")  # fmt: skip
+opportunities_cli = typer.Typer(help="Content opportunities: generate, rank, inspect, decide.")
 cli.add_typer(db_cli, name="db")
 cli.add_typer(competitors_cli, name="competitors")
 cli.add_typer(topics_cli, name="topics")
+cli.add_typer(company_cli, name="company")
+cli.add_typer(opportunities_cli, name="opportunities")
 console = Console()
 err = Console(stderr=True)
 
@@ -964,3 +984,313 @@ def usage(days: int = typer.Option(7, min=1, max=90)) -> None:
         console.print(f"today: {report.today_tokens:,} tokens (daily budget {budget}); last {days} day(s): {report.total_tokens:,}")  # fmt: skip
 
     _run_db(work)
+
+
+# ── company profile (Phase 4) ────────────────────────────────────────────────
+
+
+@company_cli.command("import")
+def import_company(
+    file: Annotated[Path | None, typer.Option(help="YAML file (default: COMPANY_FILE).")] = None,
+) -> None:
+    """Store your company profile as a new version (no-op if unchanged)."""
+    settings = get_settings()
+    try:
+        profile = load_company_profile(file or settings.company_file)
+    except ConfigurationError as exc:
+        err.print(f"[red]Configuration error:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session, session.begin():
+            row, created = await save_company_profile(session, profile, source="file", now=utcnow())
+        state = "created" if created else "unchanged"
+        console.print(f"company profile v{row.version} {state}: {profile.name}")
+        if created and row.version > 1:
+            console.print("Run `opportunities generate` to re-score opportunities against it.")
+
+    _run_db(work)
+
+
+@company_cli.command("show")
+def show_company(json_output: bool = typer.Option(False, "--json")) -> None:
+    """Show the company profile in use."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            row = await latest_company_profile(session)
+        if row is None:
+            err.print("No company profile yet: copy config/company.example.yaml to config/company.yaml, edit it, then run `company import`.")  # fmt: skip
+            raise typer.Exit(code=2)
+        view = company_view(row)
+        if json_output:
+            sys.stdout.write(view.model_dump_json(indent=2) + "\n")
+            return
+        p = view.profile
+        console.print(f"[bold]{p.name}[/bold] · profile v{view.version} · {view.created_at:%Y-%m-%d %H:%M} ({view.source})")  # fmt: skip
+        console.print(p.description)
+        for label, values in (("products", [x.name for x in p.products]), ("audiences", p.target_audiences), ("core topics", p.core_topics), ("adjacent topics", p.adjacent_topics), ("excluded topics", p.excluded_topics), ("preferred formats", [f.value for f in p.preferred_formats])):  # fmt: skip
+            if values:
+                console.print(f"{label}: {', '.join(values)}")
+
+    _run_db(work)
+
+
+@company_cli.command("versions")
+def company_versions() -> None:
+    """List company profile versions, newest first."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            rows = await list_company_profiles(session)
+        table = Table("Version", "Created", "Source", "Name", "Core topics", "Fingerprint")
+        for row in rows:
+            p = row.to_profile()
+            table.add_row(str(row.version), f"{row.created_at:%Y-%m-%d %H:%M}", row.source, p.name, ", ".join(p.core_topics)[:60], row.fingerprint[:12])  # fmt: skip
+        console.print(table if rows else "No company profile yet.")
+
+    _run_db(work)
+
+
+# ── opportunities (Phase 4) ──────────────────────────────────────────────────
+
+
+def _print_generation(outcome: GenerationOutcome, json_output: bool) -> None:
+    s, u = outcome.summary, outcome.usage
+    if json_output:
+        payload = {"run_id": outcome.run_id, "status": outcome.status.value, "error": outcome.error, "summary": s.as_dict() if s else None, "usage": u.as_dict() if u else None}  # fmt: skip
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return
+    color = {"succeeded": "green", "partial": "yellow"}.get(outcome.status.value, "red")
+    console.print(f"run {outcome.run_id} [{color}]{outcome.status.value}[/{color}]")
+    if s is not None:
+        rejected = ", ".join(f"{k} {v}" for k, v in sorted(s.rejected.items())) or "none"
+        console.print(f"company profile v{s.company_profile_version} · {s.candidates} candidates → {s.qualified} opportunities (rejected: {rejected})")  # fmt: skip
+        console.print(f"created={s.created} rescored={s.rescored} unchanged={s.unchanged} reopened={s.reopened} expired={s.expired}")  # fmt: skip
+        console.print(f"interpretation: new={s.interpreted} reused={s.interpretations_reused} failed={s.interpretations_failed} skipped={s.interpretations_skipped} unverified_sentences_removed={s.unverified_sentences_removed}")  # fmt: skip
+    if u is not None and u.calls:
+        console.print(f"gemini: {u.calls} call(s), {u.total_tokens:,} tokens")
+    if outcome.error:
+        err.print(f"[yellow]{outcome.error}[/yellow]")
+
+
+@opportunities_cli.callback(invoke_without_command=True)
+def opportunities_main(ctx: typer.Context) -> None:
+    """List opportunities when no subcommand is given."""
+    if ctx.invoked_subcommand is None:
+        list_opportunities(status=None, min_score=None, topic=None, competitor=None, limit=25, json_output=False)  # fmt: skip
+
+
+@opportunities_cli.command("generate")
+def generate_opportunities(
+    window_days: int | None = typer.Option(
+        None, min=7, max=365, help="Override the scoring window."
+    ),
+    interpret: bool = typer.Option(True, help="Let Gemini interpret the top candidates."),
+    force: bool = typer.Option(False, help="Re-assess and re-interpret even if unchanged."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Score content opportunities (deterministic), then interpret the top ones (Gemini)."""
+    settings = get_settings()
+
+    async def work(engine: AsyncEngine, sessions: SessionFactory) -> GenerationOutcome:
+        llm = LazyLLM(settings)
+        try:
+            service = OpportunityService(engine, sessions, llm, settings)
+            return await service.run(trigger=RunTrigger.CLI, options=GenerationOptions(window_days=window_days, interpret=interpret, force=force))  # fmt: skip
+        finally:
+            await llm.aclose()
+
+    try:
+        outcome = _run_db(work)
+    except (NoCompanyProfileError, OpportunityRunAlreadyActiveError, ConfigurationError) as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    _print_generation(outcome, json_output)
+    if not json_output and outcome.status != RunStatus.FAILED:
+        list_opportunities(status=None, min_score=None, topic=None, competitor=None, limit=10, json_output=False)  # fmt: skip
+    if outcome.status == RunStatus.FAILED:
+        raise typer.Exit(code=1)
+
+
+@opportunities_cli.command("list")
+def list_opportunities(
+    status: Annotated[
+        list[OpportunityStatus] | None,
+        typer.Option("--status", help="Repeatable. Default: new, reviewed, approved."),
+    ] = None,
+    min_score: float | None = typer.Option(None, min=0, max=100),
+    topic: str | None = typer.Option(None, help="Topic slug or part of its name."),
+    competitor: str | None = typer.Option(None, help="Competitor slug in the evidence."),
+    limit: int = typer.Option(25, min=1, max=200),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Opportunities ranked by score."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            rows = await opportunity_queries.list_opportunities(
+                session,
+                now=utcnow(),
+                statuses=tuple(status) if status else opportunity_queries.ACTIONABLE_STATUSES,
+                min_score=min_score,
+                topic=topic,
+                competitor=competitor,
+                limit=limit,
+            )
+        if json_output:
+            sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
+            return
+        table = Table("#", "ID", "Score", "Topic", "Working title", "Gap", "Format", "Audience", "Status")  # fmt: skip
+        for r in rows:
+            fmt = r.recommended_format.value if r.recommended_format else "—"
+            status_text = r.status.value + (" (stale)" if r.stale else "")
+            table.add_row(str(r.rank), str(r.id), f"{r.score:.0f}", r.topic_label[:32], r.title[:52], r.primary_gap.value if r.primary_gap else "—", fmt, (r.target_audience or "—")[:24], status_text)  # fmt: skip
+        console.print(table if rows else "No opportunities: run `opportunities generate` (after `analyze`).")  # fmt: skip
+
+    _run_db(work)
+
+
+@opportunities_cli.command("show")
+def show_opportunity(opportunity_id: int, json_output: bool = typer.Option(False, "--json")) -> None:  # fmt: skip
+    """One opportunity: score breakdown, why, gaps, Gemini's interpretation, timeline."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            detail = await opportunity_queries.get_opportunity(
+                session, opportunity_id, now=utcnow()
+            )
+        if detail is None:
+            err.print(f"[red]Unknown opportunity {opportunity_id}[/red]")
+            raise typer.Exit(code=2)
+        if json_output:
+            sys.stdout.write(detail.model_dump_json(indent=2) + "\n")
+            return
+        a = detail.assessment
+        console.print(f"[bold]#{detail.id} {detail.title}[/bold]")
+        console.print(f"topic: {detail.topic_label} · status: {detail.status.value} · score [bold]{detail.score:.1f}[/bold]/100")  # fmt: skip
+        if a is None:
+            return
+        table = Table("Dimension", "Points", "Detail")
+        for c in a.breakdown:
+            points = f"{c.points:+.1f}" if c.dimension == "saturation" else f"{c.points:.1f}/{c.max_points:.0f}"  # fmt: skip
+            table.add_row(c.dimension.replace("_", " "), points, c.detail[:110])
+        console.print(table)
+        console.print("[bold]Why[/bold]")
+        for reason in a.suggestion.reasons:
+            console.print(f"• {reason}")
+        gaps = [g for g in sorted(a.gaps, key=lambda g: -g.score) if g.score > 0]
+        if gaps:
+            console.print("[bold]Gaps[/bold] " + "; ".join(f"{g.type.value} {g.score:.2f}" for g in gaps))  # fmt: skip
+        s = a.suggestion
+        console.print(f"[bold]Suggested[/bold] format: {s.format.value if s.format else 'open'} · audience: {s.audience or 'open'} · intent: {s.intent.value if s.intent else 'open'}")  # fmt: skip
+        i = a.interpretation
+        if i is not None:
+            console.print(f"[bold]Gemini[/bold] ({a.interpretation_status.value}, {a.interpretation_model}, confidence {i.confidence:.2f})")  # fmt: skip
+            for label, text in (("Angle", i.recommended_angle), ("Why now", i.why_now), ("Audience", i.target_audience), ("Format / intent", f"{i.recommended_format.value} / {i.search_intent.value if i.search_intent else '—'}"), ("Differentiation", i.differentiation_strategy), ("Rationale", i.strategic_rationale)):  # fmt: skip
+                console.print(f"  {label}: {text}")
+        else:
+            console.print(f"[dim]interpretation: {a.interpretation_status.value}{' — ' + a.interpretation_error if a.interpretation_error else ''}[/dim]")  # fmt: skip
+        if a.change is not None:
+            console.print(f"[bold]Changed[/bold] {a.change.previous_score} → {a.change.score}: " + "; ".join(a.change.reasons))  # fmt: skip
+        console.print(f"[dim]company profile v{a.company_profile_version} · assessment {a.id} · evidence: `opportunities evidence {detail.id}` · history: `opportunities history {detail.id}`[/dim]")  # fmt: skip
+
+    _run_db(work)
+
+
+@opportunities_cli.command("evidence")
+def opportunity_evidence(opportunity_id: int, json_output: bool = typer.Option(False, "--json")) -> None:  # fmt: skip
+    """The evidence behind an opportunity's current score."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            rows = await opportunity_queries.evidence(session, opportunity_id)
+        if rows is None:
+            err.print(f"[red]Unknown opportunity {opportunity_id}[/red]")
+            raise typer.Exit(code=2)
+        if json_output:
+            sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
+            return
+        table = Table("ID", "Kind", "Ref", "Competitor", "Evidence")
+        for r in rows:
+            label = r.label if r.kind.value != "content" else f"{r.label} ({r.data.get('url')})"
+            table.add_row(str(r.id), r.kind.value, str(r.ref_id or "—"), r.competitor or "—", label[:120])  # fmt: skip
+        console.print(table)
+
+    _run_db(work)
+
+
+@opportunities_cli.command("history")
+def opportunity_history(opportunity_id: int) -> None:
+    """How the opportunity's score changed over time, and why."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            detail = await opportunity_queries.get_opportunity(
+                session, opportunity_id, now=utcnow()
+            )
+            rows = await opportunity_queries.history(session, opportunity_id) if detail else []
+        if detail is None:
+            err.print(f"[red]Unknown opportunity {opportunity_id}[/red]")
+            raise typer.Exit(code=2)
+        table = Table("Assessed", "Score", "Δ", "Profile", "Why it changed")
+        for r in rows:
+            delta = f"{r.change.delta:+.1f}" if r.change else "—"
+            table.add_row(f"{r.created_at:%Y-%m-%d %H:%M}", f"{r.score:.1f}", delta, f"v{r.company_profile_version}", "; ".join(r.change.reasons)[:120] if r.change else "first assessment")  # fmt: skip
+        console.print(table)
+        for e in detail.events:
+            transition = f"{e.from_status.value if e.from_status else ''} → {e.to_status.value}" if e.to_status else ""  # fmt: skip
+            console.print(f"{e.created_at:%Y-%m-%d %H:%M} {e.kind.value} {transition} {e.note or ''} [dim]({e.actor})[/dim]")  # fmt: skip
+
+    _run_db(work)
+
+
+def _set_opportunity_status(opportunity_id: int, status: OpportunityStatus, note: str | None) -> None:  # fmt: skip
+    settings = get_settings()
+
+    async def work(engine: AsyncEngine, sessions: SessionFactory) -> None:
+        service = OpportunityService(engine, sessions, LazyLLM(settings), settings)
+        await service.set_status(opportunity_id, status, note=note, actor="cli")
+        console.print(f"opportunity {opportunity_id}: {status.value}")
+
+    try:
+        _run_db(work)
+    except (OpportunityNotFoundError, InvalidStatusTransitionError) as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+
+@opportunities_cli.command("review")
+def review_opportunity(opportunity_id: int, note: str | None = typer.Option(None)) -> None:
+    """Mark an opportunity as reviewed."""
+    _set_opportunity_status(opportunity_id, OpportunityStatus.REVIEWED, note)
+
+
+@opportunities_cli.command("approve")
+def approve_opportunity(opportunity_id: int, note: str | None = typer.Option(None)) -> None:
+    """Approve an opportunity for content generation (Phase 5)."""
+    _set_opportunity_status(opportunity_id, OpportunityStatus.APPROVED, note)
+
+
+@opportunities_cli.command("reject")
+def reject_opportunity(opportunity_id: int, note: str | None = typer.Option(None)) -> None:
+    """Reject an opportunity (it stays rejected when re-scored)."""
+    _set_opportunity_status(opportunity_id, OpportunityStatus.REJECTED, note)
+
+
+@opportunities_cli.command("use")
+def use_opportunity(opportunity_id: int, note: str | None = typer.Option(None)) -> None:
+    """Mark an approved opportunity as used (content was created from it)."""
+    _set_opportunity_status(opportunity_id, OpportunityStatus.USED, note)
+
+
+@opportunities_cli.command("expire")
+def expire_opportunity(opportunity_id: int, note: str | None = typer.Option(None)) -> None:
+    """Retire an opportunity as no longer timely."""
+    _set_opportunity_status(opportunity_id, OpportunityStatus.EXPIRED, note)
+
+
+@opportunities_cli.command("reopen")
+def reopen_opportunity(opportunity_id: int, note: str | None = typer.Option(None)) -> None:
+    """Reopen an expired opportunity."""
+    _set_opportunity_status(opportunity_id, OpportunityStatus.NEW, note)

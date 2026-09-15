@@ -7,6 +7,7 @@
 - r2 (2026-09-13): **the primary LLM provider changed from Anthropic to Google Gemini**, at the owner's request. Gemini is the only LLM provider; no other provider is introduced unless the owner explicitly asks. Phase 1 stays deterministic (no LLM calls) and only establishes the provider-agnostic LLM interface and Gemini configuration.
 - r3 (2026-09-13): Phase 1 approved. Phase 2 (persisted history) implemented; see the implementation notes under §12, Phase 2.
 - r4 (2026-09-13): Phase 2 approved. Phase 3 (AI competitor intelligence, the first Gemini calls) implemented; see the implementation notes under §12, Phase 3.
+- r5 (2026-09-14): Phase 3 approved. Phase 4 (content opportunities) implemented; see the implementation notes under §12, Phase 4. Relevance is now deterministic rather than an LLM judgment (§8.3); Gemini only interprets the top candidates.
 
 The three source repositories were cloned to a temporary scratch directory for analysis only. They are not vendored, submoduled, or left beside the project.
 
@@ -721,6 +722,63 @@ At every phase: run the tests → run the app → verify against real inputs →
 - Company profile; your own site crawled as `is_self`.
 - Computation of each factor; configurable weights; LLM relevance judgment and angle.
 - Ranked, explainable opportunities.
+
+**Implemented (2026-09-14). What was built, and where it differs from §7 and §8.3:**
+- **Pipeline** (`app/services/opportunities.py`), one run at a time (advisory lock `72_004`), recorded as a `runs` row of kind `opportunities`:
+  1. load the latest analysis per page, the taxonomy with aliases, competitor profiles, the latest company profile version and the scoring config;
+  2. `OpportunitySignalEngine` (`app/services/opportunity_signals.py`, no LLM) scores one candidate per canonical top-level topic, plus core company topics no competitor covers;
+  3. qualify, deduplicate (near-duplicate topics via shared word stems) and cap;
+  4. persist in one transaction: one opportunity per topic, a new immutable assessment only when the score or its basis changed, evidence rows, events, expiry and reopening;
+  5. Gemini interprets the top candidates (angle, why now, format, audience, differentiation, rationale). Interpretations are reused while what the model sees is unchanged, and numbers are checked against the evidence.
+
+  The API starts runs in the background (`202` plus a run to poll, or `?wait=true`); the CLI runs them synchronously. A run is `partial` when interpretation stopped or failed. Scores are always saved.
+- **Scoring** (differs from §8.3):
+  - **Dimensions.** Five positive dimensions (momentum, strategic fit, audience fit, content gap, recency) are each 0–1 times a weight, rescaled to total 100. Saturation is subtracted as a penalty. The breakdown always adds up to the 0–100 score.
+  - **Weights and thresholds** live in the optional `config/scoring.yaml`. Every assessment stores the config's fingerprint instead of a `weights_version`.
+  - **Relevance is deterministic, not an LLM rubric.** Stem matching against the company profile's core, adjacent and excluded topics, subtopics, description and products, plus competitor-page keyword support. So the score never depends on model output, and the same inputs always give the same score. Gemini's role moved to interpretation.
+  - **"Novelty" and "competitor activity"** are expressed as momentum (smoothed window-over-window growth plus the share of competitors growing) and recency (half-life decay).
+  - **Seven gap types are stored separately:** topic, audience, intent, format, depth, freshness and differentiation. Low coverage alone doesn't qualify a topic: a minimum strategic fit and a minimum page count apply.
+  - **Saturation** combines volume, breadth, frequency and format variety, relieved when the existing coverage is stale, shallow, fragmented, or misses your audience or valuable intents.
+  - **Not implemented:**
+    - "Search opportunity": no keyword-data provider is configured.
+    - "Existing company coverage": the `is_self` crawl isn't built. An opportunity you already covered can be marked `used` or `rejected`. Planned for later together with internal links.
+- **Company profile.**
+  - `config/company.yaml` (gitignored; the example holds only placeholders) is imported with `company import` or `PUT /api/v1/company-profile`.
+  - It is stored as versioned rows in `company_profiles`. A version is created only when the profile changes, and every assessment references the version it was scored with. No industry is hardcoded.
+- **Tables (migration `0003`).**
+  - `company_profiles`, `opportunities`, `opportunity_assessments`, `opportunity_evidence` and `opportunity_events`.
+  - The `llm_calls` purpose check gained `opportunity_interpretation`.
+- **Differences from §7.1 `content_opportunities`:**
+  - It is split into an opportunity (identity, status, current score), immutable assessments (score history with change explanations), evidence rows (per assessment: metrics, trend, competitor pages with analysis and version ids, competitor profiles, gaps, company profile, related topics) and an event timeline.
+  - Statuses are `new` · `reviewed` · `approved` · `rejected` · `used` · `expired` (planned: `new` · `selected` · `dismissed` · `generated`), with validated transitions.
+  - Expiry is automatic for open opportunities that no longer qualify. They reopen if they qualify again.
+- **Idempotency.**
+  - Opportunities are keyed by canonical topic.
+  - A re-run with unchanged inputs writes no assessment and makes no Gemini call.
+  - The assessment basis is the scoring fingerprint, the company profile fingerprint, the window and the analysis ids.
+  - A new assessment explains its change per dimension (with the driving signals) and per basis change (profile, config, window, pages added or dropped).
+- **Gemini** (`app/prompts/opportunity.py`, `opportunity/1`, synthesis route).
+  - **What is sent.** Only the top `interpretation.candidates` above `interpretation.min_score`, in batches. Each prompt carries the evidence: the breakdown, signals, gaps, the deterministic suggestion and the cited competitor pages.
+  - **What is kept.**
+    - Sentences with numbers that aren't in the evidence are removed, and a title with an invented statistic falls back to the topic name.
+    - Cited ids are mapped to evidence rows; unknown ids are dropped.
+  - **Failure handling.** Unusable output is retried in halves. Outages, missing keys and budget stops mark interpretations `skipped` and never touch scores.
+- **API change.** Instead of `POST /opportunities/refresh` (§10.3), the API has:
+  - `POST /opportunities/generate`;
+  - `GET /opportunities`, `GET /opportunities/{id}`, `…/evidence`, `…/history`;
+  - `PATCH /opportunities/{id}` (status);
+  - `GET`/`PUT /company-profile` and `GET /company-profile/versions`.
+- **Live verification with Gemini.** PostHog and Plausible analyses (43 pages) scored against a hypothetical demo profile, not committed.
+  - **Result.** 24 candidates gave 5 opportunities (rejected: 2 excluded, 15 low strategic fit, 2 too few pages).
+  - **Cost.** 1 Gemini call of about 7.5–8k tokens per run, and 0 fabricated numbers removed.
+  - **Idempotency held.** A re-run with nothing new made 0 assessments and 0 calls.
+  - **Fixes it prompted:**
+    - Every suggestion was "tutorial". The suggestion now names the valuable or preferred format competitors use least, which diversified the formats.
+    - A forced re-score read "no material change". Change reasons now include basis changes and "recalculated on request".
+  - **Fixes from review:**
+    - Titles weren't number-checked. A title may now quote only evidence numbers, a small list count or a year.
+    - A profile change to non-scoring fields left the old version on the assessment. Every version now gets an assessment, and Gemini is called again only if the text it sees changed.
+- **Scope kept out:** blog writing, SEO, CMS/WordPress, publishing, social publishing, content calendars and social monitoring (Phases 5–10).
 
 ### Phase 5 — Blog generation
 - The LangGraph workflow (plan → research → outline → draft → edit) with the Postgres checkpointer.

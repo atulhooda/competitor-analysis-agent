@@ -4,9 +4,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
+from app.domain.company import CompanyProfileView
 from app.domain.content import ContentType
 from app.domain.history import RunView
 from app.domain.intelligence import Landscape, LandscapeReportView
+from app.domain.opportunities import OpportunityStatus
 from app.domain.scan import ScanResult
 
 
@@ -71,6 +73,26 @@ class TopicMergeRequest(BaseModel):
 
     source: str = Field(description="Slug of the topic to fold in")
     target: str = Field(description="Slug of the topic to keep")
+
+
+class OpportunityGenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    window_days: int | None = Field(default=None, ge=7, le=365, description="Override the scoring window")  # fmt: skip
+    interpret: bool = Field(default=True, description="Ask Gemini to interpret the top candidates")  # fmt: skip
+    force: bool = Field(default=False, description="Re-assess and re-interpret even if unchanged")  # fmt: skip
+
+
+class OpportunityStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: OpportunityStatus
+    note: str | None = Field(default=None, max_length=2_000)
+
+
+class CompanyProfileSaved(BaseModel):
+    created: bool = Field(description="False when the profile equals the current version")
+    version: CompanyProfileView
 
 
 class DatabaseStatus(BaseModel):

@@ -66,6 +66,7 @@ class AnalysisFact:
     key_themes: tuple[str, ...]
     word_count: int
     topics: tuple[FactTopic, ...]
+    keywords: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -149,7 +150,7 @@ class TrendEngine:
     def _scope(self, competitor: str | None) -> list[AnalysisFact]:
         return [f for f in self._facts if competitor is None or f.competitor == competitor]
 
-    def _bucket(self, fact: AnalysisFact) -> Literal["recent", "previous", "before"] | None:
+    def bucket(self, fact: AnalysisFact) -> Literal["recent", "previous", "before"] | None:
         if fact.published_at is None or fact.published_at > self.now:
             return None
         if fact.published_at > self.window_start:
@@ -192,7 +193,7 @@ class TrendEngine:
         trends = []
         for topic_id, rows in by_topic.items():
             per_competitor = Counter(fact.competitor for fact, _ in rows)
-            buckets = Counter(self._bucket(fact) for fact, _ in rows if fact.analysis_id in comparison_ids)  # fmt: skip
+            buckets = Counter(self.bucket(fact) for fact, _ in rows if fact.analysis_id in comparison_ids)  # fmt: skip
             dated = [fact.published_at for fact, _ in rows if fact.published_at is not None]
             trends.append(
                 TopicTrend(
@@ -305,8 +306,8 @@ class TrendEngine:
         comparison, reliable = self._comparison(self._scope(competitor))
         if not reliable:
             return []
-        recent = [f for f in comparison if self._bucket(f) == "recent"]
-        previous = [f for f in comparison if self._bucket(f) == "previous"]
+        recent = [f for f in comparison if self.bucket(f) == "recent"]
+        previous = [f for f in comparison if self.bucket(f) == "previous"]
         if len(recent) < MIN_SHIFT_ITEMS or len(previous) < MIN_SHIFT_ITEMS:
             return []
         shifts = []
@@ -344,7 +345,7 @@ class TrendEngine:
 
     def cadence(self, *, competitor: str | None = None) -> Cadence:
         scope = self._scope(competitor)
-        buckets = Counter(self._bucket(f) for f in scope)
+        buckets = Counter(self.bucket(f) for f in scope)
         return Cadence(
             window_days=self.window_days,
             recent=buckets["recent"],
