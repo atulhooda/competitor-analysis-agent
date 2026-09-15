@@ -22,6 +22,7 @@ from app.llm import (
     RetrievedURL,
     StructuredResponse,
 )
+from app.prompts import quality_judge
 from app.prompts.article_draft import ArticleContentOut
 from app.prompts.article_edit import EditOut, FlagOut
 from app.prompts.article_outline import OutlineOut, OutlineSectionOut
@@ -41,9 +42,14 @@ from app.prompts.content_analysis import (
     EntityOut,
     TopicLabelOut,
 )
+from app.prompts.fact_check import CheckOut, ClaimTypeOut, ClassifyOut, FactCheckOut
 from app.prompts.landscape import FindingOut, LandscapeOut, PositioningOut
 from app.prompts.opportunity import OpportunityInterpretationOut, OpportunityOut
+from app.prompts.quality_judge import DimensionOut, JudgeOut
+from app.prompts.revision import RevisionOut
+from app.prompts.seo import FAQOut, ImageOut, LinkChoiceOut, SEOOut
 from app.prompts.topic_consolidation import ConsolidationOut, MergeGroupOut
+from app.services.article_content import split_sentences, strip_markers
 
 _DOCUMENT = re.compile(r'<document id="(D\d+)">\n(.*?)\n</document>', re.DOTALL)
 _TYPE_TO_FORMAT = {
@@ -135,6 +141,25 @@ class FakeLLM:
     fail_schema: dict[type[BaseModel], list[Exception]] = field(default_factory=dict)
     # The edit returns an article too short to complete.
     edit_too_short: bool = False
+    # Phase 6. Fact-check verdicts by claim text (substring → verdict): "supported",
+    # "partial", "contradicted" (all with evidence quoted from the source notes),
+    # "unsupported", "insufficient" (the page is then re-read), or "fabricated" (claims
+    # support with a quote that isn't in the notes). Default: supported.
+    verdicts: dict[str, str] = field(default_factory=dict)
+    # What re-reading a page finds: the URL tool's status and the verdict (with evidence).
+    reread_status: str = "success"
+    reread_verdict: str = "supported"
+    # Uncited sentences: None = those with a digit need a source; True/False = all/none.
+    uncited_needs_source: bool | None = None
+    # The judge's score for every dimension (or per dimension).
+    judge_scores: dict[str, int] = field(default_factory=dict)
+    judge_default: int = 4
+    # The revision: "fix" (removes or rewrites the passages it's given), "worse" (adds
+    # uncited statistics, different each time), "same" (returns the article unchanged) or
+    # "short" (unusable).
+    revision_mode: str = "fix"
+    # The SEO answer: override fields of the default package.
+    seo_overrides: dict[str, Any] = field(default_factory=dict)
     closed: bool = False
 
     @property
@@ -147,6 +172,9 @@ class FakeLLM:
 
     def calls(self, schema: type[BaseModel]) -> list[LLMRequest]:
         return [request for request, s in self.requests if s is schema]
+
+    async def aclose(self) -> None:
+        self.closed = True
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         raise NotImplementedError
@@ -208,6 +236,29 @@ class FakeLLM:
             data = _draft(request.prompt)
         elif schema is EditOut:
             data = _edit(request.prompt, too_short=self.edit_too_short)
+        elif schema is FactCheckOut:
+            data, grounding = self._fact_check(request)
+        elif schema is ClassifyOut:
+            data = self._classify(request.prompt)
+        elif schema is SEOOut:
+            data = _seo(request.prompt, self.seo_overrides)
+        elif schema is JudgeOut:
+            data = JudgeOut(
+                dimensions=[
+                    DimensionOut(
+                        dimension=d,
+                        score=self.judge_scores.get(d, self.judge_default),
+                        explanation=f"{d} is {'fine' if self.judge_scores.get(d, self.judge_default) >= 4 else 'weak'}.",
+                        issues=[]
+                        if self.judge_scores.get(d, self.judge_default) >= 4
+                        else [f"Improve {d.replace('_', ' ')} in the second section."],
+                    )
+                    for d in quality_judge.DIMENSIONS
+                ],
+                summary="A useful, well-sourced guide.",
+            )
+        elif schema is RevisionOut:
+            data = _revise(request.prompt, self.revision_mode, len(self.calls(RevisionOut)))
         else:  # pragma: no cover - a new schema needs an answer here
             raise AssertionError(f"FakeLLM has no answer for {schema.__name__}")
         return StructuredResponse(
@@ -245,6 +296,38 @@ class FakeLLM:
             sources.append(CandidateOut(url=url, title=page.title or None, publisher=page.publisher, source_type=page.source_type, question_ids=["Q1"]))  # type: ignore[arg-type]  # fmt: skip
         grounding = Grounding(search_queries=("ai agents human handoff guidelines", "ai support agents resolution study"))  # fmt: skip
         return DiscoverOut(questions=questions, sources=sources), grounding
+
+    def _fact_check(self, request: LLMRequest) -> tuple[FactCheckOut, Grounding]:
+        claims = re.findall(r"^(C\d+) \[(S\d+)\] (.+)$", request.prompt, re.MULTILINE)
+        if "url_context" in request.tools:  # re-reading one page
+            url = re.search(r"URL context tool: (\S+)", request.prompt)
+            assert url is not None
+            grounding = Grounding(requested_urls=(url.group(1),), retrieved_urls=(RetrievedURL(url.group(1), self.reread_status),))  # fmt: skip
+            verdict = self.reread_verdict
+            checks = [CheckOut(claim_id=cid, verdict=verdict, confidence=0.8, explanation=f"On re-reading, the page is {verdict} on this.", evidence="the page states it in its guidance section" if verdict != "unsupported" else None) for cid, _, _ in claims]  # fmt: skip
+            return FactCheckOut(checks=checks), grounding
+        excerpts = {}
+        for label, body in re.findall(r"<untrusted_source>\nid: (S\d+)\n(.*?)\n</untrusted_source>", request.prompt, re.DOTALL):  # fmt: skip
+            quotes = re.findall(r'\| excerpt: "(.+)"$', body, re.MULTILINE)
+            excerpts[label] = quotes[0] if quotes else body.splitlines()[0]
+        checks = []
+        for cid, label, claim in claims:
+            verdict = next((v for key, v in self.verdicts.items() if key in claim), "supported")
+            evidence: str | None = excerpts.get(label)
+            if verdict == "fabricated":
+                verdict, evidence = "supported", "a sentence the source never contained about this exact claim"  # fmt: skip
+            elif verdict in ("unsupported", "insufficient"):
+                evidence = None
+            checks.append(CheckOut(claim_id=cid, verdict=verdict, confidence=0.9, explanation=f"The source is {verdict} on this.", evidence=evidence))  # fmt: skip
+        return FactCheckOut(checks=checks), Grounding()
+
+    def _classify(self, prompt: str) -> ClassifyOut:
+        sentences = re.findall(r"^(U\d+) \| (.+)$", prompt, re.MULTILINE)
+        answers = []
+        for sid, text in sentences:
+            needs = self.uncited_needs_source if self.uncited_needs_source is not None else bool(re.search(r"\d", text))  # fmt: skip
+            answers.append(ClaimTypeOut(sentence_id=sid, requires_citation=needs, claim_type="statistic" if needs else "advice", reason="a specific figure" if needs else "general advice"))  # fmt: skip
+        return ClassifyOut(sentences=answers)
 
     def _read(self, prompt: str) -> tuple[ReadOut, Grounding]:
         urls = re.findall(r"^U\d+ \| (\S+)$", prompt, re.MULTILINE)
@@ -448,9 +531,6 @@ def _edit(prompt: str, *, too_short: bool) -> EditOut:
         ],
     )
 
-    async def aclose(self) -> None:
-        self.closed = True
-
 
 def _profile(prompt: str) -> CompetitorProfileOut:
     evidence = re.findall(r"^(E\d+) \| (\w+) \|", prompt, re.MULTILINE)
@@ -549,3 +629,100 @@ def _opportunities(prompt: str, fabricate: bool, omit: set[str]) -> OpportunityI
             )
         )
     return OpportunityInterpretationOut(opportunities=answers)
+
+
+# ── Phase 6 ──────────────────────────────────────────────────────────────────
+
+_REWRITE = (
+    "Our own view is simpler: pick one queue, agree on what a good answer looks like, and "
+    "let the team judge each week whether customers are better served before going further."
+)
+
+
+def _seo(prompt: str, overrides: dict[str, Any]) -> SEOOut:
+    keywords = re.findall(r"^K\d+ \| (.+?) \| score", prompt, re.MULTILINE)
+    internal = re.findall(r"^(L\d+) \| ", prompt, re.MULTILINE)
+    external = re.findall(r"^(X\d+) \| ", prompt, re.MULTILINE)
+    options = re.search(r"^Category options: (.+)$", prompt, re.MULTILINE)
+    primary = keywords[0] if keywords else "ai agents"
+    answer: dict[str, Any] = {
+        "primary_keyword": primary,
+        "primary_keyword_reason": "The opportunity's topic, used in the title and headings.",
+        "secondary_keywords": keywords[1:5],
+        "meta_title": f"{primary.capitalize()} for founders: a practical guide"[:60],
+        "meta_description": f"How founders can use {primary} for support without losing customer trust: where they help, the human handoff and how to measure quality."[
+            :155
+        ],
+        "slug": primary,
+        "faq": [
+            FAQOut(
+                question=f"What can {primary} handle?",
+                answer="Routine tickets, with a clear path to a person.",
+            ),
+            FAQOut(
+                question="How should the handoff work?",
+                answer="Pass the full conversation so customers never repeat themselves.",
+            ),
+            FAQOut(
+                question="How do I measure quality?", answer="Review real conversations every week."
+            ),
+            FAQOut(
+                question="Is there a benchmark?", answer="Agents resolve 99% of tickets."
+            ),  # a number the article doesn't have
+        ],
+        "internal_links": [
+            LinkChoiceOut(candidate=c, anchor_text="our guide", reason="related")
+            for c in internal[:1]
+        ]
+        + [LinkChoiceOut(candidate="L99", anchor_text="made up", reason="not offered")],
+        "external_links": [
+            LinkChoiceOut(candidate=c, anchor_text=f"source {c}", reason="the research behind it")
+            for c in external[:2]
+        ],
+        "category": options.group(1).split("; ")[0] if options else "",
+        "tags": ["AI agents", "customer support", "blockchain"],  # "blockchain" isn't a candidate
+        "image": ImageOut(
+            concept="A founder reviewing a support conversation handed over by an AI agent",
+            purpose="Show the human handoff",
+            alt_text="Founder reading a support conversation handed over by an AI agent",
+        ),
+    }
+    answer.update(overrides)
+    return SEOOut.model_validate(answer)
+
+
+def _revise(prompt: str, mode: str, attempt: int) -> RevisionOut:
+    match = re.search(r"<draft>\n(.*)\n</draft>", prompt, re.DOTALL)
+    assert match is not None, "the revision prompt carries the article"
+    article = json.loads(match.group(1))
+    ids = re.findall(r"^(I\d+) \| priority", prompt, re.MULTILINE)
+    passages = re.findall(r'^   passage: "(.+)"$', prompt, re.MULTILINE)
+    changes = [f"Revised ({mode})"]
+    if mode == "short":
+        article["sections"] = article["sections"][:1]
+    elif mode == "worse":  # different each attempt
+        article["sections"][1]["blocks"].append({"type": "paragraph", "text": f"In 2025, 83% of teams cut costs by {40 + attempt}%. By 2026, 92% planned to expand. About 7 in 10 founders agreed, and 3 surveys found 55% savings."})  # fmt: skip
+    if "Editor's request:" in prompt:
+        article["sections"][-1]["blocks"].append({"type": "paragraph", "text": "For example, one founder started with password resets only, then added billing questions once the handoff worked well."})  # fmt: skip
+        changes.append("Added the example the editor asked for")
+    if mode == "fix":
+        for section in article["sections"]:
+            for block in section["blocks"]:
+                if block["type"] == "paragraph" and block.get("text"):
+                    block["text"] = _without(block["text"], passages)
+                elif block["type"] == "list":
+                    block["items"] = [_without(item, passages) for item in block["items"]]
+        changes.append(f"Addressed {len(passages)} flagged passage(s)")
+    return RevisionOut(article=ArticleContentOut.model_validate(article), changes=changes, issues_addressed=[*ids, "I999"])  # fmt: skip
+
+
+def _without(text: str, passages: list[str]) -> str:
+    """The text without the sentences a flagged passage starts with; a paragraph flagged as
+    a whole (an originality passage covering several sentences) is rewritten instead."""
+    sentences = split_sentences(text)
+    plain = strip_markers(text)
+    first = strip_markers(sentences[0])
+    if any(len(p) > len(first) + 10 and plain.startswith(p[:100]) for p in passages):
+        return _REWRITE
+    kept = [x for x in sentences if not any(strip_markers(x)[:50] == p[:50] for p in passages)]
+    return " ".join(kept) if kept else _REWRITE

@@ -30,6 +30,16 @@ DEFAULT_USER_AGENT = (
     "CompetitorMonitorBot/0.1 (+https://github.com/atulhooda/competitor-analysis-agent)"
 )
 DEFAULT_DATABASE_URL = "postgresql+psycopg://postgres@127.0.0.1:5433/competitor_agent"
+# The parts of the Phase 6 quality score (weights: QUALITY_WEIGHTS).
+QUALITY_COMPONENTS = (
+    "fact_support",
+    "citation_coverage",
+    "originality",
+    "structure",
+    "readability",
+    "seo",
+    "gemini_judgment",
+)
 
 
 class Settings(BaseSettings):
@@ -132,6 +142,42 @@ class Settings(BaseSettings):
     article_research_max_tokens: int = Field(default=150_000, ge=5_000)
     article_research_min_sources: int = Field(default=2, ge=0, le=20)
 
+    # ── Quality (Phase 6: validation and revision; nothing is published) ─────
+    gemini_quality_model: str | None = None  # fact-check, SEO, judge (empty → GEMINI_MODEL)
+    quality_reasoning_effort: ReasoningLevel = "low"
+    # Phase 6 tokens per article (all validations and revisions), within ARTICLE_MAX_TOKENS.
+    quality_max_tokens: int = Field(default=300_000, ge=10_000)
+    quality_max_revisions: int = Field(default=2, ge=0, le=5)  # automatic, per edited version
+    quality_min_score: float = Field(default=70.0, ge=0, le=100)
+    quality_max_contradicted: int = Field(default=0, ge=0)
+    quality_max_unsupported_ratio: float = Field(default=0.1, ge=0, le=1)
+    quality_max_uncited_claims: int = Field(default=3, ge=0)
+    # Points per score component; they are rescaled to total 100.
+    quality_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "fact_support": 20.0,
+            "citation_coverage": 20.0,
+            "originality": 20.0,
+            "structure": 10.0,
+            "readability": 10.0,
+            "seo": 10.0,
+            "gemini_judgment": 10.0,
+        }
+    )
+    fact_check_batch_size: int = Field(default=8, ge=1, le=30)
+    fact_check_max_rereads: int = Field(default=4, ge=0, le=20)  # sources re-read per version
+    fact_check_max_uncited_candidates: int = Field(default=30, ge=0, le=100)
+    originality_ngram_size: int = Field(default=8, ge=4, le=20)
+    originality_flag_threshold: float = Field(default=0.25, gt=0, lt=1)
+    originality_max_overlap: float = Field(default=0.5, gt=0, le=1)
+    # N-grams found in at least this many stored documents are common phrasing, not copying.
+    originality_common_doc_frequency: int = Field(default=3, ge=2)
+    originality_min_passage_words: int = Field(default=12, ge=4)
+    seo_title_max_chars: int = Field(default=60, ge=20, le=120)
+    seo_description_min_chars: int = Field(default=70, ge=20)
+    seo_description_max_chars: int = Field(default=160, ge=50, le=320)
+    seo_max_keyword_density: float = Field(default=0.03, gt=0, le=0.2)
+
     @field_validator("api_key", "gemini_api_key", mode="before")
     @classmethod
     def _blank_secret_is_unset(cls, value: object) -> object:
@@ -153,6 +199,19 @@ class Settings(BaseSettings):
             raise ValueError("ARTICLE_RESEARCH_MIN_SOURCES must not exceed ARTICLE_RESEARCH_MAX_SOURCES")  # fmt: skip
         return self
 
+    @model_validator(mode="after")
+    def _quality_limits_are_consistent(self) -> Self:
+        if self.originality_flag_threshold >= self.originality_max_overlap:
+            raise ValueError("ORIGINALITY_FLAG_THRESHOLD must be below ORIGINALITY_MAX_OVERLAP")
+        if self.seo_description_min_chars >= self.seo_description_max_chars:
+            raise ValueError("SEO_DESCRIPTION_MIN_CHARS must be below SEO_DESCRIPTION_MAX_CHARS")
+        unknown = set(self.quality_weights) - set(QUALITY_COMPONENTS)
+        if unknown:
+            raise ValueError(f"QUALITY_WEIGHTS has unknown components: {sorted(unknown)} (known: {', '.join(QUALITY_COMPONENTS)})")  # fmt: skip
+        if any(w < 0 for w in self.quality_weights.values()) or sum(self.quality_weights.values()) <= 0:  # fmt: skip
+            raise ValueError("QUALITY_WEIGHTS must be non-negative with a positive total")
+        return self
+
     @property
     def analysis_model(self) -> str:
         return self.gemini_analysis_model or self.gemini_model
@@ -164,6 +223,10 @@ class Settings(BaseSettings):
     @property
     def writing_model(self) -> str:
         return self.gemini_writing_model or self.gemini_model
+
+    @property
+    def quality_model(self) -> str:
+        return self.gemini_quality_model or self.gemini_model
 
     @property
     def database_url_display(self) -> str:

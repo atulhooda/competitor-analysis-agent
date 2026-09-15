@@ -128,6 +128,11 @@ class LLMPurpose(StrEnum):
     ARTICLE_OUTLINE = "article_outline"
     ARTICLE_DRAFT = "article_draft"
     ARTICLE_EDIT = "article_edit"
+    FACT_CHECK = "fact_check"  # Phase 6
+    CLAIM_CLASSIFICATION = "claim_classification"
+    SEO_PACKAGE = "seo_package"
+    QUALITY_JUDGE = "quality_judge"
+    ARTICLE_REVISION = "article_revision"
 
 
 class LLMCallStatus(StrEnum):

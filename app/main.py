@@ -13,7 +13,7 @@ from fastapi import FastAPI
 
 from app import __version__
 from app.api import health
-from app.api.v1 import articles, competitors, history, intelligence, opportunities
+from app.api.v1 import articles, competitors, history, intelligence, opportunities, quality
 from app.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.crawling.fetcher import PoliteFetcher
@@ -26,6 +26,7 @@ from app.services.articles import ArticleService
 from app.services.intelligence import IntelligenceService
 from app.services.landscape import LandscapeService
 from app.services.opportunities import OpportunityService
+from app.services.quality import QualityService
 from app.services.scans import ScanService
 from app.services.topic_admin import TopicAdminService
 
@@ -63,6 +64,7 @@ def create_app(
         app.state.topic_admin = TopicAdminService(sessions, lazy_llm, settings)
         app.state.opportunities = OpportunityService(engine, sessions, lazy_llm, settings)
         app.state.articles = ArticleService(engine, sessions, lazy_llm, settings, resolver=resolver)
+        app.state.quality = QualityService(engine, sessions, lazy_llm, settings, resolver=resolver)
         app.state.background_tasks = background
         _log_startup(settings)
         try:
@@ -87,6 +89,7 @@ def create_app(
     app.include_router(intelligence.router)
     app.include_router(opportunities.router)
     app.include_router(articles.router)
+    app.include_router(quality.router)
     return app
 
 
@@ -100,6 +103,7 @@ def _log_startup(settings: Settings) -> None:
         llm_analysis_model=settings.analysis_model,
         llm_synthesis_model=settings.synthesis_model,
         llm_writing_model=settings.writing_model,
+        llm_quality_model=settings.quality_model,
         llm_configured=settings.llm_configured,  # never log the key itself
         llm_daily_token_budget=settings.llm_daily_token_budget,
     )

@@ -16,6 +16,10 @@ from app.domain.history import ACTIVE_RUN_STATUSES, RunStatus
 QUEUED_GRACE = timedelta(minutes=5)
 
 
+def _kind(kind: str, article_id: int | None) -> ColumnElement[bool]:
+    return Run.kind.startswith("article") if article_id is not None else Run.kind == kind
+
+
 def _scope(competitor_id: int | None, article_id: int | None) -> ColumnElement[bool]:
     """Runs of one article (article runs), or of one competitor (or none): the others."""
     if article_id is not None:
@@ -35,9 +39,10 @@ async def run_slot_free(
     article_id: int | None = None,
 ) -> bool:
     """Whether a new run of ``kind`` may start. Runs left behind by a crashed process
-    (their lock is free) are marked failed on the way."""
+    (their lock is free) are marked failed on the way. For an article, runs of every kind
+    count: generation (Phase 5) and validation (Phase 6) share the article's lock."""
     query = select(Run.status, Run.created_at).where(
-        Run.kind == kind, Run.status.in_(ACTIVE_RUN_STATUSES)
+        _kind(kind, article_id), Run.status.in_(ACTIVE_RUN_STATUSES)
     )
     active = (await session.execute(query.where(_scope(competitor_id, article_id)))).all()
     if not active:
@@ -67,7 +72,7 @@ async def fail_abandoned_runs(
     """Mark queued/running runs of this kind failed. Call only while holding the kind's
     lock (or after checking it is free): then nobody is executing them."""
     query = update(Run).where(
-        Run.kind == kind,
+        _kind(kind, article_id),
         Run.status.in_(ACTIVE_RUN_STATUSES),
         _scope(competitor_id, article_id),
     )

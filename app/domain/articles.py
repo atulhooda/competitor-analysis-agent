@@ -24,8 +24,12 @@ class ArticleStatus(StrEnum):
     OUTLINING = "outlining"
     DRAFTING = "drafting"
     EDITING = "editing"
-    COMPLETED = "completed"
-    FAILED = "failed"  # a step failed; completed steps are kept and `resume` continues
+    COMPLETED = "completed"  # Phase 5 done: a draft awaiting validation
+    VALIDATING = "validating"  # Phase 6: fact-check, originality, SEO, metrics, judge
+    REVISING = "revising"  # Phase 6: a bounded revision is being written
+    READY = "ready"  # Phase 6 passed every gate (still not published)
+    NEEDS_REVIEW = "needs_review"  # Phase 6 couldn't pass the gates: a person decides
+    FAILED = "failed"  # a step failed; completed steps are kept and it can be resumed
     CANCELLED = "cancelled"  # deliberately stopped; final (regenerate for a new attempt)
 
 
@@ -36,10 +40,14 @@ IN_PROGRESS_STATUSES = frozenset(
         ArticleStatus.OUTLINING,
         ArticleStatus.DRAFTING,
         ArticleStatus.EDITING,
+        ArticleStatus.VALIDATING,
+        ArticleStatus.REVISING,
     }
 )
+# Phase 5 finished; Phase 6 may (re)validate these.
+VALIDATABLE_STATUSES = frozenset({ArticleStatus.COMPLETED, ArticleStatus.READY, ArticleStatus.NEEDS_REVIEW})  # fmt: skip
 # An opportunity has at most one article in these states (a partial unique index enforces it).
-LIVE_STATUSES = IN_PROGRESS_STATUSES | {ArticleStatus.COMPLETED}
+LIVE_STATUSES = IN_PROGRESS_STATUSES | VALIDATABLE_STATUSES
 ENDED_STATUSES = frozenset({ArticleStatus.FAILED, ArticleStatus.CANCELLED})
 
 
@@ -49,6 +57,14 @@ class ArticleStep(StrEnum):
     OUTLINE = "outline"
     DRAFT = "draft"
     EDIT = "edit"
+    # Phase 6, per article version
+    FACT_CHECK = "fact_check"
+    ORIGINALITY = "originality"
+    SEO = "seo"
+    METRICS = "metrics"
+    JUDGE = "judge"
+    DECISION = "decision"
+    REVISION = "revision"
 
 
 STEP_ORDER = (
@@ -58,11 +74,23 @@ STEP_ORDER = (
     ArticleStep.DRAFT,
     ArticleStep.EDIT,
 )
+# Validation of one version, in order (each step is checkpointed like the Phase 5 steps).
+QUALITY_STEPS = (
+    ArticleStep.FACT_CHECK,
+    ArticleStep.ORIGINALITY,
+    ArticleStep.SEO,
+    ArticleStep.METRICS,
+    ArticleStep.JUDGE,
+    ArticleStep.DECISION,
+)
+PHASE6_STEPS = frozenset({*QUALITY_STEPS, ArticleStep.REVISION})
 STATUS_FOR_STEP = {
     ArticleStep.RESEARCH: ArticleStatus.RESEARCHING,
     ArticleStep.OUTLINE: ArticleStatus.OUTLINING,
     ArticleStep.DRAFT: ArticleStatus.DRAFTING,
     ArticleStep.EDIT: ArticleStatus.EDITING,
+    **{step: ArticleStatus.VALIDATING for step in QUALITY_STEPS},
+    ArticleStep.REVISION: ArticleStatus.REVISING,
 }
 
 
@@ -75,7 +103,8 @@ class StepStatus(StrEnum):
 class VersionKind(StrEnum):
     OUTLINE = "outline"
     DRAFT = "draft"
-    FINAL = "final"  # the edited article
+    FINAL = "final"  # the edited article (Phase 5)
+    REVISION = "revision"  # a Phase 6 quality revision of another version
 
 
 class SourceType(StrEnum):
@@ -319,6 +348,10 @@ class ArticleSummary(BaseModel):
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+    quality_score: float | None = None  # Phase 6: the recommended version's score
+    revision_count: int = 0
+    recommended_version_id: int | None = None
+    validated_at: datetime | None = None
 
 
 class ArticleProgress(BaseModel):
@@ -358,6 +391,7 @@ class VersionSummary(BaseModel):
     kind: VersionKind
     number: int
     step_id: int
+    parent_version_id: int | None = None
     title: str
     word_count: int | None
     issues: int
@@ -379,8 +413,12 @@ class CitationView(BaseModel):
 
 class VersionDetail(VersionSummary):
     content: dict[str, Any]  # ArticleContent, or ArticleOutline for outline versions
+    reason: str | None = None  # revisions: why it was made
+    issues_addressed: list[str] = Field(default_factory=list)  # revisions: quality issue ids
     issue_details: list[ContentIssue]
-    changes: list[str] = Field(description="The editor's notes (final versions)")
+    changes: list[str] = Field(
+        description="The editor's or reviser's notes (final and revision versions)"
+    )
     citations: list[CitationView]
     markdown: str | None = None
 

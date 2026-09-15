@@ -20,7 +20,14 @@ from app.core.errors import ConfigurationError
 from app.core.logging import configure_logging
 from app.core.timeutils import parse_since, utcnow
 from app.crawling.fetcher import PoliteFetcher
-from app.db import analysis_queries, article_queries, migrate, opportunity_queries, queries
+from app.db import (
+    analysis_queries,
+    article_queries,
+    migrate,
+    opportunity_queries,
+    quality_queries,
+    queries,
+)
 from app.db.session import SessionFactory, create_engine, create_session_factory
 from app.domain.analysis import MixShift, Share, TopicTrend
 from app.domain.articles import ArticleBrief, ArticleStatus
@@ -28,6 +35,7 @@ from app.domain.competitor_profile import Claim
 from app.domain.content import ContentType
 from app.domain.history import ChangeType, RunStatus, RunTrigger
 from app.domain.opportunities import OpportunityStatus
+from app.domain.quality import ClaimVerdict
 from app.domain.scan import ScanResult
 from app.llm import LazyLLM, LLMConfigurationError
 from app.services.analysis import (
@@ -65,6 +73,7 @@ from app.services.opportunities import (
     OpportunityRunAlreadyActiveError,
     OpportunityService,
 )
+from app.services.quality import QualityOutcome, QualityService
 from app.services.scans import CompetitorNotFoundError, ScanError, ScanOutcome, ScanService
 from app.services.topic_admin import TopicAdminService
 from app.services.topics import TopicMergeError
@@ -73,7 +82,8 @@ cli = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
     help="Competitor intelligence agent: compliant website monitoring, persisted history, "
-    "AI analysis (Gemini), content opportunities and article drafts (never published).",
+    "AI analysis (Gemini), content opportunities, article drafts and their validation "
+    "(never published).",
 )
 db_cli = typer.Typer(no_args_is_help=True, help="Database migrations.")
 competitors_cli = typer.Typer(help="Manage monitored competitors (stored in the database).")
@@ -1485,10 +1495,10 @@ def list_articles_cmd(
         if json_output:
             sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
             return
-        table = Table("ID", "Opp.", "Try", "Status", "Step", "Words", "Tokens", "Created", "Title")
+        table = Table("ID", "Opp.", "Try", "Status", "Step", "Words", "Score", "Tokens", "Created", "Title")  # fmt: skip
         for r in rows:
             state = r.status.value + (f" ({r.failed_step.value})" if r.failed_step and r.status.value == "failed" else "")  # fmt: skip
-            table.add_row(str(r.id), str(r.opportunity_id), str(r.attempt), state, r.current_step.value if r.current_step else "—", str(r.word_count or "—"), f"{r.tokens_used:,}", _date(r.created_at), escape(r.title[:60]))  # fmt: skip
+            table.add_row(str(r.id), str(r.opportunity_id), str(r.attempt), state, r.current_step.value if r.current_step else "—", str(r.word_count or "—"), f"{r.quality_score:.1f}" if r.quality_score is not None else "—", f"{r.tokens_used:,}", _date(r.created_at), escape(r.title[:60]))  # fmt: skip
         console.print(table if rows else "No articles yet: approve an opportunity, then `articles generate <opportunity-id>`.")  # fmt: skip
 
     _run_db(work)
@@ -1525,6 +1535,10 @@ def show_article(
         console.print(table)
         console.print(f"[bold]Angle:[/bold] {escape(detail.brief.primary_angle)}")
         console.print(f"sources: {detail.sources} (`articles sources {detail.id}`) · versions: `articles versions {detail.id}`")  # fmt: skip
+        if detail.validated_at is not None:
+            console.print(f"quality: {detail.quality_score:.1f}/100 · recommended version {detail.recommended_version_id} · {detail.revision_count} revision(s) · validated {detail.validated_at:%Y-%m-%d %H:%M} (`articles quality {detail.id}`)")  # fmt: skip
+        elif detail.status.value == "completed":
+            console.print(f"[dim]not validated yet: `articles validate {detail.id}`[/dim]")
         if detail.issues:
             console.print(f"[bold]Issues[/bold] ({len(detail.issues)}, for review)")
             for issue in detail.issues[:12]:
@@ -1532,9 +1546,15 @@ def show_article(
         if detail.error:
             err.print(f"[yellow]{detail.status.value}{f' at {detail.failed_step.value}' if detail.failed_step else ''}: {escape(detail.error)}[/yellow]")  # fmt: skip
             if detail.status.value == "failed":
-                err.print(f"resume with `articles resume {detail.id}`")
+                phase6 = detail.failed_step is not None and detail.failed_step.value not in ("brief", "research", "outline", "draft", "edit")  # fmt: skip
+                err.print(
+                    f"resume with `articles {'validate' if phase6 else 'resume'} {detail.id}`"
+                )
         if content and detail.markdown:
-            label = "edited article" if detail.content_version and detail.content_version.kind.value == "final" else "draft"  # fmt: skip
+            kind = detail.content_version.kind.value if detail.content_version else "draft"
+            label = {"final": "edited article", "revision": f"revision v{detail.content_version.number if detail.content_version else '?'}"}.get(kind, "draft")  # fmt: skip
+            if detail.recommended_version_id is not None:
+                label = f"recommended version: {label}"
             console.rule(f"{label} (preview; not published)")
             console.print(detail.markdown, markup=False, highlight=False)
 
@@ -1575,7 +1595,7 @@ def article_versions_cmd(
     show: int | None = typer.Option(None, "--show", help="Print this version (id)."),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Every outline, draft and edited version (none is ever overwritten)."""
+    """Every outline, draft, edited and revised version (none is ever overwritten)."""
 
     async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
         async with sessions() as session:
@@ -1588,6 +1608,8 @@ def article_versions_cmd(
                     sys.stdout.write(detail.model_dump_json(indent=2) + "\n")
                     return
                 console.print(f"[bold]{detail.kind.value} v{detail.number}[/bold] · {detail.prompt_version} · {detail.model} · {len(detail.citations)} citation(s)")  # fmt: skip
+                if detail.reason:
+                    console.print(f"  reason: {escape(detail.reason)} · issues addressed: {', '.join(detail.issues_addressed) or '—'}")  # fmt: skip
                 for change in detail.changes:
                     console.print(f"  change: {escape(change)}")
                 for issue in detail.issue_details:
@@ -1601,9 +1623,9 @@ def article_versions_cmd(
         if json_output:
             sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
             return
-        table = Table("ID", "Kind", "No.", "Current", "Words", "Issues", "Prompt", "Model", "Created", "Title")  # fmt: skip
+        table = Table("ID", "Kind", "No.", "Parent", "Current", "Words", "Issues", "Prompt", "Model", "Created", "Title")  # fmt: skip
         for r in rows:
-            table.add_row(str(r.id), r.kind.value, str(r.number), "yes" if r.current else "", str(r.word_count or "—"), str(r.issues), r.prompt_version or "—", r.model or "—", f"{r.created_at:%Y-%m-%d %H:%M}", escape(r.title[:50]))  # fmt: skip
+            table.add_row(str(r.id), r.kind.value, str(r.number), str(r.parent_version_id or "—"), "yes" if r.current else "", str(r.word_count or "—"), str(r.issues), r.prompt_version or "—", r.model or "—", f"{r.created_at:%Y-%m-%d %H:%M}", escape(r.title[:50]))  # fmt: skip
         console.print(table)
 
     _run_db(work)
@@ -1625,6 +1647,284 @@ def article_steps_cmd(article_id: int, json_output: bool = typer.Option(False, "
         table = Table("ID", "Run", "Step", "Status", "Current", "Fingerprint", "Prompt", "Calls", "Tokens", "Error")  # fmt: skip
         for r in rows:
             table.add_row(str(r.id), str(r.run_id or "—"), r.step.value, r.status.value, "yes" if r.current else "", r.fingerprint[:12], r.prompt_version or "—", str(r.llm_calls), f"{r.tokens:,}", escape((r.error or "")[:50]))  # fmt: skip
+        console.print(table)
+
+    _run_db(work)
+
+
+# ── article validation (Phase 6: prepares articles, never publishes) ─────────
+
+
+def _print_quality_run(result: ArticleRequestResult, outcome: QualityOutcome, json_output: bool) -> None:  # fmt: skip
+    if json_output:
+        payload = {
+            "article_id": outcome.article_id,
+            "run_id": outcome.run_id,
+            "run_status": outcome.run_status.value,
+            "article_status": outcome.status.value,
+            "recommended_version_id": outcome.recommended_version_id,
+            "quality_score": outcome.quality_score,
+            "revisions": outcome.revisions,
+            "steps": outcome.steps,
+            "usage": outcome.usage.as_dict() if outcome.usage else None,
+            "error": outcome.error,
+        }
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return
+    color = {"succeeded": "green", "partial": "yellow"}.get(outcome.run_status.value, "red")
+    state = {"ready": "green", "needs_review": "yellow"}.get(outcome.status.value, "red")
+    console.print(f"article {outcome.article_id} run {outcome.run_id} [{color}]{outcome.run_status.value}[/{color}] → article [{state}]{outcome.status.value}[/{state}]")  # fmt: skip
+    if outcome.quality_score is not None:
+        console.print(f"quality score {outcome.quality_score:.1f}/100 · recommended version {outcome.recommended_version_id} · {outcome.revisions} revision(s) in total")  # fmt: skip
+    ran = sum(1 for s in outcome.steps if s.endswith(":ran"))
+    reused = sum(1 for s in outcome.steps if s.endswith(":reused"))
+    console.print(f"steps: {ran} ran, {reused} reused" + (f" · {', '.join(s for s in outcome.steps if s.endswith(':failed'))}" if any(s.endswith(":failed") for s in outcome.steps) else ""))  # fmt: skip
+    if outcome.usage is not None and outcome.usage.calls:
+        console.print(f"gemini: {outcome.usage.calls} call(s), {outcome.usage.total_tokens:,} tokens")  # fmt: skip
+    if outcome.error:
+        err.print(f"[yellow]{escape(outcome.error)}[/yellow]")
+
+
+def _run_quality(article_id: int, json_output: bool, *, revise: bool, note: str | None = None) -> None:  # fmt: skip
+    settings = get_settings()
+
+    async def work(engine: AsyncEngine, sessions: SessionFactory) -> tuple[ArticleRequestResult, QualityOutcome]:  # fmt: skip
+        llm = LazyLLM(settings)
+        try:
+            service = QualityService(engine, sessions, llm, settings)
+            if revise:
+                return await service.revise_now(article_id, trigger=RunTrigger.CLI, note=note)
+            return await service.validate_now(article_id, trigger=RunTrigger.CLI)
+        finally:
+            await llm.aclose()
+
+    try:
+        result, outcome = _run_db(work)
+    except _article_errors() as exc:
+        raise _llm_error(exc) from exc
+    _print_quality_run(result, outcome, json_output)
+    if not json_output:
+        console.print(f"[dim]details: `articles quality {article_id}` · `articles fact-check {article_id}` · `articles seo {article_id}`[/dim]")  # fmt: skip
+    if outcome.run_status == RunStatus.FAILED:
+        raise typer.Exit(code=1)
+
+
+@articles_cli.command("validate")
+def validate_article(article_id: int, json_output: bool = typer.Option(False, "--json")) -> None:
+    """Validate a completed article (runs now): fact-check, originality, SEO, metrics, the
+    Gemini judge, then at most QUALITY_MAX_REVISIONS revisions while a gate fails. Ends
+    ready or needs_review. Unchanged steps are reused; a failed validation resumes where it
+    stopped. Nothing is published."""
+    _run_quality(article_id, json_output, revise=False)
+
+
+@articles_cli.command("revise")
+def revise_article(
+    article_id: int,
+    note: str | None = typer.Option(None, help="What to change, besides the open issues."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """One more revision of the recommended version, validated like the others (it's
+    recommended only if it scores better)."""
+    _run_quality(article_id, json_output, revise=True, note=note)
+
+
+def _version_error(exc: Exception) -> typer.Exit:
+    err.print(f"[red]{escape(str(exc))}[/red]")
+    return typer.Exit(code=2)
+
+
+@articles_cli.command("quality")
+def article_quality_cmd(
+    article_id: int,
+    version: int | None = typer.Option(None, help="A version id (default: the recommended one)."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """The quality score and its breakdown, the gates, the issues, the metrics, the judge's
+    rubric and every validated version's score."""
+    settings = get_settings()
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            try:
+                view = await quality_queries.quality_overview(session, article_id, token_budget=settings.quality_max_tokens, version_id=version)  # fmt: skip
+            except quality_queries.UnknownVersionError as exc:
+                raise _version_error(exc) from exc
+        if view is None:
+            err.print(f"[red]Unknown article {article_id}[/red]")
+            raise typer.Exit(code=2)
+        if json_output:
+            sys.stdout.write(view.model_dump_json(indent=2) + "\n")
+            return
+        console.print(f"[bold]article {view.article_id}[/bold] · {view.status}" + (f" ({view.current_step})" if view.current_step else "") + f" · quality tokens {view.quality_tokens_used:,} of {view.token_budget:,}")  # fmt: skip
+        report = view.report
+        if report is None:
+            console.print(f"Not validated yet: `articles validate {article_id}`.")
+            return
+        verdict = "[green]passes every gate[/green]" if report.passed else "[yellow]needs review[/yellow]"  # fmt: skip
+        console.print(f"version {report.version_id} ({report.version_kind} v{report.version_number}) · score [bold]{report.overall_score:.1f}[/bold]/100 · {verdict}")  # fmt: skip
+        table = Table("Component", "Weight", "Value", "Points", "Detail")
+        for c in report.breakdown:
+            table.add_row(c.dimension, f"{c.max_points:g}", f"{c.value:.2f}", f"{c.points:.1f}", escape(c.detail))  # fmt: skip
+        console.print(table)
+        gates = Table("Gate", "Passed", "Detail")
+        for g in report.gates:
+            gates.add_row(g.name, "[green]yes[/green]" if g.passed else "[red]no[/red]", escape(g.detail))  # fmt: skip
+        console.print(gates)
+        if report.issues:
+            console.print(f"[bold]Issues[/bold] ({len(report.issues)}, most serious first)")
+            for i in report.issues[:15]:
+                console.print(f"  {i.id} p{i.priority} {i.kind}: {escape(i.detail[:160])}")
+        if view.judge is not None:
+            console.print("[bold]Judge[/bold] " + " · ".join(f"{d.dimension} {d.score}/5" for d in view.judge.dimensions))  # fmt: skip
+            console.print(f"  {escape(view.judge.summary)}")
+        if view.metrics is not None:
+            r = view.metrics.readability
+            console.print(f"[bold]Metrics[/bold] words {view.metrics.length.get('words')} · Flesch {r.get('flesch_reading_ease')} (grade {r.get('flesch_kincaid_grade')}) · citation coverage {view.metrics.citations.get('citation_coverage', 0):.0%} · max similarity {view.metrics.originality.get('max_similarity', 0):.0%}")  # fmt: skip
+        if len(view.versions) > 1:
+            console.print("versions: " + " · ".join(f"{v.version_id} ({v.kind} v{v.number}) {v.score:.1f}{' ✓' if v.passed else ''}{' ← recommended' if v.recommended else ''}" for v in view.versions))  # fmt: skip
+
+    _run_db(work)
+
+
+@articles_cli.command("fact-check")
+def article_fact_check_cmd(
+    article_id: int,
+    version: int | None = typer.Option(None, help="A version id (default: the recommended one)."),
+    verdict: Annotated[
+        list[ClaimVerdict] | None, typer.Option("--verdict", help="Repeatable.")
+    ] = None,
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Every claim check: claim, source, verdict, explanation, evidence."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            try:
+                view = await quality_queries.fact_check(session, article_id, version_id=version, verdicts=set(verdict) if verdict else None)  # fmt: skip
+            except quality_queries.UnknownVersionError as exc:
+                raise _version_error(exc) from exc
+        if view is None:
+            err.print(f"[red]No fact-check for article {article_id} (yet)[/red]")
+            raise typer.Exit(code=2)
+        if json_output:
+            sys.stdout.write(view.model_dump_json(indent=2) + "\n")
+            return
+        m = view.metrics
+        console.print(f"version {view.version_id} · {m.cited_claims} cited claim(s): {m.supported} supported, {m.partial} partial, {m.unsupported} unsupported, {m.contradicted} contradicted · citation coverage {m.citation_coverage:.0%} · uncited needing a source: {m.uncited_factual} · re-read {m.rereads} page(s)")  # fmt: skip
+        if not m.integrity_ok:
+            err.print("[yellow]citation integrity: " + escape("; ".join(m.integrity_problems)) + "[/yellow]")  # fmt: skip
+        table = Table("Kind", "Sec.", "Source", "Verdict", "Conf.", "Claim", "Explanation")
+        colors = {"supported": "green", "partial": "yellow", "not_required": "dim"}
+        for c in view.checks:
+            color = colors.get(c.verdict.value, "red")
+            flags = (" ↻" if c.reread else "") + (" (reused)" if c.reused else "")
+            table.add_row(c.kind.value, str(c.section + 1), c.source_label or "—", f"[{color}]{c.verdict.value}[/{color}]{flags}", f"{c.confidence:.2f}" if c.confidence is not None else "—", escape(c.claim[:90]), escape(c.explanation[:90]))  # fmt: skip
+        console.print(table)
+        for note in view.notes:
+            console.print(f"[dim]{escape(note)}[/dim]")
+
+    _run_db(work)
+
+
+@articles_cli.command("originality")
+def article_originality_cmd(
+    article_id: int,
+    version: int | None = typer.Option(None, help="A version id (default: the recommended one)."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """The similarity signal against stored competitor and company pages (not a plagiarism
+    verdict)."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            try:
+                view = await quality_queries.originality(session, article_id, version_id=version)
+            except quality_queries.UnknownVersionError as exc:
+                raise _version_error(exc) from exc
+        if view is None:
+            err.print(f"[red]No originality check for article {article_id} (yet)[/red]")
+            raise typer.Exit(code=2)
+        if json_output:
+            sys.stdout.write(view.model_dump_json(indent=2) + "\n")
+            return
+        r = view.report
+        console.print(f"version {view.version_id} · {r.passages_checked} passage(s) against {r.documents} page(s) ({r.competitor_documents} competitor, {r.company_documents} company) · {r.ngram_size}-word shingles · {r.common_ngrams_ignored} common n-gram(s) ignored")  # fmt: skip
+        console.print(f"score {r.score:.2f} · max similarity {r.max_similarity:.0%} · average {r.avg_similarity:.0%} · overall overlap {r.overall_overlap:.0%}" + (" · [red]severe[/red]" if r.severe else ""))  # fmt: skip
+        for f in r.flagged:
+            console.print(f"  [yellow]{f.similarity:.0%}[/yellow] section {f.section + 1} ↔ {f.source_label} {f.url}")  # fmt: skip
+            console.print(
+                f"    overlap ({f.overlap_words} words): “{escape(f.overlap_text[:200])}”"
+            )
+        if not r.flagged:
+            console.print("No passage is similar enough to flag.")
+
+    _run_db(work)
+
+
+@articles_cli.command("seo")
+def article_seo_cmd(
+    article_id: int,
+    version: int | None = typer.Option(None, help="A version id (default: the recommended one)."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """The SEO package and its checks."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            try:
+                view = await quality_queries.seo(session, article_id, version_id=version)
+            except quality_queries.UnknownVersionError as exc:
+                raise _version_error(exc) from exc
+        if view is None:
+            err.print(f"[red]No SEO package for article {article_id} (yet)[/red]")
+            raise typer.Exit(code=2)
+        if json_output:
+            sys.stdout.write(view.model_dump_json(indent=2) + "\n")
+            return
+        p = view.report.package
+        console.print(f"[bold]primary keyword:[/bold] {escape(p.primary_keyword)} — {escape(p.primary_keyword_reason)}")  # fmt: skip
+        console.print(f"  evidence: {escape('; '.join(p.primary_keyword_evidence))}")
+        console.print(f"[bold]secondary:[/bold] {escape(', '.join(p.secondary_keywords) or '—')}")
+        console.print(f"[bold]meta title[/bold] ({len(p.meta_title)}): {escape(p.meta_title)}")
+        console.print(f"[bold]meta description[/bold] ({len(p.meta_description)}): {escape(p.meta_description)}")  # fmt: skip
+        console.print(f"[bold]slug:[/bold] {p.slug} · [bold]category:[/bold] {escape(p.category or '—')} · [bold]tags:[/bold] {escape(', '.join(p.tags) or '—')}")  # fmt: skip
+        console.print(f"[bold]headings:[/bold] {p.headings.h1_count} H1, {len(p.headings.h2)} H2, {len(p.headings.h3)} H3" + (f" · {escape('; '.join(p.headings.issues))}" if p.headings.issues else ""))  # fmt: skip
+        for label, links in (("internal links", p.internal_links), ("external links", p.external_links)):  # fmt: skip
+            console.print(f"[bold]{label}:[/bold] {len(links)}")
+            for link in links:
+                console.print(f"  “{escape(link.anchor_text)}” → {link.url}")
+        console.print(f"[bold]FAQ:[/bold] {len(p.faq)}")
+        for item in p.faq:
+            console.print(f"  Q: {escape(item.question)}")
+        if p.image is not None:
+            console.print(f"[bold]image idea:[/bold] {escape(p.image.concept)} (alt: {escape(p.image.alt_text)})")  # fmt: skip
+        table = Table("Check", "Passed", "Detail")
+        for c in view.report.checks:
+            table.add_row(c.name, "[green]yes[/green]" if c.passed else "[red]no[/red]", escape(c.detail))  # fmt: skip
+        console.print(table)
+        for note in view.report.notes:
+            console.print(f"[dim]{escape(note)}[/dim]")
+
+    _run_db(work)
+
+
+@articles_cli.command("revisions")
+def article_revisions_cmd(article_id: int, json_output: bool = typer.Option(False, "--json")) -> None:  # fmt: skip
+    """The edited version and every revision, with parent, reason, issues addressed and score."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            rows = await quality_queries.revisions(session, article_id)
+        if rows is None:
+            err.print(f"[red]Unknown article {article_id}[/red]")
+            raise typer.Exit(code=2)
+        if json_output:
+            sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
+            return
+        table = Table("ID", "Kind", "No.", "Parent", "Score", "Passed", "Recommended", "Tokens", "Issues addressed", "Reason")  # fmt: skip
+        for r in rows:
+            table.add_row(str(r.version_id), r.kind, str(r.number), str(r.parent_version_id or "—"), f"{r.score:.1f}" if r.score is not None else "—", ("yes" if r.passed else "no") if r.passed is not None else "—", "yes" if r.recommended else "", f"{r.tokens:,}", ", ".join(r.issues_addressed) or "—", escape((r.reason or "")[:60]))  # fmt: skip
         console.print(table)
 
     _run_db(work)

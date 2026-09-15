@@ -109,3 +109,34 @@ def test_article_settings_defaults_and_consistency() -> None:
     for bad in ({"article_min_words": 2_000, "article_target_words": 1_000}, {"article_research_max_tokens": 500_000}, {"article_research_min_sources": 12}):  # fmt: skip
         with pytest.raises(ValueError, match="ARTICLE_"):
             Settings(_env_file=None, **bad)  # type: ignore[arg-type]
+
+
+def test_quality_settings_defaults_and_consistency() -> None:
+    from app.config import QUALITY_COMPONENTS, Settings
+
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.quality_model == settings.gemini_model
+    assert Settings(_env_file=None, gemini_quality_model="gemini-q").quality_model == "gemini-q"  # type: ignore[call-arg]
+    assert settings.quality_max_revisions == 2
+    assert settings.quality_min_score == 70
+    assert set(settings.quality_weights) == set(QUALITY_COMPONENTS)
+    assert sum(settings.quality_weights.values()) == 100
+    assert (settings.originality_ngram_size, settings.originality_flag_threshold, settings.originality_max_overlap) == (8, 0.25, 0.5)  # fmt: skip
+    for bad, name in (
+        ({"originality_flag_threshold": 0.6, "originality_max_overlap": 0.5}, "ORIGINALITY_"),
+        ({"seo_description_min_chars": 200}, "SEO_"),
+        ({"quality_weights": {"vibes": 10}}, "QUALITY_WEIGHTS"),
+        ({"quality_weights": {"seo": -1, "fact_support": 5}}, "QUALITY_WEIGHTS"),
+        ({"quality_weights": {"seo": 0}}, "QUALITY_WEIGHTS"),
+    ):
+        with pytest.raises(ValueError, match=name):
+            Settings(_env_file=None, **bad)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="quality_max_revisions"):
+        Settings(_env_file=None, quality_max_revisions=9)  # type: ignore[call-arg]
+
+
+def test_quality_weights_can_come_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.config import Settings
+
+    monkeypatch.setenv("QUALITY_WEIGHTS", '{"fact_support": 50, "gemini_judgment": 50}')
+    assert Settings(_env_file=None).quality_weights == {"fact_support": 50, "gemini_judgment": 50}  # type: ignore[call-arg]

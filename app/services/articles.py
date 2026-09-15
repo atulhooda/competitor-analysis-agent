@@ -22,8 +22,6 @@ budget; research has its own cap (ARTICLE_RESEARCH_MAX_TOKENS).
 """
 
 import asyncio
-import hashlib
-import json
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -31,7 +29,7 @@ from datetime import datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import func, select, true, update
+from sqlalchemy import func, select, true
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
@@ -54,8 +52,10 @@ from app.db.session import SessionFactory
 from app.domain.articles import (
     ENDED_STATUSES,
     IN_PROGRESS_STATUSES,
+    PHASE6_STEPS,
     STATUS_FOR_STEP,
     STEP_ORDER,
+    VALIDATABLE_STATUSES,
     ArticleBrief,
     ArticleContent,
     ArticleOutline,
@@ -87,6 +87,8 @@ from app.services.article_writing import (
     write_draft,
     write_outline,
 )
+from app.services.checkpoints import digest as _digest
+from app.services.checkpoints import fail_running_steps, find_checkpoint, new_run
 from app.services.llm_usage import BudgetedLLM, RunUsage
 from app.services.opportunities import OpportunityNotFoundError
 from app.services.research import ResearchConfig, ResearchFailedError, research
@@ -173,10 +175,6 @@ class _Stopped(Exception):
         super().__init__(message)
         self.step = step
         self.cancelled = cancelled
-
-
-def _digest(data: Any) -> str:
-    return hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def prompt_version(step: ArticleStep) -> str:
@@ -309,7 +307,7 @@ class ArticleService:
             session.add(article)
             await session.flush()
             session.add(ArticleStepRun(article_id=article.id, step=ArticleStep.BRIEF.value, status=StepStatus.SUCCEEDED.value, fingerprint=self._brief_fingerprint(inputs.assessment_id, inputs.company_profile_id), prompt_version=article_brief.BRIEF_VERSION, output=output, output_hash=_digest(output), started_at=now, finished_at=now))  # fmt: skip
-            run = self._new_run(article.id, trigger, now, {"action": "regenerate" if regenerate else "generate", "opportunity_id": opportunity_id})  # fmt: skip
+            run = new_run(RUN_KIND, article.id, trigger, now, {"action": "regenerate" if regenerate else "generate", "opportunity_id": opportunity_id})  # fmt: skip
             session.add(run)
             await session.flush()
             log.info("article.created", article_id=article.id, opportunity_id=opportunity_id, attempt=article.attempt, run_id=run.id)  # fmt: skip
@@ -336,14 +334,16 @@ class ArticleService:
                 # Nothing is running it, so the process that was generating it stopped.
                 await self._mark_interrupted(session, article, now)
             pending = await self._pending_steps(session, article)
-            if not pending and article.status == ArticleStatus.COMPLETED.value:
+            if not pending and ArticleStatus(article.status) in VALIDATABLE_STATUSES:
                 return ArticleRequestResult(article_id, None, False, "nothing to do: every step is up to date")  # fmt: skip
+            if not pending and article.failed_step in {s.value for s in PHASE6_STEPS}:
+                return ArticleRequestResult(article_id, None, False, f"the draft is complete; validation failed at {article.failed_step}: run `articles validate {article_id}`")  # fmt: skip
             if pending and article.tokens_used >= self._settings.article_max_tokens:
                 raise ArticleBudgetExhaustedError(f"Article {article_id} has used {article.tokens_used:,} tokens of ARTICLE_MAX_TOKENS={self._settings.article_max_tokens:,}: raise it to resume")  # fmt: skip
             article.status = ArticleStatus.QUEUED.value
             article.current_step = (pending[0] if pending else ArticleStep.EDIT).value
             article.error = None
-            run = self._new_run(article_id, trigger, now, {"action": "resume", "steps": [s.value for s in pending]})  # fmt: skip
+            run = new_run(RUN_KIND, article_id, trigger, now, {"action": "resume", "steps": [s.value for s in pending]})  # fmt: skip
             session.add(run)
             await session.flush()
             return ArticleRequestResult(article_id, run.id, True)
@@ -392,7 +392,7 @@ class ArticleService:
                 async with self._sessions() as session, session.begin():
                     now = self._now()
                     await fail_abandoned_runs(session, kind=RUN_KIND, competitor_id=None, now=now, keep=run_id, article_id=article_id)  # fmt: skip
-                    await self._fail_running_steps(session, article_id, now)
+                    await fail_running_steps(session, article_id, now)
                     run = await session.get_one(Run, run_id)
                     run.status = RunStatus.RUNNING.value
                     run.started_at = now
@@ -565,6 +565,9 @@ class ArticleService:
                 else:
                     chain.final_version_id = version.id
                     article.final_version_id, article.word_count = version.id, words
+                    # A new edited version must be validated again (Phase 6).
+                    article.recommended_version_id = article.quality_report_id = None
+                    article.quality_score = article.validated_at = None
 
     @staticmethod
     async def _add_version(session: AsyncSession, article_id: int, step_id: int, kind: VersionKind, title: str, content: dict[str, Any], words: int | None, issues: list[ContentIssue], changes: list[str], model: str, now: datetime) -> ArticleVersion:  # fmt: skip
@@ -633,31 +636,15 @@ class ArticleService:
 
     # ── checkpoints ──────────────────────────────────────────────────────────
 
-    @staticmethod
-    async def _match(session: AsyncSession, article_id: int, step: ArticleStep, fingerprint: str) -> ArticleStepRun | None:  # fmt: skip
-        """The latest succeeded execution of ``step`` with these exact inputs."""
-        row: ArticleStepRun | None = await session.scalar(
-            select(ArticleStepRun)
-            .where(
-                ArticleStepRun.article_id == article_id,
-                ArticleStepRun.step == step.value,
-                ArticleStepRun.fingerprint == fingerprint,
-                ArticleStepRun.status == StepStatus.SUCCEEDED.value,
-            )
-            .order_by(ArticleStepRun.id.desc())
-            .limit(1)
-        )
-        return row
-
     async def _load_brief(self, session: AsyncSession, article: Article) -> _Chain | None:
-        row = await self._match(session, article.id, ArticleStep.BRIEF, self._brief_fingerprint(article.assessment_id, article.company_profile_id))  # fmt: skip
+        row = await find_checkpoint(session, article.id, ArticleStep.BRIEF, self._brief_fingerprint(article.assessment_id, article.company_profile_id))  # fmt: skip
         if row is None or row.output is None:
             return None
         return _Chain(article_id=article.id, brief=ArticleBrief.model_validate(row.output), brief_hash=row.output_hash or _digest(row.output))  # fmt: skip
 
     async def _load_step(self, session: AsyncSession, step: ArticleStep, fingerprint: str, chain: _Chain) -> bool:  # fmt: skip
         """Load the stored output matching ``fingerprint`` into ``chain``; False if none."""
-        row = await self._match(session, chain.article_id, step, fingerprint)
+        row = await find_checkpoint(session, chain.article_id, step, fingerprint)
         if row is None or row.output is None:
             return False
         if step is ArticleStep.RESEARCH:
@@ -699,25 +686,10 @@ class ArticleService:
         return []
 
     async def _mark_interrupted(self, session: AsyncSession, article: Article, now: datetime) -> None:  # fmt: skip
-        await self._fail_running_steps(session, article.id, now)
+        await fail_running_steps(session, article.id, now)
         article.status = ArticleStatus.FAILED.value
         article.failed_step = article.current_step
         article.error = "interrupted: the process generating it stopped"
-
-    @staticmethod
-    async def _fail_running_steps(session: AsyncSession, article_id: int, now: datetime) -> None:
-        await session.execute(
-            update(ArticleStepRun)
-            .where(
-                ArticleStepRun.article_id == article_id,
-                ArticleStepRun.status == StepStatus.RUNNING.value,
-            )
-            .values(
-                status=StepStatus.FAILED.value,
-                error="interrupted: the process running this step stopped",
-                finished_at=now,
-            )
-        )
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -736,10 +708,6 @@ class ArticleService:
         base = slugify(title)
         query = select(Article.slug).where(Article.slug.like(f"{base}%"), Article.id != exclude_id if exclude_id else true())  # fmt: skip
         return unique_slug(base, set(await session.scalars(query)))
-
-    @staticmethod
-    def _new_run(article_id: int, trigger: RunTrigger, now: datetime, params: dict[str, Any]) -> Run:  # fmt: skip
-        return Run(kind=RUN_KIND, trigger=trigger.value, status=RunStatus.QUEUED.value, competitor_id=None, article_id=article_id, params={"article_id": article_id, **params}, created_at=now)  # fmt: skip
 
 
 __all__ = [

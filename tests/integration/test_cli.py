@@ -339,3 +339,74 @@ def test_article_commands(configured: Path, monkeypatch: pytest.MonkeyPatch, tmp
     assert "cancelled" in runner.invoke(cli, ["articles"]).output
     assert runner.invoke(cli, ["articles", "show", "999999"]).exit_code == 2
     assert "article" in runner.invoke(cli, ["runs"]).output
+
+
+# ── Phase 6 ──────────────────────────────────────────────────────────────────
+
+
+def test_quality_commands(configured: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:  # fmt: skip
+    import yaml
+
+    from app.llm import LazyLLM
+    from app.services.articles import ArticleService
+    from app.services.quality import QualityService
+    from tests.fakellm import FakeLLM
+    from tests.pipeline import ARTICLE_COMPANY
+
+    fake = FakeLLM()
+    monkeypatch.setattr("app.cli.LazyLLM", functools.partial(LazyLLM, provider=fake))
+    monkeypatch.setattr("app.cli.ArticleService", functools.partial(ArticleService, resolver=public_resolver))  # fmt: skip
+    monkeypatch.setattr("app.cli.QualityService", functools.partial(QualityService, resolver=public_resolver))  # fmt: skip
+    _scan_acme()
+    assert runner.invoke(cli, ["analyze", "acme", "--no-profile"]).exit_code == 0
+    company = tmp_path / "company.yaml"
+    company.write_text(yaml.safe_dump({"company": ARTICLE_COMPANY}), encoding="utf-8")
+    assert runner.invoke(cli, ["company", "import", "--file", str(company)]).exit_code == 0
+    assert runner.invoke(cli, ["opportunities", "generate"]).exit_code == 0
+    payload = json.loads(runner.invoke(cli, ["opportunities", "list", "--json"]).stdout)
+    opportunity = str(next(o["id"] for o in payload if o["topic_label"].casefold() == "ai agents"))  # fmt: skip
+    assert runner.invoke(cli, ["opportunities", "approve", opportunity]).exit_code == 0
+    assert runner.invoke(cli, ["articles", "generate", opportunity]).exit_code == 0
+    article = str(json.loads(runner.invoke(cli, ["articles", "list", "--json"]).stdout)[0]["id"])
+    assert "not validated yet" in runner.invoke(cli, ["articles", "show", article, "--no-content"]).output  # fmt: skip
+    fake.verdicts = {"Designing the human handoff is where": "contradicted"}
+
+    validated = runner.invoke(cli, ["articles", "validate", article])
+
+    assert validated.exit_code == 0, validated.output
+    assert "→ article ready" in validated.output
+    assert "1 revision(s) in total" in validated.output
+    quality = runner.invoke(cli, ["articles", "quality", article])
+    assert quality.exit_code == 0, quality.output
+    for text in ("passes every gate", "gemini_judgment", "minimum_score", "Judge", "Flesch", "← recommended"):  # fmt: skip
+        assert text in quality.output
+    overview = json.loads(runner.invoke(cli, ["articles", "quality", article, "--json"]).stdout)
+    assert overview["status"] == "ready"
+    final = str(json.loads(runner.invoke(cli, ["articles", "revisions", article, "--json"]).stdout)[0]["version_id"])  # fmt: skip
+    earlier = runner.invoke(cli, ["articles", "quality", article, "--version", final])
+    assert "needs review" in earlier.output
+    assert "contradicted_claim" in earlier.output
+    checks = runner.invoke(cli, ["articles", "fact-check", article, "--version", final, "--verdict", "contradicted"])  # fmt: skip
+    assert checks.exit_code == 0, checks.output
+    assert "1 contradicted" in checks.output
+    assert "Designing the human handoff" in checks.output
+    assert "No passage is similar enough" in runner.invoke(cli, ["articles", "originality", article]).output  # fmt: skip
+    seo = runner.invoke(cli, ["articles", "seo", article])
+    assert seo.exit_code == 0, seo.output
+    for text in ("primary keyword:", "meta title", "slug: ai-agents", "FAQ:", "image idea:", "keyword_in_h1"):  # fmt: skip
+        assert text in seo.output
+    revisions = runner.invoke(cli, ["articles", "revisions", article])
+    assert "contradicted_claim" in revisions.output
+    revised = runner.invoke(cli, ["articles", "revise", article, "--note", "Add a short example"])
+    assert revised.exit_code == 0, revised.output
+    assert len(json.loads(runner.invoke(cli, ["articles", "revisions", article, "--json"]).stdout)) == 3  # fmt: skip
+    shown = runner.invoke(cli, ["articles", "show", article])
+    assert "recommended version: revision v1" in shown.output
+    assert "quality:" in shown.output
+    assert "ready" in runner.invoke(cli, ["articles", "list"]).output
+    assert runner.invoke(cli, ["articles", "validate", "999999"]).exit_code == 2
+    assert (
+        runner.invoke(cli, ["articles", "quality", article, "--version", "999999"]).exit_code == 2
+    )
+    assert runner.invoke(cli, ["articles", "seo", "999999"]).exit_code == 2
+    assert "article_quality" in runner.invoke(cli, ["runs"]).output

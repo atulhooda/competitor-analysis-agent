@@ -9,6 +9,7 @@
 - r4 (2026-09-13): Phase 2 approved. Phase 3 (AI competitor intelligence, the first Gemini calls) implemented; see the implementation notes under §12, Phase 3.
 - r5 (2026-09-14): Phase 3 approved. Phase 4 (content opportunities) implemented; see the implementation notes under §12, Phase 4. Relevance is now deterministic rather than an LLM judgment (§8.3); Gemini only interprets the top candidates.
 - r6 (2026-09-14): Phase 4 approved. Phase 5 (article drafts) implemented; see the implementation notes under §12, Phase 5. LangGraph was evaluated and **not** adopted: a plain checkpoint table gives the same resumability for this linear pipeline, without a new dependency (§8.4). Drafts only; nothing is published.
+- r7 (2026-09-14): Phase 5 approved. Phase 6 (article validation: fact-checking, originality, SEO package, metrics, Gemini judge, combined score and gates, bounded revisions) implemented on the Phase 5 checkpoint system; see the implementation notes under §12, Phase 6. LangGraph still isn't needed: the bounded loop is a few lines over the same checkpoints. Phase 6 validates and prepares articles but does not publish them.
 
 The three source repositories were cloned to a temporary scratch directory for analysis only. They are not vendored, submoduled, or left beside the project.
 
@@ -834,6 +835,50 @@ At every phase: run the tests → run the app → verify against real inputs →
 
 ### Phase 6 — SEO and quality checks
 - SEO packaging (all the blog output fields you listed), fact-check, originality, LLM judge, the bounded revision loop, and the quality report.
+
+**Implemented (2026-09-14). What was built, and where it differs from §7.1 and §8.4:**
+- **Pipeline** (`app/services/quality.py`), on Phase 5's job system: the same per-article advisory lock (one run per article, generation and validation alike), `runs` with kind `article_quality`, and `article_steps` checkpoints (which gained `version_id`).
+  - Per version, six checkpointed steps: **fact_check** → **originality** → **seo** → **metrics** → **judge** → **decision**.
+  - Then the loop: while the best version fails a gate and fewer than `QUALITY_MAX_REVISIONS` automatic revisions were made from the edited version, **revision** of the best version, then full revalidation of the result.
+  - The best version (passing first, then score, then earliest) becomes the recommended version, and the article ends `ready` or `needs_review`, never `completed`. New statuses `validating` and `revising` are shown while it runs.
+  - Only `completed` articles (or `ready` / `needs_review`, to validate again) enter; one failed at a Phase 6 step resumes by validating again.
+  - A new Phase 5 edit clears the validation.
+- **Deterministic vs Gemini.**
+  - **Code:** evidence verification (the quote must be in the stored notes), uncited-claim extraction, claim ratios and citation coverage, originality (8-word BLAKE2b shingles with common-phrase filtering, containment per passage), SEO candidates and link targets, SEO checks, structure/length/Flesch readability metrics, the weighted score, the eight gates, issue order and best-version choice.
+  - **Gemini:** verdicts against the stored notes; re-reads of the source page with URL context, after the SSRF guard; which uncited sentences need a source; the SEO package's choices and wording; the 8-dimension rubric (1-5 with reasons, mapped to 0-1 in code); revisions.
+  - Every prompt is versioned and fences untrusted text.
+- **Fact-check verdict rules.** A verdict that isn't grounded doesn't count. Support needs a verified quote from the stored notes, or a successful URL-context re-read with a quote. What stays unsettled is `unsupported`. Verdicts are cached per (claim hash, source) for the same prompt version and model, and only model-decided verdicts are reused.
+- **Revision loop.**
+  - Revisions are `article_versions` rows of kind `revision`, with the parent, reason, issues addressed, changes, model, prompt version and tokens.
+  - A revision failing the completion checks, or identical to a version already validated, is an attempt with no new version.
+  - The attempt number is in the revision fingerprint, so a retry is a new attempt, while re-running the same validation replays it without calls.
+  - A budget exhausted mid-loop stops revising; the validated versions decide.
+- **Idempotency boundaries.**
+  - Downstream fingerprints include upstream **output** hashes, not prompt versions.
+  - The judge's inputs exclude the SEO metrics, so a new SEO prompt redoes the SEO step, plus the metrics and decision only if the package changed. A new judge prompt redoes only the judge and the decision.
+  - Weights and gate limits redo only the decision, and the decision is per version.
+- **Tables (migration `0005`).**
+  - **`article_claim_checks`:** one row per (claim, cited source) verdict and per uncited factual claim. Holds the evidence and whether it was verified, confidence, re-read flag, claim type and signals, `reused_from_id`, model, prompt version and time. Never overwritten.
+  - **`article_originality_flags`:** flagged passages, with the page (content item), overlap text and similarity.
+  - **`article_quality_reports`:** each version's score, breakdown, gates, pass/fail, issues and policy fingerprint, linked to the five step executions it came from.
+  - **`articles`** gained `recommended_version_id`, `quality_report_id`, `quality_score`, `revision_count`, `quality_tokens_used` and `validated_at`.
+  - **`article_versions`** gained `parent_version_id`, `reason`, `issues_addressed` and `tokens`.
+  - CHECK constraints now cover the Phase 6 statuses, steps, the `revision` kind and five new `llm_calls` purposes.
+  - The downgrade maps Phase 6 states back to `completed` and removes the Phase 6 rows.
+- **Differences from §7.1 / §8.4.**
+  - The SEO package and the quality report are stored as step outputs and report rows rather than columns on `generated_articles`.
+  - `needs_review` is the Phase 6 outcome. The approval states (`awaiting_approval`, `scheduled`, `published`) remain Phase 7.
+  - Originality compares against every stored page of the monitored sites, with common phrasing filtered by document frequency, rather than "related" articles only.
+  - Your own site's pages are included when it's monitored, recognized by the company website's domain.
+- **Budgets.** `QUALITY_MAX_TOKENS` per article, within `ARTICLE_MAX_TOKENS`, `LLM_MAX_TOKENS_PER_RUN` and the daily budget, is checked before every call. Claims are batched (`FACT_CHECK_BATCH_SIZE`), and unusable batches are split. Re-reads are capped per version.
+- **Live verification.**
+  - **Opt-in test** (`pytest -m llm_live tests/live/test_live_quality.py`, fake-written article, real Gemini): `ready` in 8 calls and 21.9k tokens. The edited version failed the unsupported-claims gate; one revision grounded every claim (score 87.8).
+  - **Real run** (dev database, the 1,877-word Phase 5 article with 3 sources and 28 citations): 15 calls and 60.2k tokens.
+    - The edited version scored 80.7 and failed two gates: 4 of 28 cited claims were unsupported (14% > 10%), and 6 uncited factual claims needed sources.
+    - One revision scored 90.8 with every gate passing (29 of 30 claims supported, 3 uncited), and became the recommended version (`ready`).
+    - SEO chose "cookieless tracking" (a competitor subtopic), with 3 external links to the stored sources.
+  - **Idempotency held:** validating again reused all 12 steps with no call.
+- **Scope kept out:** CMS publishing, approval policy, scheduling, social posting (Phases 7–10). Nothing is published.
 
 ### Phase 7 — CMS publishing
 - `CMSPublisher`, `WordPressPublisher` (draft/publish/schedule, taxonomy, slug, SEO meta via mu-plugin), idempotency and reconciliation.

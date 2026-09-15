@@ -9,7 +9,8 @@
 - recommendation: Opportunity, OpportunityAssessment, OpportunityEvidence,
                OpportunityEvent (content opportunities; Phase 4)
 - generation:  Article, ArticleStepRun, ArticleVersion, ArticleSource, ArticleCitation
-               (article drafts; Phase 5; never published)
+               (article drafts; Phase 5), ArticleClaimCheck, ArticleOriginalityFlag,
+               ArticleQualityReport (validation; Phase 6). Never published
 - ops:         Run, RunEvent, LLMCall (what ran, when, what happened, what it cost)
 
 LLM output lives in the analysis layer, in assessments' ``interpretation`` and in the
@@ -29,6 +30,9 @@ from app.db.models.analysis import (
 from app.db.models.article import (
     Article,
     ArticleCitation,
+    ArticleClaimCheck,
+    ArticleOriginalityFlag,
+    ArticleQualityReport,
     ArticleSource,
     ArticleStepRun,
     ArticleVersion,
@@ -47,6 +51,9 @@ from app.db.models.recommendation import (
 __all__ = [
     "Article",
     "ArticleCitation",
+    "ArticleClaimCheck",
+    "ArticleOriginalityFlag",
+    "ArticleQualityReport",
     "ArticleSource",
     "ArticleStepRun",
     "ArticleVersion",

@@ -4,8 +4,9 @@ Drafts only: there is no publishing endpoint, and nothing here publishes anythin
 """
 
 import asyncio
+from collections.abc import Callable, Coroutine
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
@@ -31,7 +32,6 @@ from app.services.articles import (
     ArticleNotFoundError,
     ArticleRequestResult,
     ArticleRunActiveError,
-    ArticleService,
     OpportunityNotApprovedError,
 )
 from app.services.opportunities import OpportunityNotFoundError
@@ -64,24 +64,25 @@ async def _summary_or_404(session: SessionDep, article_id: int) -> ArticleSummar
     return article_queries.summary(article)
 
 
-async def _respond(
+async def respond(
     request: Request,
     response: Response,
     session: SessionDep,
-    service: ArticleService,
+    execute: Callable[[int], Coroutine[Any, Any, object]],
     result: ArticleRequestResult,
     *,
     wait: bool,
+    location: str | None = None,
 ) -> ArticleRunResponse:
     """202 with the queued run (running in the background), or 200 when nothing was queued
     or the run finished synchronously (``?wait=true``)."""
-    response.headers["Location"] = f"/api/v1/articles/{result.article_id}"
+    response.headers["Location"] = location or f"/api/v1/articles/{result.article_id}"
     if result.created and result.run_id is not None:
         if wait:
-            await service.execute(result.run_id)
+            await execute(result.run_id)
             response.status_code = status.HTTP_200_OK
         else:
-            task: asyncio.Task[object] = asyncio.create_task(service.execute(result.run_id))
+            task: asyncio.Task[object] = asyncio.create_task(execute(result.run_id))
             tasks: set[asyncio.Task[object]] = request.app.state.background_tasks
             tasks.add(task)
             task.add_done_callback(tasks.discard)
@@ -120,7 +121,7 @@ async def create_article(
         result = await service.create(body.opportunity_id, trigger=RunTrigger.API, regenerate=body.regenerate)  # fmt: skip
     except _ERRORS as exc:
         raise _http_error(exc) from exc
-    return await _respond(request, response, session, service, result, wait=wait)
+    return await respond(request, response, session, service.execute, result, wait=wait)
 
 
 @router.post(
@@ -143,7 +144,7 @@ async def resume_article(
         result = await service.resume(article_id, trigger=RunTrigger.API)
     except _ERRORS as exc:
         raise _http_error(exc) from exc
-    return await _respond(request, response, session, service, result, wait=wait)
+    return await respond(request, response, session, service.execute, result, wait=wait)
 
 
 @router.post("/articles/{article_id}/cancel")
@@ -213,8 +214,9 @@ async def get_article(
     include_markdown: bool = False,
 ) -> ArticleDetail:
     """Status, progress, current step, brief, per-step prompt versions and models, runs,
-    token use, the content (edited version, or the draft until then), the outline, content
-    issues, and failure details."""
+    token use, the content (Phase 6's recommended version once validated, else the edited
+    version, or the draft until then), the outline, content issues, the quality score, and
+    failure details."""
     return await _detail_or_404(session, settings.article_max_tokens, article_id, include_markdown=include_markdown)  # fmt: skip
 
 
@@ -234,7 +236,8 @@ async def article_sources(
 
 @router.get("/articles/{article_id}/versions")
 async def article_versions(session: SessionDep, article_id: int) -> list[VersionSummary]:
-    """Every outline, draft and edited version, oldest first; none is ever overwritten."""
+    """Every outline, draft, edited and revised version, oldest first; none is ever
+    overwritten."""
     rows = await article_queries.list_versions(session, article_id)
     if rows is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown article {article_id}")

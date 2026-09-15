@@ -111,6 +111,16 @@ class ArticleCancelRequest(BaseModel):
     note: str | None = Field(default=None, max_length=2_000)
 
 
+class ArticleReviseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str | None = Field(
+        default=None,
+        max_length=2_000,
+        description="What to change, on top of the open quality issues (treated as an editor's request)",
+    )
+
+
 class ArticleRunResponse(BaseModel):
     article: ArticleSummary
     run: RunView | None = Field(description="The queued (or finished, with ?wait=true) run")

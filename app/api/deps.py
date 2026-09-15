@@ -14,6 +14,7 @@ from app.services.articles import ArticleService
 from app.services.intelligence import IntelligenceService
 from app.services.landscape import LandscapeService
 from app.services.opportunities import OpportunityService
+from app.services.quality import QualityService
 from app.services.scans import ScanService
 from app.services.topic_admin import TopicAdminService
 
@@ -105,3 +106,11 @@ def get_article_service(request: Request) -> ArticleService:
 
 
 ArticleServiceDep = Annotated[ArticleService, Depends(get_article_service)]
+
+
+def get_quality_service(request: Request) -> QualityService:
+    service: QualityService = request.app.state.quality
+    return service
+
+
+QualityServiceDep = Annotated[QualityService, Depends(get_quality_service)]

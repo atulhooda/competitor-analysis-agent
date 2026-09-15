@@ -18,7 +18,7 @@ from app.db.session import create_engine as create_async_db_engine
 from app.llm import get_llm
 from tests.fakesite import FakeClock, make_settings, public_resolver
 
-_SETTINGS_PREFIXES = ("CRAWLER_", "LLM_", "GEMINI_", "GOOGLE_", "DATABASE_", "ANALYSIS_", "SYNTHESIS_", "ARTICLE_", "WRITING_", "RESEARCH_")  # fmt: skip
+_SETTINGS_PREFIXES = ("CRAWLER_", "LLM_", "GEMINI_", "GOOGLE_", "DATABASE_", "ANALYSIS_", "SYNTHESIS_", "ARTICLE_", "WRITING_", "RESEARCH_", "QUALITY_", "FACT_CHECK_", "ORIGINALITY_", "SEO_")  # fmt: skip
 _SETTINGS_NAMES = {
     "API_KEY",
     "APP_ENV",
@@ -40,7 +40,8 @@ _TABLES = (
     "change_events, topics, topic_aliases, content_analyses, content_analysis_topics, "
     "change_summaries, competitor_profiles, landscape_reports, llm_calls, company_profiles, "
     "opportunities, opportunity_assessments, opportunity_evidence, opportunity_events, "
-    "articles, article_steps, article_versions, article_sources, article_citations"
+    "articles, article_steps, article_versions, article_sources, article_citations, "
+    "article_claim_checks, article_originality_flags, article_quality_reports"
 )
 
 

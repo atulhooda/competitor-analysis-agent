@@ -1,4 +1,5 @@
-"""Read queries for article drafts (Phase 5), shared by the API and the CLI."""
+"""Read queries for articles (Phase 5 drafts, with Phase 6 quality fields), shared by the API
+and the CLI."""
 
 from collections.abc import Sequence
 from datetime import datetime
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import (
     Article,
     ArticleCitation,
+    ArticleQualityReport,
     ArticleSource,
     ArticleStepRun,
     ArticleVersion,
@@ -18,6 +20,7 @@ from app.db.models import (
 )
 from app.domain.analysis import ContentFormat, SearchIntent
 from app.domain.articles import (
+    QUALITY_STEPS,
     STEP_ORDER,
     ArticleBrief,
     ArticleContent,
@@ -63,6 +66,10 @@ def summary(article: Article) -> ArticleSummary:
         created_at=article.created_at,
         updated_at=article.updated_at,
         completed_at=article.completed_at,
+        quality_score=article.quality_score,
+        revision_count=article.revision_count,
+        recommended_version_id=article.recommended_version_id,
+        validated_at=article.validated_at,
     )
 
 
@@ -91,14 +98,31 @@ async def list_articles(
 
 
 def _current_ids(article: Article) -> set[int]:
-    return {i for i in (article.outline_version_id, article.draft_version_id, article.final_version_id) if i}  # fmt: skip
+    return {i for i in (article.outline_version_id, article.draft_version_id, article.final_version_id, article.recommended_version_id) if i}  # fmt: skip
 
 
-def _step_view(row: ArticleStepRun, article: Article, current_brief: int | None) -> ArticleStepView:
-    version_id = (row.output or {}).get("version_id") if row.step != ArticleStep.RESEARCH.value else None  # fmt: skip
+def content_version_id(article: Article) -> int | None:
+    """The version an article's content comes from: Phase 6's recommended version once it
+    has been validated, else the edited version (or the draft until then)."""
+    return article.recommended_version_id or article.final_version_id or article.draft_version_id
+
+
+async def _quality_step_ids(session: AsyncSession, article: Article) -> set[int]:
+    """The checkpoint steps behind the recommended version's quality report."""
+    if article.quality_report_id is None:
+        return set()
+    report = await session.get(ArticleQualityReport, article.quality_report_id)
+    if report is None:
+        return set()
+    return {i for i in (report.fact_check_step_id, report.originality_step_id, report.seo_step_id, report.metrics_step_id, report.judge_step_id, report.decision_step_id) if i}  # fmt: skip
+
+
+def _step_view(row: ArticleStepRun, article: Article, current_brief: int | None, quality_steps: set[int]) -> ArticleStepView:  # fmt: skip
+    version_id = (row.output or {}).get("version_id") if row.step in (ArticleStep.OUTLINE.value, ArticleStep.DRAFT.value, ArticleStep.EDIT.value, ArticleStep.REVISION.value) else None  # fmt: skip
     current = (
         row.id == article.research_step_id
         or row.id == current_brief
+        or row.id in quality_steps
         or (version_id is not None and version_id in _current_ids(article))
     )
     return ArticleStepView(
@@ -138,6 +162,7 @@ def _version_summary(v: ArticleVersion, current: set[int]) -> VersionSummary:
         kind=VersionKind(v.kind),
         number=v.number,
         step_id=v.step_id,
+        parent_version_id=v.parent_version_id,
         title=v.title,
         word_count=v.word_count,
         issues=len(v.issues),
@@ -172,10 +197,11 @@ async def get_article(session: AsyncSession, article_id: int, *, token_budget: i
     latest: dict[str, ArticleStepRun] = {}
     for step_row in step_rows:
         latest[step_row.step] = step_row
-    steps = [_step_view(latest[s.value], article, current_brief) for s in STEP_ORDER if s.value in latest]  # fmt: skip
+    quality_steps = await _quality_step_ids(session, article)
+    steps = [_step_view(latest[s.value], article, current_brief, quality_steps) for s in (*STEP_ORDER, *QUALITY_STEPS, ArticleStep.REVISION) if s.value in latest]  # fmt: skip
     runs = await session.scalars(select(Run).where(Run.article_id == article_id).order_by(Run.id))
-    content_version_id = article.final_version_id or article.draft_version_id
-    content_version = await session.get(ArticleVersion, content_version_id) if content_version_id else None  # fmt: skip
+    version_id = content_version_id(article)
+    content_version = await session.get(ArticleVersion, version_id) if version_id else None
     outline_version = await session.get(ArticleVersion, article.outline_version_id) if article.outline_version_id else None  # fmt: skip
     sources = await session.scalar(select(func.count()).select_from(ArticleSource).where(ArticleSource.step_id == article.research_step_id)) if article.research_step_id else 0  # fmt: skip
     done = [ArticleStep.BRIEF] if current_brief else []
@@ -231,7 +257,7 @@ async def get_sources(session: AsyncSession, article_id: int, *, include_all: bo
     query = select(ArticleSource).where(ArticleSource.article_id == article_id)
     if not include_all:
         query = query.where(ArticleSource.step_id == article.research_step_id)
-    content_version = article.final_version_id or article.draft_version_id
+    content_version = content_version_id(article)
     counts: dict[int, int] = {}
     if content_version:
         counts = {sid: n for sid, n in await session.execute(select(ArticleCitation.source_id, func.count()).where(ArticleCitation.version_id == content_version).group_by(ArticleCitation.source_id))}  # fmt: skip
@@ -275,6 +301,8 @@ async def get_version(session: AsyncSession, article_id: int, version_id: int, *
     return VersionDetail(
         **_version_summary(version, _current_ids(article)).model_dump(),
         content=version.content,
+        reason=version.reason,
+        issues_addressed=list(version.issues_addressed or []),
         issue_details=[ContentIssue.model_validate(i) for i in version.issues],
         changes=list(version.changes),
         citations=[c for c, _ in cited],
@@ -287,12 +315,14 @@ async def list_steps(session: AsyncSession, article_id: int) -> list[ArticleStep
     if article is None:
         return None
     current_brief = await _latest_brief_step(session, article_id)
+    quality_steps = await _quality_step_ids(session, article)
     rows = await session.scalars(select(ArticleStepRun).where(ArticleStepRun.article_id == article_id).order_by(ArticleStepRun.id))  # fmt: skip
-    return [_step_view(r, article, current_brief) for r in rows]
+    return [_step_view(r, article, current_brief, quality_steps) for r in rows]
 
 
 __all__ = [
     "MAX_PAGE_SIZE",
+    "content_version_id",
     "get_article",
     "get_sources",
     "get_version",

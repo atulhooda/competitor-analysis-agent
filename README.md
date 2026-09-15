@@ -4,11 +4,13 @@ An AI-powered competitor intelligence and content generation agent. It monitors 
 websites (and later their social channels), keeps a history of what they publish, finds content
 opportunities, and generates and publishes original blog posts.
 
-> **Status: Phase 5 of 10: article drafts.** Scans are deterministic and stored in PostgreSQL;
-> Gemini analyzes what competitors publish (Phase 3); opportunities are scored
-> deterministically (Phase 4). Phase 5 turns an **approved** opportunity into a researched,
-> cited, edited article draft. **Phase 5 generates drafts but does not publish them**:
-> nothing is sent to a CMS, scheduled or posted.
+> **Status: Phase 6 of 10: article validation.** Scans are deterministic and stored in
+> PostgreSQL; Gemini analyzes what competitors publish (Phase 3); opportunities are scored
+> deterministically (Phase 4); an **approved** opportunity becomes a researched, cited, edited
+> draft (Phase 5). Phase 6 fact-checks the draft against its sources, measures its similarity
+> to competitor pages, builds its SEO package, scores it and revises it within a bound, ending
+> `ready` or `needs_review`. **Phase 6 validates and prepares articles but does not publish
+> them**: nothing is sent to a CMS, scheduled or posted.
 > See [MIGRATION_PLAN.md](MIGRATION_PLAN.md) for the architecture and roadmap.
 
 ## What it does today
@@ -132,6 +134,28 @@ approved opportunity → brief (deterministic) → research (Google Search + URL
 
 **Phase 5 generates drafts but does not publish them.** See
 [Article drafts](#article-drafts).
+
+**Article validation (Phase 6).** Checks a completed draft and prepares it for a person to
+publish:
+
+```
+completed article → fact-check → originality → SEO package → metrics → Gemini judge
+  → decision (score + gates) → bounded revisions → ready / needs_review
+```
+
+- **Fact-checked.** Every cited claim is checked against the source it cites. Support needs a
+  quote from the source, and agreement alone never counts. Uncited factual claims are flagged.
+- **Measured.** Similarity to competitor pages, readability, structure, citations and SEO
+  are computed in code. Gemini contributes one scored component, its quality rubric.
+- **Gated.** An article is `ready` only when no mandatory gate fails (contradicted claims,
+  unsupported claims, uncited claims, citation integrity, severe overlap, missing SEO fields,
+  malformed content, minimum score).
+- **Revised within a bound.** Failing articles are revised at most `QUALITY_MAX_REVISIONS`
+  times. Every revision is a new version, validated again, and recommended only if it scores
+  better.
+
+**Phase 6 validates and prepares articles but does not publish them.** See
+[Article validation](#article-validation).
 
 ### Dates: what they mean
 
@@ -287,6 +311,15 @@ uv run python -m app articles steps 1                # the checkpoint log (finge
 uv run python -m app articles resume 1               # continue from the first unfinished step
 uv run python -m app articles cancel 1               # stop for good
 
+# Article validation (needs GEMINI_API_KEY; nothing is published)
+uv run python -m app articles validate 1             # fact-check, originality, SEO, score, revise → ready / needs_review
+uv run python -m app articles quality 1              # score breakdown, gates, issues, metrics, judge, versions (--version ID)
+uv run python -m app articles fact-check 1           # every claim check (--verdict contradicted, --version ID)
+uv run python -m app articles originality 1          # passages similar to stored competitor/company pages
+uv run python -m app articles seo 1                  # keywords + evidence, meta tags, slug, links, FAQ, checks
+uv run python -m app articles revisions 1            # the edited version and every revision, with scores
+uv run python -m app articles revise 1 --note "..."  # one more revision of the recommended version
+
 # Database
 uv run python -m app db upgrade                      # apply migrations
 uv run python -m app db current                      # show the schema revision
@@ -334,12 +367,19 @@ uv run uvicorn app.main:create_app --factory --port 8000
 | GET | `/api/v1/opportunities/{id}/brief` | The deterministic brief an article would get (no Gemini, nothing stored) |
 | POST | `/api/v1/articles` | Write a draft for an approved opportunity: `202` with the article and its queued run (runs in the background), or `?wait=true`. Body: `{"opportunity_id": 12, "regenerate": false}`. `200` with the existing article if the opportunity already has one; `409` if the opportunity isn't approved; `503` without `GEMINI_API_KEY` |
 | GET | `/api/v1/articles` | Newest first. Filters: `status` (repeatable), `opportunity_id`, `created_since`, `created_until`, `limit`/`offset` |
-| GET | `/api/v1/articles/{id}` | Status, progress, current step, brief, steps (prompt versions, models, tokens), runs, content (edited version, or the draft until then), outline, issues, failure details (`?include_markdown=true` for a preview) |
+| GET | `/api/v1/articles/{id}` | Status, progress, current step, brief, steps (prompt versions, models, tokens), runs, content (Phase 6's recommended version once validated, else the edited version, or the draft until then), outline, issues, quality score, failure details (`?include_markdown=true` for a preview) |
 | GET | `/api/v1/articles/{id}/sources` | Retrieved sources with their facts and citation counts (`?all=true` for earlier research runs) |
 | GET | `/api/v1/articles/{id}/versions`, `…/versions/{version_id}` | Every outline, draft and edited version / one version with its claim → source citations and editor notes |
 | GET | `/api/v1/articles/{id}/steps` | The checkpoint log |
 | POST | `/api/v1/articles/{id}/resume` | Continue from the first step needing work (`202`), or `200` when nothing needs redoing. `409` while running, for a cancelled article, or when the article's token budget is spent |
 | POST | `/api/v1/articles/{id}/cancel` | Stop for good; a run in progress stops before its next step |
+| POST | `/api/v1/articles/{id}/validate` | Validate a completed article: `202` with the article (`validating`) and its queued run, or `?wait=true`. Resumes a failed validation. `409` for an article still being written, cancelled, running or out of budget; `503` without `GEMINI_API_KEY` |
+| POST | `/api/v1/articles/{id}/revise` | One more revision of the recommended version, validated like the others. Body: `{"note": "..."}` (optional). `409` before the first validation |
+| GET | `/api/v1/articles/{id}/quality` | Status and current step, score, breakdown, gates, issues, metrics, judge rubric, every validated version's score, revision count, recommended version (`?version_id=` for another version) |
+| GET | `/api/v1/articles/{id}/fact-check` | Every claim check with its verdict, explanation, evidence, confidence, model and prompt version (`?verdict=` repeatable, `?version_id=`) |
+| GET | `/api/v1/articles/{id}/originality` | The similarity report: flagged passages, the page and the overlapping text (`?version_id=`) |
+| GET | `/api/v1/articles/{id}/seo` | The SEO package and its checks (`?version_id=`) |
+| GET | `/api/v1/articles/{id}/revisions` | The edited version and every revision: parent, reason, issues addressed, changes, tokens, score, whether it's recommended |
 
 `/api/v1/*` requires the `X-API-Key` header whenever `API_KEY` is set. Outside development,
 requests are refused until it is. Interactive docs are served at `/docs`.
@@ -725,13 +765,268 @@ fails the step, and a resume retries it.
 - **Sources.** Research depends on what Google Search and URL context return. Paywalled,
   script-rendered or blocked pages can't be read. With fewer usable sources than the minimum,
   research fails rather than writing without evidence.
-- **No fact-checking yet.** Citations show which source a claim relies on, but whether the
-  source supports the claim isn't verified until Phase 6. The number check only sees digits.
+- **Fact-checking is Phase 6.** Citations show which source a claim relies on; whether the
+  source supports it is checked by [Article validation](#article-validation). The Phase 5
+  number check only sees digits.
 - **Titles.** The URL tool doesn't report page titles, so a source's title is as Gemini read
   it from the page.
 - **Query cap.** The cap is enforced on research questions and in the prompt, while Gemini
   decides the exact queries. The queries it ran are recorded.
 - **One language.** Articles are written in English.
+
+## Article validation
+
+Phase 6 turns a completed draft into a checked, scored article that a person can publish.
+**Phase 6 validates and prepares articles but does not publish them.** Publishing is Phase 7.
+
+### Flow
+
+```
+completed article (Phase 5)
+  ├─ fact_check    every cited claim vs its source; uncited factual claims    (Gemini + code)
+  ├─ originality   word n-gram overlap with stored competitor/company pages   (code)
+  ├─ seo           keywords, meta tags, slug, headings, FAQ, links, tags       (Gemini + code)
+  ├─ metrics       structure, length, readability, citations, claims, SEO     (code)
+  ├─ judge         quality rubric, 8 dimensions scored 1-5 with reasons       (Gemini)
+  └─ decision      combined score, mandatory gates, issues in priority order  (code)
+while the best version fails a gate and automatic revisions < QUALITY_MAX_REVISIONS:
+  revise the best version (issues most serious first) → validate the revision
+recommended version = the best: passing first, then the highest score, then the earliest
+→ ready (every gate passes) or needs_review
+```
+
+Only `completed` articles (and `ready` / `needs_review` ones, to validate again) can enter.
+Articles still being written (`queued`, `researching`, `outlining`, `drafting`, `editing`) and
+cancelled ones are refused. While Phase 6 runs, the article is `validating` or `revising`.
+`current_step`, the run, the score, the revision count and the recommended version are exposed
+by the API and CLI. A new Phase 5 edit (for example after an edit-prompt change) clears the
+validation: the article is `completed` again and must be revalidated.
+
+### Fact-checking
+
+Claims come from `article_citations` (claim → source). For each (claim, cited source) pair:
+
+1. **Stored notes.** Gemini checks the claim against the source's stored research: the facts
+   and verbatim excerpts read in Phase 5. The prompt (`fact-check/1`) treats the source as
+   untrusted data and asks for a verdict from the source text only.
+2. **Evidence check.** A `supported`, `partial` or `contradicted` verdict needs an evidence
+   quote. Code checks that the quote is in the stored notes (word for word, or at least 80% as
+   one contiguous run, allowing for punctuation). Without a verified quote the verdict doesn't
+   count, and the claim is unsettled.
+3. **Re-reading.** Unsettled claims are checked against the page itself with Gemini's URL
+   context tool, for at most `FACT_CHECK_MAX_REREADS` sources per version. The URL must pass
+   the Phase 1 SSRF guard first (public addresses only; no localhost, private, link-local,
+   `javascript:` or `file:` URLs), and the tool must report the page as retrieved. This process
+   fetches nothing itself, and URLs from the article text are never fetched.
+4. **Fallback.** Whatever is still unsettled is `unsupported`. Agreement alone never verifies
+   a claim.
+
+Verdicts are `supported`, `partial` (the source supports part of it, or less than it says),
+`unsupported` and `contradicted`. A claim citing several sources takes its best verdict. Each
+check is stored in `article_claim_checks`: claim, source, verdict, explanation, evidence and
+whether it was verified, confidence, re-read or not, model, prompt version and time. Rows are
+never overwritten. An identical (claim, source) pair keeps its earlier verdict (same prompt
+and model), so a revision only re-checks the sentences it changed. Only verdicts a model
+actually decided are reused.
+
+**Uncited claims.** Sentences without a citation that look factual are extracted in code:
+numbers, percentages, dates, quantities, research references ("a study found"), legal
+statements and named organizations. Gemini then classifies which of them need a source.
+Those are stored as `needs_verification`, and the rest as `not_required` (advice, common
+knowledge). Nothing is deleted automatically: they become issues for the revision.
+
+**Computed from the verdicts, never by the model:** `citation_coverage` (cited claims ÷
+cited + uncited claims needing a source), the supported, partial, unsupported and
+contradicted claim ratios, the uncited factual claim ratio, and citation integrity (markers in
+the text, claim → source records and stored sources must agree).
+
+### Originality
+
+Originality is a **similarity signal**, not a plagiarism verdict. It is deterministic, with no
+LLM:
+
+- **Shingles.** Text is normalized (citation markers removed, Unicode folded, lowercased) and
+  split into runs of `ORIGINALITY_NGRAM_SIZE` words (default 8), hashed stably.
+- **Common phrases are ignored.** A run found on `ORIGINALITY_COMMON_DOC_FREQUENCY` or more
+  stored pages (boilerplate, stock phrases, terminology) doesn't count. Neither does a run
+  that is 75% or more stopwords.
+- **Per passage.** Each paragraph or list item of at least `ORIGINALITY_MIN_PASSAGE_WORDS`
+  words is compared with every stored page. Its similarity is the share of its runs found in
+  the best-matching page (containment). Each flag stores the passage, the page (competitor
+  slug or "company", URL, content item), the longest shared text and the similarity.
+- **Thresholds.** A passage is flagged at `ORIGINALITY_FLAG_THRESHOLD` (0.25). At
+  `ORIGINALITY_MAX_OVERLAP` (0.5) the overlap is severe and the article can't be `ready`. The
+  0-1 score goes from 1 (at or below the flag threshold) to 0 (at the severe level).
+
+The corpus is the current version of every active page of the monitored competitors. Your
+own site is compared too when it's monitored like a competitor: its pages are recognized by
+the company profile's website domain, labelled "company", and offered as internal links.
+
+### SEO package
+
+- **Keywords.** Candidates are derived from stored data, with their provenance: the
+  opportunity topic (weight 4), competitor subtopics (2), keywords of the competitor pages
+  behind the opportunity (1, plus a capped bonus for pages sharing it), and company topics (1).
+  Prominence in the article adds to that. Gemini picks the primary and secondary keywords
+  among them and explains the choice. Code rejects a keyword that isn't a candidate or a
+  rewording of candidate and heading words, and falls back to the top candidate. The evidence
+  stored with the primary keyword lists the inputs it rests on.
+- **Meta tags.** Meta title (at most `SEO_TITLE_MAX_CHARS`) and meta description
+  (`SEO_DESCRIPTION_MIN_CHARS`-`SEO_DESCRIPTION_MAX_CHARS`). The final slug is built from the
+  primary keyword, and the article's slug is updated (made unique, like Phase 5's).
+- **Headings.** H1 (the title), H2 (section headings) and H3 (subheadings), with hierarchy
+  problems and duplicates.
+- **FAQ.** 3-6 questions answered only with what the article says. An answer with a number
+  the article doesn't contain is dropped.
+- **Links.** Internal links only to stored pages of your own site, and external links only
+  to the article's stored research sources (never competitor or company pages). Gemini
+  chooses by id among what it's offered, so a URL can never come from the model.
+- **Category, tags, image.** The category is one of the topic options. Tags must relate to
+  the candidates. The image suggestion is a concept, purpose and alt text (at most 125
+  characters); no image is generated.
+- **Checks.** Keyword in the meta title, H1, introduction, an H2 and the slug (content words,
+  any order or inflection); meta lengths; hierarchy; duplicates; at least two H2s; FAQ; external
+  links; and keyword density at most `SEO_MAX_KEYWORD_DENSITY`. Repetition is flagged as
+  stuffing, never rewarded. The SEO score is the share of checks passed.
+
+### Metrics and readability
+
+Every number is computed in code:
+
+- **Structure:** title, H1/H2/H3 counts, introduction and conclusion, hierarchy, duplicates,
+  the Phase 5 completion checks, and paragraphs of at most 150 words.
+- **Length:** words, sentences, paragraphs, lists.
+- **Readability:** Flesch reading ease, `206.835 − 1.015 × (words ÷ sentences) − 84.6 ×
+  (syllables ÷ words)`, and Flesch-Kincaid grade, `0.39 × (words ÷ sentences) + 11.8 ×
+  (syllables ÷ words) − 15.59`. Syllables are counted with a vowel-group heuristic. The 0-1
+  value maps reading ease 20 → 0 and 60 → 1.
+- **Citations, claims, originality and SEO,** as above.
+
+### The Gemini judge
+
+The judge (`quality-judge/1`) scores eight dimensions from 1 to 5, each with an explanation and
+specific issues: factual_support, audience_value, clarity, structure, originality,
+search_intent_alignment, strategic_alignment and readability. It is given the article, the
+brief, the research and the computed fact-check, originality and metrics results, which it
+must treat as authoritative. It must not invent evidence, and it gives no overall score. A
+dimension it leaves out counts as 1. Its 0-1 value is the mean of `(score − 1) ÷ 4`, computed
+in code.
+
+### Score and gates
+
+```
+score = Σ weight × value        weights (QUALITY_WEIGHTS) rescaled to total 100
+```
+
+| Component | Default weight | Value (0-1) |
+|---|---|---|
+| fact_support | 20 | (supported + ½ partial) ÷ cited claims |
+| citation_coverage | 20 | cited ÷ (cited + uncited claims needing a source) |
+| originality | 20 | the originality score |
+| structure | 10 | share of structure checks passed |
+| readability | 10 | Flesch reading ease, 20 → 0 and 60 → 1 |
+| seo | 10 | share of SEO checks passed |
+| gemini_judgment | 10 | the rubric mean, 1 → 0 and 5 → 1 |
+
+The breakdown (weight, value and points per component) is stored with each report. An article
+is `ready` only if **every** gate passes; otherwise it is `needs_review`:
+
+| Gate | Fails when |
+|---|---|
+| content_valid | the Phase 5 completion checks fail (malformed content) |
+| citation_integrity | a citation doesn't resolve to a stored source, or text and records disagree |
+| no_contradicted_claims | more than `QUALITY_MAX_CONTRADICTED` (0) contradicted claims |
+| unsupported_claims | more than `QUALITY_MAX_UNSUPPORTED_RATIO` (10%) of cited claims unsupported |
+| uncited_claims | more than `QUALITY_MAX_UNCITED_CLAIMS` (3) factual claims without a citation |
+| originality | a passage at or above `ORIGINALITY_MAX_OVERLAP` similarity |
+| seo_fields | primary keyword, meta title, meta description or slug missing |
+| minimum_score | score below `QUALITY_MIN_SCORE` (70) |
+
+### Revisions and the recommended version
+
+- **Issues first.** Issues are listed most serious first: contradicted claims, unsupported
+  (then partially supported) claims, uncited factual claims, citation problems, overlap with
+  competitor pages, structure, search intent (and the judge's audience and strategy points),
+  SEO, then readability and style.
+- **What the revision gets.** The revision prompt (`article-revision/2`) receives them with
+  the source evidence, as fenced data, along with the brief, the outline, the research and the
+  current length. It may not add facts, numbers or sources.
+- **A new version.** Each revision is an immutable `article_versions` row of kind `revision`,
+  with its parent, reason, the issue ids it says it addressed (only real ids are kept), its
+  changes, model, prompt version, tokens and time. It then goes through the same checks as a
+  draft, and a revision that fails them (too short, broken structure) is rejected.
+- **Validated again.** Each revision is validated in full. Unchanged claims keep their
+  verdicts.
+- **The best, not the latest.** The recommended version passes the gates first, then has the
+  highest score, then is the earliest. A worse revision is kept but never recommended, and
+  the article's content (API, CLI) is the recommended version.
+- **Bounded.** At most `QUALITY_MAX_REVISIONS` (2) automatic revisions are made from one
+  edited version, counting earlier validations'. An unusable revision, or one identical to a
+  version already validated, counts as an attempt. A second attempt on the same version is a
+  new attempt, not a replay. `articles revise` / `POST …/revise` asks for one more, optionally
+  with a note.
+
+### Checkpoints, resume and idempotency
+
+Phase 6 reuses Phase 5's job system: the article lock (one run per article, for generation and
+validation alike), `runs` (kind `article_quality`), and `article_steps`. Each step is a
+checkpoint with a fingerprint of its inputs, so an unchanged step is reused:
+
+| Step | Fingerprint |
+|---|---|
+| fact_check | prompt version, model and limits, version content, its citations, the research |
+| originality | algorithm version and thresholds, version content, the stored corpus (page versions) |
+| seo | prompt version, model and limits, version content, the SEO inputs (brief, topics, keywords, pages, sources) |
+| metrics | metrics version, content, the fact-check, originality and SEO outputs |
+| judge | prompt version, model, content, brief, research, the fact-check and originality outputs, the metrics except SEO |
+| decision | policy (weights, thresholds), the outputs above, the version |
+| revision | prompt version, writing settings, parent content, its issues, brief, research, outline, note, attempt |
+
+Downstream steps depend on the **outputs** of upstream steps. So validating again makes no
+Gemini call, and a failed step resumes where it stopped (`articles validate` again). A prompt
+change re-runs only what depends on it: a new SEO prompt redoes the SEO step (and the metrics
+and decision if the package changed), never the fact-check or the judge. A new judge prompt
+never redoes the originality check.
+
+### Token budget
+
+Phase 6 calls count towards the article's `ARTICLE_MAX_TOKENS` and have their own cap,
+`QUALITY_MAX_TOKENS`, across every validation and revision (also within
+`LLM_MAX_TOKENS_PER_RUN` and the daily budget). Budgets are checked before each call. If the
+budget runs out while validating the edited version, the article is `failed` at that step.
+If it runs out during a revision, revising stops: the versions already validated decide the
+outcome, and the article records why revisions stopped. Calls are recorded in `llm_calls`
+(purposes `fact_check`, `claim_classification`, `seo_package`, `quality_judge`,
+`article_revision`). Claims are checked in batches (`FACT_CHECK_BATCH_SIZE`), and a batch that
+returns unusable output is split and retried.
+
+In a live run, the 1,877-word Phase 5 article (28 citations) was validated in 15 calls and
+about 60k tokens. The edited version failed two gates (4 unsupported claims, 6 uncited
+factual claims). One revision fixed them (29 of 30 claims supported), and the score rose from
+80.7 to 90.8, so it became the recommended version. Validating again reused every step.
+
+### Safety
+
+- All source, competitor and article text is untrusted: it is fenced in the prompts (tags
+  inside it are defused), and every prompt says it is data, never instructions.
+- The only URLs ever read are stored research sources, re-read through Gemini after the SSRF
+  check. Link suggestions can only point at stored pages and sources.
+- API keys are never logged or stored.
+
+### Limitations
+
+- **Fact-checking checks support, not truth.** A claim is checked against the source it
+  cites, so a supported claim is only as good as its source. Re-reading depends on the page
+  still being readable by Gemini's URL tool.
+- **Signals, not judgments.** Originality is a similarity signal against *stored* pages only,
+  not the web. Readability is a formula tuned for English.
+- **Heuristics.** Keyword placement checks content words in any order. The uncited-claim
+  extraction is signal-based, so a factual sentence without numbers, dates or research words
+  can be missed.
+- **Revisions can shorten.** A revision that removes unsupported content can shorten the
+  article (1,877 → 1,298 words in the live run). It must stay above `ARTICLE_MIN_WORDS`.
+- **Your own site.** Your site is compared and linked only if it is monitored like a
+  competitor.
 
 ## Data model
 
@@ -745,6 +1040,7 @@ PostgreSQL, managed with Alembic migrations (`migrations/`), in separate layers:
 | Analysis (Phase 3) | `topics`, `topic_aliases`, `content_analyses`, `content_analysis_topics`, `change_summaries`, `competitor_profiles`, `landscape_reports` | Model-produced interpretations, each with its run, model and prompt version; profiles and reports stored with the metrics they were grounded on |
 | Recommendations (Phase 4) | `company_profiles`, `opportunities`, `opportunity_assessments`, `opportunity_evidence`, `opportunity_events` | Versioned company profiles; one opportunity per topic with its status; immutable scored assessments (breakdown, gaps, signals, suggestion, Gemini interpretation); the evidence each assessment rests on; the status and scoring timeline |
 | Generation (Phase 5) | `articles`, `article_steps`, `article_versions`, `article_sources`, `article_citations` | Article drafts linked to their opportunity, assessment and company profile version; the checkpoint log; immutable outline/draft/edited versions; retrieved research sources with their facts; claim → source citations. Never published |
+| Validation (Phase 6) | `article_claim_checks`, `article_originality_flags`, `article_quality_reports`; revision rows in `article_versions` | One verdict per (claim, cited source) and per uncited factual claim, with evidence and provenance; flagged passages with the page they overlap; each version's score, breakdown, gates and issues, linked to the steps it came from. The article points at its recommended version and report. Never published |
 | Operations | `runs`, `run_events`, `llm_calls` | What ran, when, with what result (article runs carry `article_id`); every LLM call with its tokens |
 
 LLM output lives in the analysis layer, in the `interpretation` of opportunity assessments and
@@ -802,8 +1098,8 @@ topics = await llm.generate_structured(LLMRequest(prompt="..."), TopicList)  # a
 | 2 · Persisted history | **No.** Storage, incremental scans and change detection are deterministic. |
 | 3 · Competitor analysis | **Yes:** per-page analysis, change summaries, profiles, landscape briefings, topic consolidation. Metrics, trends and gaps stay deterministic. |
 | 4 · Content opportunities | **Yes, top candidates only:** title, angle, why now, format, audience, rationale. Signals, relevance, gaps, scores and ranking are deterministic; works without a key. |
-| 5 · Article drafts (current) | **Yes:** research (Google Search grounding and URL context), outline, draft, editorial pass. The brief, URL screening, citation checks and completion checks are deterministic. Nothing is published. |
-| 6 · SEO, editing, fact-checking, quality | Yes |
+| 5 · Article drafts | **Yes:** research (Google Search grounding and URL context), outline, draft, editorial pass. The brief, URL screening, citation checks and completion checks are deterministic. Nothing is published. |
+| 6 · Article validation (current) | **Yes:** claim verdicts (with URL context re-reads), uncited-claim classification, SEO wording, the quality rubric, revisions. Evidence checks, originality, metrics, the score, gates and version selection are deterministic. Nothing is published. |
 | 7–10 · Publishing, scheduling, social, dashboard | Publishing itself never uses an LLM |
 
 ## Configuration reference
@@ -842,6 +1138,18 @@ All settings are environment variables (or `.env`); see [`.env.example`](.env.ex
 | `ARTICLE_RESEARCH_MAX_URL_CONTEXT_CALLS` | `2` | Page-reading calls (URL context; up to 20 pages each) |
 | `ARTICLE_RESEARCH_MAX_TOKENS` | `150000` | Research token cap (within the article budget) |
 | `ARTICLE_RESEARCH_MIN_SOURCES` | `2` | Usable sources required to continue (0 allows an article without external sources) |
+| `GEMINI_QUALITY_MODEL` | `GEMINI_MODEL` | Model for fact-checking, SEO and the judge (revisions use `GEMINI_WRITING_MODEL`) |
+| `QUALITY_REASONING_EFFORT` | `low` | Gemini `thinking_level` for fact-checking, SEO and the judge |
+| `QUALITY_MAX_TOKENS` | `300000` | Phase 6 tokens per article, across validations and revisions (within `ARTICLE_MAX_TOKENS`) |
+| `QUALITY_MAX_REVISIONS` | `2` | Automatic revisions from one edited version (0 = validate only) |
+| `QUALITY_MIN_SCORE` | `70` | Minimum score for `ready` |
+| `QUALITY_MAX_CONTRADICTED` / `_UNSUPPORTED_RATIO` / `_UNCITED_CLAIMS` | `0` / `0.1` / `3` | Gate limits |
+| `QUALITY_WEIGHTS` | see [Score and gates](#score-and-gates) | Component weights as JSON (rescaled to 100) |
+| `FACT_CHECK_BATCH_SIZE` / `_MAX_REREADS` / `_MAX_UNCITED_CANDIDATES` | `8` / `4` / `30` | Claims per call; sources re-read per version; uncited sentences checked per version |
+| `ORIGINALITY_NGRAM_SIZE` / `_FLAG_THRESHOLD` / `_MAX_OVERLAP` | `8` / `0.25` / `0.5` | Shingle size; flag and severe similarity |
+| `ORIGINALITY_COMMON_DOC_FREQUENCY` / `_MIN_PASSAGE_WORDS` | `3` / `12` | Pages that make a phrase common; shortest passage checked |
+| `SEO_TITLE_MAX_CHARS` / `SEO_DESCRIPTION_MIN_CHARS` / `_MAX_CHARS` | `60` / `70` / `160` | Meta tag lengths |
+| `SEO_MAX_KEYWORD_DENSITY` | `0.03` | Keyword density above which repetition is stuffing |
 
 ## Development
 
@@ -870,6 +1178,13 @@ uv run pytest -m llm_live            # opt-in: one real Gemini call (needs GEMIN
   competitor page and unsafe URLs. The tests cover failure and resume at every step, crash
   recovery, concurrency, budgets and prompt-version changes. `uv run pytest -m llm_live
   tests/live/test_live_article.py` writes one real article (about 40k tokens).
+- Article validation is tested end to end with the fake Gemini. The tests cover each verdict,
+  evidence that isn't in the source, re-reads and unsafe source URLs, uncited claims,
+  competitor and company overlap, common phrases, SEO validation, every gate, the revision
+  loop (fixing, worse, unchanged and unusable revisions, bounds, budgets), resume after
+  failure, cancellation, dependency boundaries between steps, the API and the CLI.
+  `uv run pytest -m llm_live tests/live/test_live_quality.py` validates one article with the
+  real Gemini (about 20-30k tokens).
 - CI runs lint, format, type checks and tests against a PostgreSQL service
   (`.github/workflows/ci.yml`).
 
@@ -907,6 +1222,14 @@ app/
     research.py                search → URL screening → URL-context reading → sources and facts
     article_writing.py         outline, draft and editorial pass (Gemini)
     article_content.py         citations, completion checks, slugs, Markdown preview (no LLM)
+    checkpoints.py             step fingerprints and checkpoint lookup (Phases 5 and 6)
+    quality.py                 validation runs: steps, revision loop, best version, finish
+    fact_check.py              claim verdicts, evidence checks, re-reads, uncited claims
+    originality.py             n-gram similarity against stored pages (no LLM)
+    seo.py                     keyword candidates, package validation, SEO checks
+    quality_metrics.py         structure, length, readability, citation metrics (no LLM)
+    quality_decision.py        score, gates, issue order, best-version choice (no LLM)
+    quality_review.py          the Gemini judge and revisions
   prompts/                     versioned prompts + their structured-output schemas
   db/                          models (by layer), sessions, advisory locks, queries, migrations
   llm/                         provider-agnostic LLM interface + Gemini provider

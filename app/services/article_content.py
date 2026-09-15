@@ -75,6 +75,15 @@ def _texts(content: ArticleContent) -> Iterable[tuple[int, int, int | None, str]
                 yield s, b, i, item
 
 
+def text_blocks(content: ArticleContent) -> Iterable[tuple[int, int, int | None, str]]:
+    """(section, block, list item or None, text) for every paragraph, list item and subheading."""
+    return _texts(content)
+
+
+def split_sentences(text: str) -> list[str]:
+    return _SENTENCE.split(text)
+
+
 def clean_citations(content: ArticleContent, valid: set[str]) -> tuple[ArticleContent, list[ContentIssue]]:  # fmt: skip
     """Canonical markers, with labels that aren't in ``valid`` removed and reported."""
     issues: list[ContentIssue] = []
@@ -169,6 +178,22 @@ def unique_slug(base: str, taken: set[str]) -> str:
     while f"{base}-{n}" in taken:
         n += 1
     return f"{base}-{n}"
+
+
+def to_markdown(content: ArticleContent) -> str:
+    """The content as Markdown with its citation labels kept as written ([S1]), for prompts."""
+    lines = [f"# {content.title}", ""]
+    for section in content.sections:
+        if section.heading:
+            lines += [f"## {section.heading}", ""]
+        for block in section.blocks:
+            if block.type is BlockType.SUBHEADING:
+                lines += [f"### {block.text or ''}", ""]
+            elif block.type is BlockType.LIST:
+                lines += [f"{f'{n}.' if block.ordered else '-'} {item}" for n, item in enumerate(block.items, start=1)] + [""]  # fmt: skip
+            else:
+                lines += [block.text or "", ""]
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def render_markdown(content: ArticleContent, sources: Mapping[str, tuple[str | None, str]]) -> str:
