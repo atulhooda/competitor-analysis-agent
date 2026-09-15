@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
+from zoneinfo import ZoneInfo
 
 import typer
 from rich.console import Console
@@ -37,6 +38,15 @@ from app.domain.articles import ArticleBrief, ArticleStatus
 from app.domain.competitor_profile import Claim
 from app.domain.content import ContentType
 from app.domain.history import ChangeType, RunStatus, RunTrigger
+from app.domain.jobs import (
+    JobStatus,
+    JobTrigger,
+    JobType,
+    JobView,
+    PipelinePlan,
+    SchedulerStatus,
+    ScheduleView,
+)
 from app.domain.opportunities import OpportunityStatus
 from app.domain.publishing import (
     ApprovalChannel,
@@ -50,6 +60,8 @@ from app.domain.publishing import (
 from app.domain.quality import ClaimVerdict
 from app.domain.scan import ScanResult
 from app.llm import LazyLLM, LLMConfigurationError
+from app.scheduling.runtime import Scheduling, standalone
+from app.scheduling.worker import run_worker
 from app.services.analysis import (
     AnalysisAlreadyRunningError,
     AnalysisOptions,
@@ -74,6 +86,7 @@ from app.services.company import (
     save_company_profile,
 )
 from app.services.intelligence import IntelligenceService
+from app.services.jobs import JobConflictError, JobNotFoundError
 from app.services.landscape import LandscapeAlreadyRunningError, LandscapeService
 from app.services.llm_usage import usage_window_start, utc_day_start
 from app.services.monitoring import MonitoringService
@@ -96,8 +109,9 @@ cli = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
     help="Competitor intelligence agent: compliant website monitoring, persisted history, "
-    "AI analysis (Gemini), content opportunities, article drafts, their validation, and "
-    "publishing approved, ready versions (WordPress drafts by default; no scheduling).",
+    "AI analysis (Gemini), content opportunities, article drafts, their validation, "
+    "publishing approved, ready versions (WordPress drafts by default), and the scheduled "
+    "pipeline that runs them (off by default).",
 )
 db_cli = typer.Typer(no_args_is_help=True, help="Database migrations.")
 competitors_cli = typer.Typer(help="Manage monitored competitors (stored in the database).")
@@ -2255,3 +2269,294 @@ def article_publications_cmd(article_id: int, json_output: bool = typer.Option(F
     for r in rows:
         table.add_row(str(r.id), str(r.version_id), f"#{r.approval_id}", r.status.value, r.target_status.value, f"{r.external_id or '—'} ({r.external_status or '—'})", r.url or "—", str(r.attempt_count), f"{r.updated_at:%Y-%m-%d %H:%M}", f"#{r.superseded_by_id}" if r.superseded_by_id else "")  # fmt: skip
     console.print(table if rows else f"No publications yet: `articles publish {article_id}` (a draft by default).")  # fmt: skip
+
+
+# ── Phase 8: jobs, the schedule, the pipeline, the worker ────────────────────
+
+jobs_cli = typer.Typer(no_args_is_help=True, help="Jobs: scheduled and manual pipeline runs, their stages and reports.")  # fmt: skip
+schedule_cli = typer.Typer(no_args_is_help=True, help="The schedule: status (the dashboard), list, run a job now, pause, resume.")  # fmt: skip
+pipeline_cli = typer.Typer(no_args_is_help=True, help="The autonomous pipeline: scan → analyze → opportunities → generate → validate → approval → publish.")  # fmt: skip
+cli.add_typer(jobs_cli, name="jobs")
+cli.add_typer(schedule_cli, name="schedule")
+cli.add_typer(pipeline_cli, name="pipeline")
+
+_JOB_COLORS = {"completed": "green", "completed_with_warnings": "yellow", "failed": "red", "skipped": "dim", "cancelled": "dim", "running": "cyan", "queued": "cyan"}  # fmt: skip
+
+
+def _run_jobs[T](work: Callable[[Scheduling], Awaitable[T]]) -> T:
+    """Like ``_run_db``, with every service a job may call (created on first use)."""
+    settings = get_settings()
+
+    async def runner() -> T:
+        async with standalone(settings, pooled=False) as scheduling:
+            return await work(scheduling)
+
+    try:
+        return asyncio.run(runner())
+    except ProgrammingError as exc:
+        err.print(f"[red]Database schema problem:[/red] {exc.orig}")
+        err.print("Run [bold]uv run python -m app db upgrade[/bold] to apply migrations.")
+        raise typer.Exit(code=2) from exc
+    except (OperationalError, DBAPIError, OSError) as exc:
+        err.print(f"[red]Cannot reach the database[/red] at {settings.database_url_display}")
+        err.print("Start it with [bold]docker compose up -d db[/bold] or set DATABASE_URL.")
+        raise typer.Exit(code=2) from exc
+
+
+def _status_text(value: str) -> str:
+    color = _JOB_COLORS.get(value, "white")
+    return f"[{color}]{value}[/{color}]"
+
+
+def _short(summary: dict[str, object], limit: int = 90) -> str:
+    parts = []
+    for key, value in summary.items():
+        if isinstance(value, bool | int | float) or value is None:
+            parts.append(f"{key}={value}")
+        elif isinstance(value, list):
+            parts.append(f"{key}={len(value)}" if len(value) > 5 else f"{key}={value}")
+    text = ", ".join(parts)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _print_job(job: JobView) -> None:
+    when = f" · for {job.scheduled_for:%Y-%m-%d %H:%M} UTC" if job.scheduled_for else ""
+    console.print(f"job {job.id} · {job.job_type.value} · {_status_text(job.status.value)} · {job.trigger.value}{when} · attempt {job.attempt_count}/{job.max_attempts}" + (" · dry run" if job.dry_run else "") + (f" · retry of {job.parent_id}" if job.parent_id else ""))  # fmt: skip
+    if job.checkpoint:
+        console.print(f"checkpoint: {job.checkpoint}")
+    if job.status is JobStatus.QUEUED and job.attempt_count:
+        console.print(f"[yellow]retried after {job.run_after:%Y-%m-%d %H:%M} UTC (by the worker: `python -m app worker`)[/yellow]")  # fmt: skip
+    if job.last_error:
+        (err.print if job.status is JobStatus.FAILED else console.print)(f"[{'red' if job.status is JobStatus.FAILED else 'yellow'}]{escape(job.last_error[:600])}[/]" + (f" ({job.error_kind.value})" if job.error_kind else ""))  # fmt: skip
+    if job.stages:
+        table = Table("Stage", "Status", "Started", "Took", "Summary", "Warnings")
+        for s in job.stages:
+            took = f"{(s.finished_at - s.started_at).total_seconds():.0f}s" if s.started_at and s.finished_at else "—"  # fmt: skip
+            table.add_row(s.stage.value, _status_text(s.status.value), f"{s.started_at:%H:%M:%S}" if s.started_at else "—", took, escape(_short(s.summary)), str(len(s.warnings)) if s.warnings else "")  # fmt: skip
+        console.print(table)
+        for s in job.stages:
+            for warning in s.warnings[:5]:
+                console.print(f"[yellow]! {s.stage.value}: {escape(warning[:300])}[/yellow]")
+    today = job.report.get("today")
+    if isinstance(today, dict):
+        console.print(f"today ({today.get('date')}, {today.get('timezone')}): generated {today.get('generated')}/{today.get('generation_limit')} · ready {today.get('ready')} · published {today.get('published')}/{today.get('publication_limit')} (remaining {today.get('remaining')}) · drafts {today.get('drafts')}")  # fmt: skip
+
+
+def _print_plan(plan: PipelinePlan) -> None:
+    console.print(f"[bold]Plan[/bold] for {plan.job_type.value} at {plan.generated_at:%Y-%m-%d %H:%M} UTC: stages {', '.join(s.value for s in plan.stages)}")  # fmt: skip
+    for note in plan.notes:
+        console.print(f"[dim]· {escape(note)}[/dim]")
+    if plan.analysis:
+        table = Table("Competitor", "To analyze", "Carried forward", "Batches", "≈ input tokens")
+        for a in plan.analysis:
+            table.add_row(str(a.get("competitor")), str(a.get("to_analyze", a.get("error", "—"))), str(a.get("carry_forward", "—")), str(a.get("batches", "—")), f"{a.get('estimated_input_tokens', 0):,}")  # fmt: skip
+        console.print(table)
+    if plan.opportunities:
+        table = Table("Opp.", "Score", "Fit", "Evidence", "Status", "Selected", "Title")
+        for o in plan.opportunities[:15]:
+            table.add_row(str(o.opportunity_id), f"{o.score:.1f}", f"{o.strategic_fit:.2f}" if o.strategic_fit is not None else "—", str(o.evidence), o.status, "[green]yes[/green]" if o.selected else "no", escape(o.title[:60]))  # fmt: skip
+        console.print(table)
+    console.print(f"generation: {plan.generation_remaining} of {plan.generation_limit} left today · publishing: {plan.publication_remaining} of {plan.publication_limit} left today")  # fmt: skip
+    for label, rows in (("validation", plan.validation), ("publishing", plan.publishing)):
+        if rows:
+            table = Table("Article", "Status", "Score", "Approval", "Action", "Title", title=label)
+            for r in rows[:15]:
+                table.add_row(str(r.article_id), r.status, f"{r.score:.1f}" if r.score is not None else "—", r.approval or "—", escape(r.action), escape(r.title[:50]))  # fmt: skip
+            console.print(table)
+
+
+def _job_exit(job: JobView) -> None:
+    if job.status is JobStatus.FAILED:
+        raise typer.Exit(code=1)
+
+
+def _run_job_now(job_type: JobType, *, dry_run: bool, json_output: bool) -> None:
+    """Queue a job and run it here, now: the same locks, limits, gates and switches as a
+    scheduled run (a job of the same type already running means this one is skipped)."""
+
+    async def work(scheduling: Scheduling) -> JobView:
+        view, _ = await scheduling.jobs.enqueue(job_type, trigger=JobTrigger.CLI, dry_run=dry_run)
+        return await scheduling.jobs.run(view.id)
+
+    job = _run_jobs(work)
+    plan = PipelinePlan.model_validate(job.report["plan"]) if dry_run and job.report.get("plan") else None  # fmt: skip
+    if json_output:
+        payload = {"job": job.model_dump(mode="json"), "plan": plan.model_dump(mode="json") if plan else None}  # fmt: skip
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+    elif plan is not None:
+        _print_plan(plan)
+    else:
+        _print_job(job)
+    _job_exit(job)
+
+
+@jobs_cli.command("list")
+def jobs_list_cmd(
+    status: Annotated[JobStatus | None, typer.Option("--status")] = None,
+    job_type: Annotated[JobType | None, typer.Option("--type")] = None,
+    limit: int = typer.Option(25, min=1, max=500),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Recent jobs, newest first (scheduled, manual, skipped, retried)."""
+
+    async def work(scheduling: Scheduling) -> list[JobView]:
+        return await scheduling.jobs.find(status=status, job_type=job_type, limit=limit)
+
+    rows = _run_jobs(work)
+    if json_output:
+        sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
+        return
+    table = Table("ID", "Type", "Status", "Trigger", "For (UTC)", "Created", "Try", "Checkpoint", "Error")  # fmt: skip
+    for j in rows:
+        table.add_row(str(j.id), j.job_type.value + (" (dry run)" if j.dry_run else ""), _status_text(j.status.value), j.trigger.value, f"{j.scheduled_for:%m-%d %H:%M}" if j.scheduled_for else "—", f"{j.created_at:%Y-%m-%d %H:%M}", f"{j.attempt_count}/{j.max_attempts}", j.checkpoint or "—", escape((j.last_error or "")[:60]))  # fmt: skip
+    console.print(table if rows else "No jobs yet: `pipeline run --dry-run`, `schedule run <job>`, or start the worker.")  # fmt: skip
+
+
+@jobs_cli.command("show")
+def jobs_show_cmd(job_id: int = typer.Argument(..., min=1), json_output: bool = typer.Option(False, "--json")) -> None:  # fmt: skip
+    """One job: its stages, checkpoint, attempts, error and report."""
+
+    async def work(scheduling: Scheduling) -> JobView:
+        return await scheduling.jobs.get(job_id)
+
+    try:
+        job = _run_jobs(work)
+    except JobNotFoundError as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    if json_output:
+        sys.stdout.write(job.model_dump_json(indent=2) + "\n")
+    else:
+        _print_job(job)
+
+
+@jobs_cli.command("retry")
+def jobs_retry_cmd(job_id: int = typer.Argument(..., min=1), json_output: bool = typer.Option(False, "--json")) -> None:  # fmt: skip
+    """Retry a failed job now: a new job continuing from its checkpoints (finished stages
+    aren't repeated; no duplicate article, approval or post)."""
+
+    async def work(scheduling: Scheduling) -> JobView:
+        view = await scheduling.jobs.retry(job_id, actor="cli")
+        return await scheduling.jobs.run(view.id)
+
+    try:
+        job = _run_jobs(work)
+    except (JobNotFoundError, JobConflictError) as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    if json_output:
+        sys.stdout.write(job.model_dump_json(indent=2) + "\n")
+    else:
+        _print_job(job)
+    _job_exit(job)
+
+
+@jobs_cli.command("cancel")
+def jobs_cancel_cmd(job_id: int = typer.Argument(..., min=1)) -> None:
+    """Cancel a queued job, or stop a running one at its next checkpoint."""
+
+    async def work(scheduling: Scheduling) -> JobView:
+        return await scheduling.jobs.cancel(job_id, actor="cli")
+
+    try:
+        job = _run_jobs(work)
+    except (JobNotFoundError, JobConflictError) as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    note = "stops at its next checkpoint" if job.cancel_requested and job.status is JobStatus.RUNNING else job.status.value  # fmt: skip
+    console.print(f"job {job.id}: {note}")
+
+
+@schedule_cli.command("status")
+def schedule_status_cmd(json_output: bool = typer.Option(False, "--json")) -> None:
+    """The dashboard: switches, today's articles and allowances, today's jobs, next runs."""
+
+    async def work(scheduling: Scheduling) -> SchedulerStatus:
+        return await scheduling.state.status()
+
+    s = _run_jobs(work)
+    if json_output:
+        sys.stdout.write(s.model_dump_json(indent=2) + "\n")
+        return
+    state = "[green]enabled[/green]" if s.enabled else ("[yellow]paused[/yellow]" if s.paused else "[dim]disabled (SCHEDULER_ENABLED=false)[/dim]")  # fmt: skip
+    console.print(f"scheduler: {state} · timezone {s.timezone} · pipelines at once: {s.max_concurrent_pipelines}")  # fmt: skip
+    console.print(f"publishing: automated {'[green]on[/green]' if s.automated_publishing else '[dim]off[/dim]'} · auto-approve {'on' if s.auto_approve else 'off'} · target {s.publish_target} · direct publish {'allowed' if s.direct_publish else 'not allowed'}")  # fmt: skip
+    t = s.today
+    console.print(f"today {t.date}: generated {t.generated}/{t.generation_limit} (left {t.generation_remaining}) · ready {t.ready} · published {t.published}/{t.publication_limit} (left {t.remaining}) · drafts {t.drafts}")  # fmt: skip
+    if s.llm_tokens_left_today is not None:
+        console.print(f"LLM tokens left today (UTC): {s.llm_tokens_left_today:,}")
+    console.print("jobs today: " + (", ".join(f"{k} {v}" for k, v in sorted(s.jobs_today.items())) or "none") + (f" · running: {s.running}" if s.running else ""))  # fmt: skip
+    for v in s.next_runs:
+        nxt = v.next_runs[0].astimezone(ZoneInfo(s.timezone)) if v.next_runs else None
+        console.print(f"next {v.job_type.value}: {nxt:%Y-%m-%d %H:%M %Z}" if nxt else f"next {v.job_type.value}: —")  # fmt: skip
+    for warning in s.warnings:
+        console.print(f"[yellow]! {escape(warning)}[/yellow]")
+
+
+@schedule_cli.command("list")
+def schedule_list_cmd(json_output: bool = typer.Option(False, "--json")) -> None:
+    """The configured schedules, their next runs and their last job."""
+
+    async def work(scheduling: Scheduling) -> list[ScheduleView]:
+        return await scheduling.state.schedules()
+
+    rows = _run_jobs(work)
+    if json_output:
+        sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
+        return
+    table = Table("Job", "Setting", "Cron", "Timezone", "Next runs (local)", "Last job")
+    for v in rows:
+        tz = ZoneInfo(v.timezone)
+        table.add_row(v.job_type.value, v.setting, v.expression, v.timezone, ", ".join(f"{r.astimezone(tz):%m-%d %H:%M}" for r in v.next_runs), f"{v.last_job_id} ({v.last_status.value})" if v.last_job_id and v.last_status else "—")  # fmt: skip
+    console.print(table if rows else "No schedule is set: e.g. FULL_PIPELINE_SCHEDULE=\"0 6 * * *\" (and SCHEDULER_ENABLED=true for the worker).")  # fmt: skip
+
+
+@schedule_cli.command("run")
+def schedule_run_cmd(job_type: JobType, json_output: bool = typer.Option(False, "--json")) -> None:  # fmt: skip
+    """Run a job now (full_pipeline or one stage), with every lock, limit, gate and switch
+    of a scheduled run. Works while the scheduler is paused or disabled."""
+    _run_job_now(job_type, dry_run=False, json_output=json_output)
+
+
+@schedule_cli.command("pause")
+def schedule_pause_cmd(reason: str | None = typer.Option(None, help="Why (shown in the status).")) -> None:  # fmt: skip
+    """Pause scheduled runs (recorded as skipped) without a restart. Manual runs still work."""
+
+    async def work(scheduling: Scheduling) -> SchedulerStatus:
+        return await scheduling.state.pause(reason=reason, actor="cli")
+
+    _run_jobs(work)
+    console.print("scheduler paused: scheduled occurrences are recorded as skipped until `schedule resume`")  # fmt: skip
+
+
+@schedule_cli.command("resume")
+def schedule_resume_cmd() -> None:
+    async def work(scheduling: Scheduling) -> SchedulerStatus:
+        return await scheduling.state.resume(actor="cli")
+
+    status = _run_jobs(work)
+    console.print("scheduler resumed" + ("" if status.configured else " (but SCHEDULER_ENABLED=false: nothing fires until it is true)"))  # fmt: skip
+
+
+@pipeline_cli.command("run")
+def pipeline_run_cmd(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Planning mode: no site fetched, no Gemini call, no CMS change, no allowance used.",
+    ),
+    job_type: Annotated[
+        JobType, typer.Option("--job", help="full_pipeline (default) or one stage.")
+    ] = JobType.FULL_PIPELINE,
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Run the pipeline now (or plan it with --dry-run)."""
+    _run_job_now(job_type, dry_run=dry_run, json_output=json_output)
+
+
+@cli.command()
+def worker() -> None:
+    """The scheduler process: fires the configured schedules (SCHEDULER_ENABLED=true) and runs
+    queued jobs (manual runs, retries). Stop it with Ctrl-C: running jobs are requeued and
+    continue from their checkpoints on the next start."""
+    asyncio.run(run_worker(get_settings()))

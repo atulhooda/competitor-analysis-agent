@@ -26,6 +26,7 @@ written and verified before it goes public. A public post is never taken back to
 """
 
 import asyncio
+import dataclasses
 import hashlib
 import uuid
 from collections.abc import Awaitable, Callable
@@ -85,6 +86,7 @@ from app.services.article_content import structural_problems
 from app.services.article_render import render_article
 from app.services.articles import ArticleConflictError, ArticleNotFoundError, ArticleRunActiveError
 from app.services.checkpoints import new_run
+from app.services.daily_limits import reserve_publication_slot
 from app.services.runs import fail_abandoned_runs, finish_run, run_slot_free
 
 log = structlog.get_logger(__name__)
@@ -103,6 +105,10 @@ class ApprovalRequiredError(PublishingConflictError):
 
 
 class _Blocked(AppError):
+    pass
+
+
+class _LimitReached(AppError):
     pass
 
 
@@ -211,9 +217,13 @@ class PublishingService:
 
     # ── requests ─────────────────────────────────────────────────────────────
 
-    async def request(self, article_id: int, *, trigger: RunTrigger, target: TargetStatus | str | None = None) -> PublishRequestResult:  # fmt: skip
+    async def request(self, article_id: int, *, trigger: RunTrigger, target: TargetStatus | str | None = None, daily_limit: bool = False) -> PublishRequestResult:  # fmt: skip
         """Queue the publication of the article's recommended version. Refused unless it is
-        ready and approved (checked again, with the CMS, when the run executes)."""
+        ready and approved (checked again, with the CMS, when the run executes).
+
+        ``daily_limit`` (the autonomous pipeline, Phase 8): making the post public needs one
+        of today's MAX_ARTICLES_PER_DAY slots, reserved atomically right before the CMS
+        call. Publications made by hand keep Phase 7's behavior (they still count)."""
         wanted = self._target(target)
         if not self._cms.configured:
             raise CMSConfigurationError("WordPress isn't configured: set WORDPRESS_BASE_URL, WORDPRESS_USERNAME and WORDPRESS_APPLICATION_PASSWORD (an Application Password)")  # fmt: skip
@@ -255,14 +265,14 @@ class PublishingService:
                     )
                 publication.status, publication.target_status, publication.approval_id = PublicationStatus.QUEUED.value, wanted.value, approval.id  # fmt: skip
                 publication.updated_at = now
-            run = new_run(RUN_KIND, article_id, trigger, now, {"publication_id": publication.id, "target_status": wanted.value})  # fmt: skip
+            run = new_run(RUN_KIND, article_id, trigger, now, {"publication_id": publication.id, "target_status": wanted.value, "daily_limit": self._settings.max_articles_per_day if daily_limit else None})  # fmt: skip
             session.add(run)
             await session.flush()
             publication.run_id = run.id
             return PublishRequestResult(article_id, publication.id, run.id, created, PublicationStatus.QUEUED, None if created else f"publication #{publication.id} of this version exists: it is checked against the CMS and updated only if needed")  # fmt: skip
 
-    async def publish_now(self, article_id: int, *, trigger: RunTrigger, target: TargetStatus | str | None = None) -> tuple[PublishRequestResult, PublishOutcome | None]:  # fmt: skip
-        result = await self.request(article_id, trigger=trigger, target=target)
+    async def publish_now(self, article_id: int, *, trigger: RunTrigger, target: TargetStatus | str | None = None, daily_limit: bool = False) -> tuple[PublishRequestResult, PublishOutcome | None]:  # fmt: skip
+        result = await self.request(article_id, trigger=trigger, target=target, daily_limit=daily_limit)  # fmt: skip
         if not result.queued or result.run_id is None:  # another request's run is in progress
             return result, None
         return result, await self.execute(result.run_id)
@@ -277,6 +287,7 @@ class PublishingService:
             raise ValueError(f"Run {run_id} is not an article run")
         publication_id = int(params["publication_id"])
         target = TargetStatus(params["target_status"])
+        limit = params.get("daily_limit")
         async with article_lock(self._engine, article_id) as acquired:
             if not acquired:
                 return await self._finish(run_id, publication_id, RunStatus.FAILED, None, "another run is processing this article", mark_failed=False)  # fmt: skip
@@ -288,7 +299,7 @@ class PublishingService:
                     run.status, run.started_at = RunStatus.RUNNING.value, now
                     publication = await session.get_one(Publication, publication_id)
                     publication.status, publication.run_id, publication.updated_at = PublicationStatus.PREFLIGHT.value, run_id, now  # fmt: skip
-                return await self._execute(run_id, article_id, publication_id, target)
+                return await self._execute(run_id, article_id, publication_id, target, int(limit) if limit is not None else None)  # fmt: skip
             except asyncio.CancelledError:
                 await self._fail(publication_id, "interrupted: the server stopped during publishing (the next run reconciles with the CMS first)")  # fmt: skip
                 await finish_run(self._sessions, run_id, status=RunStatus.FAILED, now=self._now(), error="cancelled")  # fmt: skip
@@ -297,7 +308,7 @@ class PublishingService:
                 log.exception("publishing.crashed", article_id=article_id, run_id=run_id)
                 return await self._finish(run_id, publication_id, RunStatus.FAILED, None, f"{type(exc).__name__}: {exc}")  # fmt: skip
 
-    async def _execute(self, run_id: int, article_id: int, publication_id: int, target: TargetStatus) -> PublishOutcome:  # fmt: skip
+    async def _execute(self, run_id: int, article_id: int, publication_id: int, target: TargetStatus, limit: int | None = None) -> PublishOutcome:  # fmt: skip
         async with self._sessions() as session:
             snap = await self._snapshot(session, article_id)
         if snap.publication is None or snap.publication.id != publication_id:
@@ -321,14 +332,16 @@ class PublishingService:
                 publication.status, publication.last_error, publication.updated_at = _FINAL[target].value, None, self._now()  # fmt: skip
             return await self._finish(run_id, publication_id, RunStatus.SUCCEEDED, plan, None, action="none", warnings=plan.warnings)  # fmt: skip
         doc = document.model_copy(update={"slug": plan.slug or document.slug})
+        try:  # the last checks (and the daily slot) come before any change to the CMS
+            await self._begin_submit(publication_id, article_id, target, limit)
+        except _LimitReached as exc:
+            return await self._deferred(run_id, publication_id, plan, str(exc))
+        except _Blocked as exc:
+            return await self._blocked(run_id, publication_id, plan, str(exc))
         terms = plan.terms or TermResolution(None, ())
         if self._settings.wordpress_create_missing_terms and (terms.missing_category or terms.missing_tags):  # fmt: skip
             terms = await self._create_terms(publisher, publication_id, run_id, doc)
         payload = publisher.build_payload(doc, status=target, terms=terms, marker=snap.marker)
-        try:
-            await self._begin_submit(publication_id, article_id)
-        except _Blocked as exc:
-            return await self._blocked(run_id, publication_id, plan, str(exc))
         try:
             post = await self._write(publisher, publication_id, run_id, snap.marker, plan.post, doc, terms, target)  # fmt: skip
         except CMSError as exc:
@@ -421,9 +434,10 @@ class PublishingService:
         await self._attempt_done(attempt, AttemptOutcome.SUCCEEDED, 200, None, "created: " + ", ".join(terms.created) if terms.created else None)  # fmt: skip
         return terms
 
-    async def _begin_submit(self, publication_id: int, article_id: int) -> None:
+    async def _begin_submit(self, publication_id: int, article_id: int, target: TargetStatus, limit: int | None) -> None:  # fmt: skip
         """Right before the CMS is changed: the article is still ready, its recommended
-        version and report unchanged, and an approval for them live."""
+        version and report unchanged, and an approval for them live. An automated public
+        publication also takes one of today's slots here, atomically (Phase 8)."""
         async with self._sessions() as session, session.begin():
             article = await session.get_one(Article, article_id, with_for_update=True)
             publication = await session.get_one(Publication, publication_id)
@@ -434,6 +448,10 @@ class PublishingService:
                 problem = "the recommended version changed"
             if problem is not None or live is None:
                 raise _Blocked(problem or "no approval")
+            if limit is not None and target is TargetStatus.PUBLISH:
+                reserved, used, day = await reserve_publication_slot(session, publication, limit=limit, settings=self._settings, now=self._now())  # fmt: skip
+                if not reserved:
+                    raise _LimitReached(f"the daily publishing limit is reached ({used} of {limit} on {day}, {self._settings.scheduler_timezone}): left for a later run")  # fmt: skip
             publication.status, publication.approval_id, publication.updated_at = PublicationStatus.SUBMITTING.value, live.id, self._now()  # fmt: skip
 
     async def _record_success(self, run_id: int, publication_id: int, article_id: int, post: CMSPost, doc: RenderedDocument, terms: TermResolution, target: TargetStatus, warnings: list[str]) -> None:  # fmt: skip
@@ -523,19 +541,31 @@ class PublishingService:
             publication.status, publication.last_error, publication.updated_at = PublicationStatus.BLOCKED.value, f"blocked: {reason}"[:2_000], self._now()  # fmt: skip
         return await self._finish(run_id, publication_id, RunStatus.FAILED, plan, f"blocked: {reason}", mark_failed=False)  # fmt: skip
 
+    async def _deferred(self, run_id: int, publication_id: int, plan: _Plan | None, reason: str) -> PublishOutcome:  # fmt: skip
+        """Nothing was sent: the daily allowance is used up. The publication waits for a
+        later run (it isn't a failure)."""
+        async with self._sessions() as session, session.begin():
+            publication = await session.get_one(Publication, publication_id)
+            publication.status, publication.last_error, publication.updated_at = PublicationStatus.CANCELLED.value, reason[:2_000], self._now()  # fmt: skip
+        log.info("publishing.deferred_daily_limit", publication_id=publication_id, reason=reason)
+        outcome = await self._finish(run_id, publication_id, RunStatus.SUCCEEDED, plan, None, action="deferred_daily_limit", note=reason)  # fmt: skip
+        return dataclasses.replace(outcome, error=reason)
+
     async def _fail(self, publication_id: int, error: str) -> None:
         async with self._sessions() as session, session.begin():
             publication = await session.get_one(Publication, publication_id)
             # The post's own state stays in external_status / url; this records the request.
             publication.status, publication.last_error, publication.updated_at = PublicationStatus.FAILED.value, error[:2_000], self._now()  # fmt: skip
 
-    async def _finish(self, run_id: int, publication_id: int, run_status: RunStatus, plan: _Plan | None, error: str | None, *, status: PublicationStatus | None = None, action: str | None = None, warnings: list[str] | None = None, mark_failed: bool = True) -> PublishOutcome:  # fmt: skip
+    async def _finish(self, run_id: int, publication_id: int, run_status: RunStatus, plan: _Plan | None, error: str | None, *, status: PublicationStatus | None = None, action: str | None = None, warnings: list[str] | None = None, mark_failed: bool = True, note: str | None = None) -> PublishOutcome:  # fmt: skip
         if error is not None and mark_failed:
             await self._fail(publication_id, error)
         async with self._sessions() as session:
             publication = await session.get_one(Publication, publication_id)
             outcome = PublishOutcome(publication.article_id, publication_id, run_id, run_status, status or PublicationStatus(publication.status), action, publication.external_id, publication.url, error, warnings or [])  # fmt: skip
         summary = {"publication_id": publication_id, "status": outcome.status.value, "action": action, "external_id": outcome.external_id, "url": outcome.url}  # fmt: skip
+        if note:
+            summary["note"] = note
         await finish_run(self._sessions, run_id, status=run_status, now=self._now(), error=error, summary=summary)  # fmt: skip
         log.info("publishing.run_finished", run_id=run_id, publication_id=publication_id, status=run_status.value, publication_status=outcome.status.value, error=error)  # fmt: skip
         return outcome

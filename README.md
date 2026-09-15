@@ -4,14 +4,15 @@ An AI-powered competitor intelligence and content generation agent. It monitors 
 websites (and later their social channels), keeps a history of what they publish, finds content
 opportunities, and generates and publishes original blog posts.
 
-> **Status: Phase 7 of 10: publishing.** Scans are deterministic and stored in PostgreSQL;
-> Gemini analyzes what competitors publish (Phase 3); opportunities are scored
-> deterministically (Phase 4); an **approved** opportunity becomes a researched, cited, edited
-> draft (Phase 5), which Phase 6 fact-checks, scores and revises until it is `ready` or
-> `needs_review`. Phase 7 sends a ready article to WordPress once a person approves its exact
-> version. **Phase 7 publishes only approved, ready article versions and defaults to
-> WordPress drafts. Scheduling is not included**, and nothing is posted to social media.
-> See [MIGRATION_PLAN.md](MIGRATION_PLAN.md) for the architecture and roadmap.
+> **Status: Phase 8 of 10: scheduling and the autonomous pipeline.** Scans are deterministic
+> and stored in PostgreSQL; Gemini analyzes what competitors publish (Phase 3); opportunities
+> are scored deterministically (Phase 4); an **approved** opportunity becomes a researched,
+> cited, edited draft (Phase 5), which Phase 6 fact-checks, scores and revises until it is
+> `ready` or `needs_review`. Phase 7 sends a ready article to WordPress once its exact version
+> is approved. Phase 8 runs all of it on a schedule, within daily limits, and **everything
+> automatic is off by default**. **Phase 8 introduces autonomous scheduling and pipeline
+> orchestration. Social media automation is intentionally deferred to Phase 9.** See
+> [MIGRATION_PLAN.md](MIGRATION_PLAN.md) for the architecture and roadmap.
 
 ## What it does today
 
@@ -171,8 +172,26 @@ ready article → approval (this exact version and quality report) → render (s
 - **Never twice.** One publication per version and site; a lost response is reconciled,
   never retried blindly.
 
-**Phase 7 publishes only approved, ready article versions and defaults to WordPress drafts.
-Scheduling is not included.** See [Publishing](#publishing).
+**Phase 7 publishes only approved, ready article versions and defaults to WordPress drafts.**
+See [Publishing](#publishing).
+
+**Scheduling and the autonomous pipeline (Phase 8).** Runs the whole chain on a schedule:
+
+```
+schedule → scan → analyze → opportunities → generate (top N) → validate → READY gate
+  → approval policy → daily publishing limit → WordPress draft → publish
+```
+
+- **Off by default.** `SCHEDULER_ENABLED=false`, `AUTOMATED_PUBLISHING_ENABLED=false`,
+  `PUBLISH_AUTO_APPROVE=false`, `WORDPRESS_ALLOW_DIRECT_PUBLISH=false`: nothing runs, and
+  nothing is sent to WordPress, until you turn it on.
+- **Daily limits, per local day.** `MAX_ARTICLES_GENERATED_PER_DAY` (3) is applied before any
+  article is written; `MAX_ARTICLES_PER_DAY` (1) counts successful public posts and is
+  enforced atomically inside the publisher.
+- **Safe to repeat.** One job per scheduled occurrence, one running job per type, checkpoints
+  per stage: a rerun, retry or crash never duplicates an article, an approval or a post.
+
+See [Scheduling and the autonomous pipeline](#scheduling-and-the-autonomous-pipeline).
 
 ### Dates: what they mean
 
@@ -337,7 +356,7 @@ uv run python -m app articles seo 1                  # keywords + evidence, meta
 uv run python -m app articles revisions 1            # the edited version and every revision, with scores
 uv run python -m app articles revise 1 --note "..."  # one more revision of the recommended version
 
-# Approval and publishing (WordPress drafts by default; nothing is scheduled)
+# Approval and publishing (WordPress drafts by default)
 uv run python -m app articles approval 1             # recommended version, score, gates, approval state
 uv run python -m app articles approve 1 --note "..." # approve that exact version (asks to confirm; --yes)
 uv run python -m app articles reject 1 --note "..."  # reject it, with a reason
@@ -348,6 +367,21 @@ uv run python -m app articles publish 1              # create or update the Word
 uv run python -m app articles publish 1 --status publish   # make it public (needs WORDPRESS_ALLOW_DIRECT_PUBLISH)
 uv run python -m app articles publication 1          # post id, URL, what was mapped, every attempt
 uv run python -m app articles publications 1         # every publication (one per version and site)
+
+# Scheduling and the pipeline (Phase 8)
+uv run python -m app pipeline run --dry-run          # plan: no fetch, no Gemini call, no CMS change
+uv run python -m app pipeline run                    # the full pipeline, now (same locks and limits)
+uv run python -m app schedule run scan               # one job now: scan, analyze, opportunities,
+                                                     #   generate_articles, quality_check, publish
+uv run python -m app schedule status                 # dashboard: today's counts, allowances, next runs
+uv run python -m app schedule list                   # schedules, next runs, last job
+uv run python -m app schedule pause --reason "..."   # pause schedules (manual runs still work)
+uv run python -m app schedule resume
+uv run python -m app jobs list --status failed       # recent jobs
+uv run python -m app jobs show 12                    # stages, checkpoint, attempts, report
+uv run python -m app jobs retry 12                   # continue a failed job from its checkpoint
+uv run python -m app jobs cancel 12                  # queued: now; running: at its next checkpoint
+uv run python -m app worker                          # the scheduler process (SCHEDULER_ENABLED=true)
 
 # Database
 uv run python -m app db upgrade                      # apply migrations
@@ -417,6 +451,14 @@ uv run uvicorn app.main:create_app --factory --port 8000
 | POST | `/api/v1/articles/{id}/publish` | `202` with `{"publication_id": ..., "status": "queued"}`; the CMS work runs in the background (`?wait=true` to wait). `?dry_run=true`: preflight, rendered HTML and the WordPress request, changing nothing. Body: `{"status": "draft" / "pending" / "publish"}`. `409` if not ready or not approved, or if `publish` isn't allowed; `503` if WordPress isn't configured |
 | GET | `/api/v1/articles/{id}/publication` | The latest publication: status, post id, public URL, what was mapped, the last preflight, every attempt |
 | GET | `/api/v1/articles/{id}/publications` | Every publication, newest first |
+| POST | `/api/v1/pipeline/run` | Start the pipeline now: `202` with the queued job, which runs in the background. Body: `{"job_type": "full_pipeline"}` (or one stage), `{"dry_run": true}` → `200` with the plan. A job of a type already running is skipped |
+| GET | `/api/v1/jobs` | Recent jobs, newest first (`?status=`, `?job_type=`, `?limit=`) |
+| GET | `/api/v1/jobs/{id}` | One job: stages, checkpoint, attempts, heartbeat, error, report |
+| POST | `/api/v1/jobs/{id}/retry` | Retry a failed job: `202` with a new job continuing from its checkpoints. `409` unless it failed |
+| POST | `/api/v1/jobs/{id}/cancel` | Cancel a queued job, or stop a running one at its next checkpoint. `409` once finished |
+| GET | `/api/v1/schedule` | The configured schedules, their next runs and last job |
+| GET | `/api/v1/schedule/status` | The dashboard: switches, today's generated / ready / published and the remaining allowances, today's jobs, next runs, warnings |
+| POST | `/api/v1/schedule/pause`, `/api/v1/schedule/resume` | Pause or resume scheduled runs. Body: `{"reason": "..."}` (optional) |
 
 `/api/v1/*` requires the `X-API-Key` header whenever `API_KEY` is set. Outside development,
 requests are refused until it is. Interactive docs are served at `/docs`.
@@ -1297,6 +1339,148 @@ article's (its marker), and the new approval. The version 4 publication stays as
 - **After publishing, the opportunity is `used`.** Phase 5 won't write to it again (use a
   Phase 6 revision for changes).
 
+## Scheduling and the autonomous pipeline
+
+Phase 8 introduces autonomous scheduling and pipeline orchestration. Social media automation is
+intentionally deferred to Phase 9.
+
+### How it runs
+
+```
+APScheduler (worker process) → JobService (queue, locks, heartbeat, retries)
+  → PipelineService (the stages) → the Phase 2–7 services
+```
+
+The scheduler holds no business logic. Each stage calls the same service a person would:
+
+| Stage | Service | Notes |
+|---|---|---|
+| `scan` | Phase 2 scans | Every active competitor; one failing is a warning |
+| `analyze` | Phase 3 analysis | Incremental: already analyzed pages cost nothing |
+| `opportunities` | Phase 4 scoring | Zero opportunities is a normal result |
+| `generate` | Phase 5 articles | The top N opportunities within today's allowance |
+| `quality` | Phase 6 validation | With its revision loop; `needs_review` is a decision, not an error |
+| `approval` | Phase 7 approvals | Reports where each ready article stands; approves nothing |
+| `publish` | Phase 7 publishing | Only through `PublishingService`; the daily slot is reserved atomically |
+
+Job types: `scan`, `analyze`, `opportunities`, `generate_articles`, `quality_check`, `publish`
+(approval + publish) and `full_pipeline`.
+
+### Turning it on
+
+Nothing runs by default. A cautious setup that writes drafts every morning for a person to
+review:
+
+```bash
+SCHEDULER_ENABLED=true
+FULL_PIPELINE_SCHEDULE=0 6 * * *     # 06:00 every day, in SCHEDULER_TIMEZONE
+AUTOMATED_PUBLISHING_ENABLED=true    # the pipeline may send articles to WordPress...
+# WORDPRESS_ALLOW_DIRECT_PUBLISH=false (default): ...as drafts only
+# PUBLISH_AUTO_APPROVE=false (default): only articles a person approved
+```
+
+Then start the worker next to the API: `uv run python -m app worker`. Fully automatic public
+posting needs all four of `AUTOMATED_PUBLISHING_ENABLED`, `PUBLISH_AUTO_APPROVE`,
+`WORDPRESS_ALLOW_DIRECT_PUBLISH` and a non-zero `MAX_ARTICLES_PER_DAY`. Check what a run would
+do with `pipeline run --dry-run` first.
+
+### Schedules and time zones
+
+- **Cron.** Standard 5 fields (`minute hour day month weekday`) or `@hourly`, `@daily`,
+  `@weekly`, per job: `FULL_PIPELINE_SCHEDULE`, `SCAN_SCHEDULE`, `ANALYSIS_SCHEDULE`,
+  `OPPORTUNITY_SCHEDULE`, `ARTICLE_GENERATION_SCHEDULE`, `QUALITY_SCHEDULE`,
+  `PUBLISH_SCHEDULE`. Expressions are parsed, never evaluated; a bad one stops the app at
+  startup.
+- **Time zone.** Schedules run in `SCHEDULER_TIMEZONE` (default `Asia/Kolkata`), DST included.
+  Everything is stored in UTC.
+- **One job per occurrence.** Each scheduled time has a unique key, so two workers or a restart
+  can't run it twice.
+- **Missed runs.** After an outage, one catch-up run for the latest missed time (within
+  `SCHEDULER_CATCH_UP_HOURS`), never one per missed time. A new schedule doesn't fire
+  retroactively.
+- **Pause.** `schedule pause` records each scheduled time as a skipped job until `schedule
+  resume`; manual runs still work. `SCHEDULER_ENABLED=false` fires nothing at all.
+
+### Daily limits
+
+Both limits use the calendar day in `SCHEDULER_TIMEZONE`, computed from stored timestamps (no
+midnight job). `0` means none, never unlimited.
+
+| Limit | Counts | Enforced |
+|---|---|---|
+| `MAX_ARTICLES_GENERATED_PER_DAY` (3) | Articles created today, by the pipeline or by hand | Before any article is created: the best N opportunities are selected under a lock. The rest stay eligible for later runs |
+| `MAX_ARTICLES_PER_DAY` (1) | Successful public posts today. Not drafts, failed, blocked or deferred attempts | Inside Phase 7's publisher, in the transaction that starts the CMS change, under a lock. Two publishers racing for the last slot publish exactly one; the other waits for a later run with nothing sent |
+
+A publication made by hand isn't limited, but uses the day's allowance. Drafts don't use it;
+a run still sends at most `MAX_ARTICLES_PER_DAY` of them.
+
+### Selection
+
+Never random. Opportunities are ranked by score, then evidence, then strategic fit:
+approved ones, plus (with `PIPELINE_APPROVE_OPPORTUNITIES`, the default) new or reviewed ones
+scoring at least `PIPELINE_MIN_OPPORTUNITY_SCORE`. The pipeline approves only the ones it
+selects, recorded as actor `pipeline`. An opportunity that has an article, in any state, is
+never selected again. Publishing takes ready articles of approved, unused opportunities that
+were never published on the site, in the same order.
+
+### Approval and publishing safety
+
+- The pipeline never approves an article. Without `PUBLISH_AUTO_APPROVE` it stops before
+  publishing and lists the articles awaiting approval (`articles approve <id>`).
+- Only `ready` articles with a live approval of their exact version are sent, through Phase 7:
+  preflight, idempotency key, reconciliation after a lost response, draft first.
+- `AUTOMATED_PUBLISHING_ENABLED=false` keeps the pipeline away from WordPress entirely.
+- Two consecutive publishing failures stop the stage (the CMS is probably down).
+
+### Jobs, checkpoints and recovery
+
+- **Jobs** (`jobs list`, `GET /api/v1/jobs`): type, status (`queued`, `running`, `completed`,
+  `completed_with_warnings`, `failed`, `cancelled`, `skipped`), trigger, attempts, heartbeat,
+  error, stages and the pipeline report.
+- **Checkpoints.** Each stage's result is saved when it ends (`scan_complete` …
+  `publishing_complete`), with per-item progress while it runs. A continued job skips what's
+  done: no Gemini work is repeated, and an article is never created twice.
+- **Locks.** One running job per type (a second is skipped), and at most
+  `MAX_CONCURRENT_PIPELINES` jobs that can spend Gemini tokens.
+- **Crashes.** A running job whose heartbeat is older than `JOB_STALE_AFTER_MINUTES`, and whose
+  process is gone, is continued from its checkpoint by the worker. Ctrl-C requeues running jobs.
+- **Retries.** Transient failures (network, Gemini unavailable or rate limited, WordPress
+  429/5xx) are retried with exponential backoff, `JOB_MAX_ATTEMPTS` attempts in all.
+  Invalid keys or configuration, rejected credentials, failed quality gates and spent token
+  budgets are never retried. `jobs retry` continues a failed job from its checkpoints.
+- **Budgets.** `LLM_DAILY_TOKEN_BUDGET` is checked before each Gemini stage and item; a spent
+  budget ends the stage as `skipped_due_to_budget`.
+- **Priority.** Recovered and retried jobs first, then scheduled ones, then manual ones.
+
+### Planning mode
+
+`pipeline run --dry-run` (or `POST /api/v1/pipeline/run {"dry_run": true}`) shows what would
+run now: the competitors and the local analysis estimate, the ranked opportunities and which
+fit today's allowance, the validations, and each publication with why it would or wouldn't be
+sent. No site is fetched, **no Gemini call is made**, nothing is written to WordPress and no
+allowance is used. It doesn't simulate opportunity detection: it shows the opportunities that
+exist now.
+
+### Observability
+
+- `schedule status` (`GET /api/v1/schedule/status`): what ran today, what failed, generated /
+  ready / published with the remaining allowances, the next runs, and warnings (disabled,
+  paused, WordPress or Gemini not configured, failed or stuck jobs).
+- Structured log events for every job and stage (`job.*`, `pipeline.stage_*`, `worker.*`,
+  `publishing.deferred_daily_limit`), never with a secret.
+
+### Limitations
+
+- **One pipeline at a time by default.** Raise `MAX_CONCURRENT_PIPELINES` only with enough
+  Gemini quota and database connections (each running job holds two).
+- **The worker is required for schedules and retries.** The API and CLI run the jobs they
+  start; a job requeued for a retry waits for a worker.
+- **A stage's failure stops the pipeline.** If every competitor's scan fails, nothing after it
+  runs that time.
+- **Failed articles are not resumed automatically** after the run that created them: resume
+  them with `articles resume <id>`.
+- **No metrics backend.** Status comes from the database and the logs.
+
 ## Data model
 
 PostgreSQL, managed with Alembic migrations (`migrations/`), in separate layers:
@@ -1311,6 +1495,7 @@ PostgreSQL, managed with Alembic migrations (`migrations/`), in separate layers:
 | Generation (Phase 5) | `articles`, `article_steps`, `article_versions`, `article_sources`, `article_citations` | Article drafts linked to their opportunity, assessment and company profile version; the checkpoint log; immutable outline/draft/edited versions; retrieved research sources with their facts; claim → source citations. Never published |
 | Validation (Phase 6) | `article_claim_checks`, `article_originality_flags`, `article_quality_reports`; revision rows in `article_versions` | One verdict per (claim, cited source) and per uncited factual claim, with evidence and provenance; flagged passages with the page they overlap; each version's score, breakdown, gates and issues, linked to the steps it came from. The article points at its recommended version and report. Never published |
 | Publishing (Phase 7) | `article_approvals`, `publications`, `publication_attempts` | Decisions on an exact article version and quality report (never deleted; invalidated with a reason; one live per article); one publication per article version and CMS site (idempotency key, post id, URL, status, what was mapped, last preflight); every CMS change attempted and its outcome. No credentials |
+| Scheduling (Phase 8) | `jobs`, `scheduler_state`; `publications.limit_day` | One row per execution (type, trigger, status, the scheduled time and its unique key, attempts, heartbeat, error kind, stage checkpoints and progress, the report; no secrets); the persisted pause switch; the local day an automated publication reserved |
 | Operations | `runs`, `run_events`, `llm_calls` | What ran, when, with what result (article runs carry `article_id`); every LLM call with its tokens |
 
 LLM output lives in the analysis layer, in the `interpretation` of opportunity assessments and
@@ -1431,6 +1616,16 @@ All settings are environment variables (or `.env`); see [`.env.example`](.env.ex
 | `WORDPRESS_CREATE_MISSING_TERMS` | `false` | Create missing categories and tags (else a missing category blocks; missing tags are left out) |
 | `PUBLISH_AUTO_APPROVE` | `false` | Approve ready articles automatically when publishing (never over a rejection) |
 | `PUBLISH_DRAFT_FIRST` | `true` | Going public: a verified draft first |
+| `SCHEDULER_ENABLED` | `false` | The worker fires schedules (manual runs work either way) |
+| `SCHEDULER_TIMEZONE` | `Asia/Kolkata` | Schedules and daily limits use this calendar (IANA name) |
+| `FULL_PIPELINE_SCHEDULE`, `SCAN_SCHEDULE`, `ANALYSIS_SCHEDULE`, `OPPORTUNITY_SCHEDULE`, `ARTICLE_GENERATION_SCHEDULE`, `QUALITY_SCHEDULE`, `PUBLISH_SCHEDULE` | *(empty)* | Cron (`0 6 * * *`) or `@hourly` / `@daily` / `@weekly`; empty: not scheduled |
+| `SCHEDULER_CATCH_UP_HOURS` / `SCHEDULER_POLL_SECONDS` | `24` / `30` | How far back one catch-up run looks after an outage; how often the worker checks the queue |
+| `AUTOMATED_PUBLISHING_ENABLED` | `false` | The kill switch: false keeps the pipeline away from the CMS |
+| `MAX_ARTICLES_GENERATED_PER_DAY` / `MAX_ARTICLES_PER_DAY` | `3` / `1` | Articles created / public posts per local day (0 = none) |
+| `MAX_CONCURRENT_PIPELINES` | `1` | Jobs that can spend Gemini tokens at the same time |
+| `JOB_STALE_AFTER_MINUTES` | `60` | No heartbeat for this long (and no live process): continued from the checkpoint |
+| `JOB_MAX_ATTEMPTS` / `JOB_RETRY_BASE_SECONDS` / `JOB_RETRY_MAX_SECONDS` | `3` / `300` / `3600` | Transient-failure retries with exponential backoff |
+| `PIPELINE_APPROVE_OPPORTUNITIES` / `PIPELINE_MIN_OPPORTUNITY_SCORE` | `true` / `60` | The pipeline may approve the new or reviewed opportunities it selects, above this score |
 
 ## Development
 
@@ -1526,6 +1721,12 @@ app/
     approvals.py, approval_rules.py   approval decisions and when they stop applying
     article_render.py          CMS-neutral safe HTML: citations, sources, links, FAQ (no LLM)
     publishing.py              publishing runs: preflight, idempotency, reconciliation, verify
+    daily_limits.py            daily allowances per local day; the atomic publishing slot
+    jobs.py                    jobs: queue, claim, locks, heartbeat, retries, recovery, cancel
+    pipeline.py                the pipeline stages, checkpoints, selection, planning mode
+    scheduler_state.py         pause / resume and the status dashboard
+  scheduling/                  schedules and days (cron, time zones), retry policy, the
+                               APScheduler worker, wiring
   cms/                         CMS-neutral interface (CMSPublisher) and the WordPress adapter
     wordpress/client.py        REST API: auth, bounded retries, error mapping, read-only mode
     wordpress/publisher.py     posts, categories, tags, payloads, ownership, verification

@@ -39,6 +39,10 @@ from app.services.digest import estimate_tokens
 log = structlog.get_logger(__name__)
 
 
+# In every budget error message (the scheduler reports such stops as skipped_due_to_budget).
+BUDGET_REACHED = "LLM token budget reached"
+
+
 @dataclass
 class RunUsage:
     calls: int = 0
@@ -132,7 +136,7 @@ class BudgetedLLM:
             run_budget, name, kind = self._token_limit, self._token_limit_name, "remaining"
         if self.usage.total_tokens + estimate > run_budget:
             raise LLMBudgetExceededError(
-                f"{kind} LLM token budget reached ({self.usage.total_tokens:,} used this run, "
+                f"{kind} {BUDGET_REACHED} ({self.usage.total_tokens:,} used this run, "
                 f"next call ≈{estimate:,}, {name}={run_budget:,})"
             )
         daily_budget = self._settings.llm_daily_token_budget
@@ -142,7 +146,7 @@ class BudgetedLLM:
             used_today = await tokens_used_since(session, utc_day_start(self._now()))
         if used_today + estimate > daily_budget:
             raise LLMBudgetExceededError(
-                f"daily LLM token budget reached ({used_today:,} used today (UTC), "
+                f"daily {BUDGET_REACHED} ({used_today:,} used today (UTC), "
                 f"next call ≈{estimate:,}, LLM_DAILY_TOKEN_BUDGET={daily_budget:,})"
             )
 

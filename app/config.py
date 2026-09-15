@@ -11,6 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Self
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
@@ -197,6 +198,32 @@ class Settings(BaseSettings):
     publish_auto_approve: bool = False  # approve ready articles automatically when publishing
     publish_draft_first: bool = True  # going public: a verified draft first
 
+    # ── Scheduling (Phase 8: autonomous pipeline; off by default) ────────────
+    scheduler_enabled: bool = False  # the worker runs the schedules below
+    scheduler_timezone: str = "Asia/Kolkata"  # schedules and "a day" (limits) use it
+    # Cron expressions ("0 6 * * *") or @hourly / @daily / @weekly, in SCHEDULER_TIMEZONE.
+    full_pipeline_schedule: str | None = None
+    scan_schedule: str | None = None
+    analysis_schedule: str | None = None
+    opportunity_schedule: str | None = None
+    article_generation_schedule: str | None = None
+    quality_schedule: str | None = None
+    publish_schedule: str | None = None
+    scheduler_catch_up_hours: int = Field(default=24, ge=0, le=168)  # 0: never catch up
+    scheduler_poll_seconds: int = Field(default=30, ge=5, le=3_600)
+    automated_publishing_enabled: bool = False  # the pipeline's publishing stage (kill switch)
+    max_articles_generated_per_day: int = Field(default=3, ge=0, le=100)  # 0: none
+    max_articles_per_day: int = Field(default=1, ge=0, le=100)  # published per day; 0: none
+    max_concurrent_pipelines: int = Field(default=1, ge=1, le=4)
+    job_stale_after_minutes: int = Field(default=60, ge=5, le=1_440)
+    job_max_attempts: int = Field(default=3, ge=1, le=10)
+    job_retry_base_seconds: int = Field(default=300, ge=1, le=86_400)
+    job_retry_max_seconds: int = Field(default=3_600, ge=1, le=86_400)
+    # The pipeline may approve the top-scoring new/reviewed opportunities itself (recorded
+    # as the "pipeline" actor); false: it only writes opportunities a person approved.
+    pipeline_approve_opportunities: bool = True
+    pipeline_min_opportunity_score: float = Field(default=60.0, ge=0, le=100)
+
     @field_validator("api_key", "gemini_api_key", "wordpress_application_password", mode="before")
     @classmethod
     def _blank_secret_is_unset(cls, value: object) -> object:
@@ -245,6 +272,35 @@ class Settings(BaseSettings):
         if self.wordpress_default_status == "publish" and not self.wordpress_allow_direct_publish:
             raise ValueError("WORDPRESS_DEFAULT_STATUS=publish needs WORDPRESS_ALLOW_DIRECT_PUBLISH=true")  # fmt: skip
         return self
+
+    @field_validator("scheduler_timezone")
+    @classmethod
+    def _known_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"SCHEDULER_TIMEZONE {value!r} isn't an IANA timezone (e.g. Asia/Kolkata, Europe/Berlin, UTC)") from exc  # fmt: skip
+        return value
+
+    @field_validator("full_pipeline_schedule", "scan_schedule", "analysis_schedule", "opportunity_schedule", "article_generation_schedule", "quality_schedule", "publish_schedule")  # fmt: skip
+    @classmethod
+    def _valid_schedule(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        from app.scheduling.schedules import parse_schedule  # here: avoids an import cycle
+
+        parse_schedule(value, ZoneInfo("UTC"))  # raises ValueError on a bad expression
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _retry_delays_are_consistent(self) -> Self:
+        if self.job_retry_base_seconds > self.job_retry_max_seconds:
+            raise ValueError("JOB_RETRY_BASE_SECONDS must not exceed JOB_RETRY_MAX_SECONDS")
+        return self
+
+    @property
+    def scheduler_tz(self) -> ZoneInfo:
+        return ZoneInfo(self.scheduler_timezone)
 
     @property
     def cms_configured(self) -> bool:

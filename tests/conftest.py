@@ -18,7 +18,7 @@ from app.db.session import create_engine as create_async_db_engine
 from app.llm import get_llm
 from tests.fakesite import FakeClock, make_settings, public_resolver
 
-_SETTINGS_PREFIXES = ("CRAWLER_", "LLM_", "GEMINI_", "GOOGLE_", "DATABASE_", "ANALYSIS_", "SYNTHESIS_", "ARTICLE_", "WRITING_", "RESEARCH_", "QUALITY_", "FACT_CHECK_", "ORIGINALITY_", "SEO_", "CMS_", "WORDPRESS_", "PUBLISH_")  # fmt: skip
+_SETTINGS_PREFIXES = ("CRAWLER_", "LLM_", "GEMINI_", "GOOGLE_", "DATABASE_", "ANALYSIS_", "SYNTHESIS_", "ARTICLE_", "WRITING_", "RESEARCH_", "QUALITY_", "FACT_CHECK_", "ORIGINALITY_", "SEO_", "CMS_", "WORDPRESS_", "PUBLISH_", "SCHEDULER_", "JOB_", "PIPELINE_", "MAX_ARTICLES_", "MAX_CONCURRENT_", "AUTOMATED_")  # fmt: skip
 _SETTINGS_NAMES = {
     "API_KEY",
     "APP_ENV",
@@ -29,6 +29,13 @@ _SETTINGS_NAMES = {
     "TOPICS_FILE",
     "COMPANY_FILE",
     "SCORING_FILE",
+    "FULL_PIPELINE_SCHEDULE",
+    "SCAN_SCHEDULE",
+    "ANALYSIS_SCHEDULE",
+    "OPPORTUNITY_SCHEDULE",
+    "ARTICLE_GENERATION_SCHEDULE",
+    "QUALITY_SCHEDULE",
+    "PUBLISH_SCHEDULE",
 }
 
 TEST_DATABASE_URL = os.environ.get(
@@ -42,7 +49,7 @@ _TABLES = (
     "opportunities, opportunity_assessments, opportunity_evidence, opportunity_events, "
     "articles, article_steps, article_versions, article_sources, article_citations, "
     "article_claim_checks, article_originality_flags, article_quality_reports, "
-    "article_approvals, publications, publication_attempts"
+    "article_approvals, publications, publication_attempts, jobs, scheduler_state"
 )
 
 

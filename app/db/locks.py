@@ -1,5 +1,6 @@
 """Postgres advisory locks: one scan and one analysis per competitor; one landscape report
-and one opportunity generation at a time; one generation run per article.
+and one opportunity generation at a time; one generation run per article; one running job
+per job type and at most MAX_CONCURRENT_PIPELINES LLM-spending jobs (Phase 8).
 
 No Redis needed. A session-level lock lives exactly as long as the connection that holds
 it, so a crashed process can never leave anything locked.
@@ -16,7 +17,12 @@ _ANALYSIS_NAMESPACE = 72_002
 _LANDSCAPE_NAMESPACE = 72_003
 _OPPORTUNITY_NAMESPACE = 72_004
 _ARTICLE_NAMESPACE = 72_005
+_JOB_TYPE_NAMESPACE = 72_006  # Phase 8: one running job per job type
+_PIPELINE_SLOT_NAMESPACE = 72_007  # Phase 8: MAX_CONCURRENT_PIPELINES slots
 # 72_010 / 72_011 are transaction-level locks: taxonomy writes, company profile versions.
+# 72_012 / 72_013 (Phase 8): the daily publishing and generation allowances.
+PUBLISH_LIMIT_LOCK_KEY = (72_012 << 32) | 1
+GENERATION_LIMIT_LOCK_KEY = (72_013 << 32) | 1
 
 
 def scan_lock_key(competitor_id: int) -> int:
@@ -69,3 +75,18 @@ def article_lock_key(article_id: int) -> int:
 def article_lock(engine: AsyncEngine, article_id: int) -> AbstractAsyncContextManager[bool]:
     """One generation run per article at a time (different articles run in parallel)."""
     return try_advisory_lock(engine, article_lock_key(article_id))
+
+
+def job_type_lock(engine: AsyncEngine, type_index: int) -> AbstractAsyncContextManager[bool]:
+    """One running job per job type (a second one is skipped, not queued behind it)."""
+    return try_advisory_lock(engine, (_JOB_TYPE_NAMESPACE << 32) | type_index)
+
+
+def pipeline_slot_lock(engine: AsyncEngine, slot: int) -> AbstractAsyncContextManager[bool]:
+    """One of MAX_CONCURRENT_PIPELINES slots for jobs that can spend LLM tokens."""
+    return try_advisory_lock(engine, (_PIPELINE_SLOT_NAMESPACE << 32) | slot)
+
+
+def generation_limit_lock(engine: AsyncEngine) -> AbstractAsyncContextManager[bool]:
+    """Held while the daily generation allowance is checked and articles are created."""
+    return try_advisory_lock(engine, GENERATION_LIMIT_LOCK_KEY)

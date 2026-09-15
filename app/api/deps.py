@@ -13,11 +13,14 @@ from app.services.analysis import AnalysisService
 from app.services.approvals import ApprovalService
 from app.services.articles import ArticleService
 from app.services.intelligence import IntelligenceService
+from app.services.jobs import JobService
 from app.services.landscape import LandscapeService
 from app.services.opportunities import OpportunityService
+from app.services.pipeline import PipelineService
 from app.services.publishing import PublishingService
 from app.services.quality import QualityService
 from app.services.scans import ScanService
+from app.services.scheduler_state import SchedulerStateService
 from app.services.topic_admin import TopicAdminService
 
 
@@ -130,3 +133,23 @@ def get_publishing_service(request: Request) -> PublishingService:
 
 ApprovalServiceDep = Annotated[ApprovalService, Depends(get_approval_service)]
 PublishingServiceDep = Annotated[PublishingService, Depends(get_publishing_service)]
+
+
+def get_job_service(request: Request) -> JobService:
+    service: JobService = request.app.state.jobs
+    return service
+
+
+def get_pipeline_service(request: Request) -> PipelineService:
+    service: PipelineService = request.app.state.pipeline
+    return service
+
+
+def get_scheduler_state(request: Request) -> SchedulerStateService:
+    service: SchedulerStateService = request.app.state.scheduler_state
+    return service
+
+
+JobServiceDep = Annotated[JobService, Depends(get_job_service)]
+PipelineServiceDep = Annotated[PipelineService, Depends(get_pipeline_service)]
+SchedulerStateDep = Annotated[SchedulerStateService, Depends(get_scheduler_state)]

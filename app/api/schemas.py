@@ -9,6 +9,7 @@ from app.domain.company import CompanyProfileView
 from app.domain.content import ContentType
 from app.domain.history import RunView
 from app.domain.intelligence import Landscape, LandscapeReportView
+from app.domain.jobs import JobType, JobView, PipelinePlan
 from app.domain.opportunities import OpportunityStatus
 from app.domain.publishing import ApprovalRecord, ApprovalView, PublicationStatus, TargetStatus
 from app.domain.scan import ScanResult
@@ -188,9 +189,37 @@ class LLMStatus(BaseModel):
     required_from_phase: int = 3
 
 
+class SchedulerHealth(BaseModel):
+    enabled: bool = Field(description="SCHEDULER_ENABLED (the worker process fires schedules)")
+    automated_publishing: bool = Field(description="AUTOMATED_PUBLISHING_ENABLED (the kill switch)")  # fmt: skip
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok", "degraded"]
     version: str
     database: DatabaseStatus
     llm: LLMStatus
     cms: CMSStatus | None = None
+    scheduler: SchedulerHealth | None = None
+
+
+# ── Phase 8: jobs and the schedule ───────────────────────────────────────────
+
+
+class PipelineRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_type: JobType = Field(default=JobType.FULL_PIPELINE, description="full_pipeline (default) or one stage: scan, analyze, opportunities, generate_articles, quality_check, publish")  # fmt: skip
+    dry_run: bool = Field(default=False, description="Planning mode: what would run now; no site fetched, no Gemini call, no CMS change, no allowance used")  # fmt: skip
+
+
+class PipelineRunResponse(BaseModel):
+    job: JobView
+    plan: PipelinePlan | None = Field(default=None, description="Present for a dry run")
+    message: str | None = None
+
+
+class PauseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(default=None, max_length=500)

@@ -11,7 +11,7 @@
   (succeeded, failed, or unknown and reconciled before any retry).
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import BigInteger, ForeignKey, Identity, Index, String, Text, text
@@ -92,6 +92,9 @@ class Publication(TimestampMixin, Base):
     run_id: Mapped[int | None] = mapped_column(ForeignKey("runs.id", ondelete="SET NULL"))
     superseded_by_id: Mapped[int | None] = mapped_column(ForeignKey("publications.id", ondelete="SET NULL"))  # fmt: skip
     published_at: Mapped[datetime | None]
+    # Phase 8: the local day (SCHEDULER_TIMEZONE) whose publishing allowance an automated
+    # publication reserved, under a lock, right before the CMS call.
+    limit_day: Mapped[date | None] = mapped_column(index=True)
 
 
 class PublicationAttempt(Base):
