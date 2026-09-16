@@ -131,7 +131,7 @@ class WordPressPublisher:
             return None
         return self._post(data)
 
-    async def resolve_terms(self, category: str | None, tags: Sequence[str], *, create: bool) -> TermResolution:  # fmt: skip
+    async def resolve_terms(self, category: str | None, tags: Sequence[str], *, create: bool, content_type: str | None = None) -> TermResolution:  # fmt: skip
         created: list[str] = []
         notes: list[str] = []
         chosen: TermRef | None = None

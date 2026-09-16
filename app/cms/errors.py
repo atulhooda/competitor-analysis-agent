@@ -62,6 +62,15 @@ class CMSResponseError(CMSPermanentError):
     """A response that isn't what the API promises (not JSON, missing fields, a redirect)."""
 
 
+class CMSDeploymentError(CMSPermanentError):
+    """The site's build or deployment of the change failed (GitHub publishing)."""
+
+
+class CMSProtectedError(CMSPermanentError):
+    """A deployment can't be verified because access to it is protected (Vercel
+    Deployment Protection): a person must decide, nothing is bypassed."""
+
+
 class CMSRateLimitError(CMSTransientError):
     pass
 

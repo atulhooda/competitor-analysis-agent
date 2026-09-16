@@ -146,8 +146,8 @@ def test_publishing_defaults_are_safe() -> None:
     from app.config import Settings
 
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
-    assert settings.wordpress_default_status == "draft"
-    assert not settings.wordpress_allow_direct_publish
+    assert settings.publish_default_status == "draft"
+    assert not settings.publish_allow_direct_publish
     assert not settings.publish_auto_approve
     assert settings.publish_draft_first
     assert not settings.wordpress_create_missing_terms
@@ -158,11 +158,11 @@ def test_publishing_defaults_are_safe() -> None:
 def test_publishing_settings_are_validated() -> None:
     from app.config import Settings
 
-    configured = Settings(_env_file=None, wordpress_base_url="https://Blog.Example.com/", wordpress_username="editor", wordpress_application_password="abcd efgh")  # type: ignore[call-arg]  # fmt: skip
+    configured = Settings(_env_file=None, cms_provider="wordpress", wordpress_base_url="https://Blog.Example.com/", wordpress_username="editor", wordpress_application_password="abcd efgh")  # type: ignore[call-arg]  # fmt: skip
     assert configured.cms_configured
     assert configured.cms_site == "https://blog.example.com"
     assert "abcd" not in repr(configured)  # the password is a secret
-    assert Settings(_env_file=None, wordpress_base_url="http://localhost:8080").cms_site == "http://localhost:8080"  # type: ignore[call-arg]  # fmt: skip
+    assert Settings(_env_file=None, cms_provider="wordpress", wordpress_base_url="http://localhost:8080").cms_site == "http://localhost:8080"  # type: ignore[call-arg]  # fmt: skip
     assert Settings(_env_file=None, wordpress_application_password=" ").wordpress_application_password is None  # type: ignore[call-arg]  # fmt: skip
     for bad, message in (
         ({"wordpress_base_url": "http://blog.example.com"}, "must use https"),
@@ -171,8 +171,8 @@ def test_publishing_settings_are_validated() -> None:
             "must not contain credentials",
         ),
         ({"wordpress_base_url": "ftp://blog.example.com"}, "http"),
-        ({"wordpress_default_status": "publish"}, "WORDPRESS_ALLOW_DIRECT_PUBLISH"),
+        ({"publish_default_status": "publish"}, "PUBLISH_ALLOW_DIRECT_PUBLISH"),
     ):
         with pytest.raises(ValueError, match=message):
             Settings(_env_file=None, **bad)  # type: ignore[arg-type]
-    assert Settings(_env_file=None, wordpress_default_status="publish", wordpress_allow_direct_publish=True).wordpress_default_status == "publish"  # type: ignore[call-arg]  # fmt: skip
+    assert Settings(_env_file=None, publish_default_status="publish", publish_allow_direct_publish=True).publish_default_status == "publish"  # type: ignore[call-arg]  # fmt: skip

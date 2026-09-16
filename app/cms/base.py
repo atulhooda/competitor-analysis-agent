@@ -1,9 +1,11 @@
-"""The CMS-neutral publishing interface (Phase 7).
+"""The target-neutral publishing interface (Phases 7-8).
 
-The application talks to ``PublishingService → CMSPublisher``. Only an adapter (so far
-``app.cms.wordpress``) knows its CMS's API, authentication, fields, post ids, statuses and
-quirks. Everything here is in neutral terms: a post has a string external id and a
-``CMSPostStatus``; terms (categories, tags) are resolved by name.
+The application talks to ``PublishingService → PublishingAdapter``. Only an adapter
+(``app.cms.github``: the site's own repository; ``app.cms.wordpress``: the earlier CMS
+adapter) knows its target's API, authentication, fields, identifiers, statuses and quirks.
+Everything here is in neutral terms: a post has a string external id and a
+``CMSPostStatus``; terms (categories, tags) are resolved by name. ``CMSPublisher`` is the
+older name of the same protocol.
 """
 
 from collections.abc import Sequence
@@ -67,7 +69,10 @@ class CMSPublisher(Protocol):
 
     async def get_post(self, external_id: str) -> CMSPost | None: ...
 
-    async def resolve_terms(self, category: str | None, tags: Sequence[str], *, create: bool) -> TermResolution: ...  # fmt: skip
+    async def resolve_terms(self, category: str | None, tags: Sequence[str], *, create: bool, content_type: str | None = None) -> TermResolution:  # fmt: skip
+        """The target's category and tags for the article. ``content_type`` (the brief's
+        format) lets a target with a fixed category set choose by a fixed mapping."""
+        ...
 
     def build_payload(self, document: RenderedDocument, *, status: TargetStatus, terms: TermResolution, marker: str) -> dict[str, Any]: ...  # fmt: skip
 
@@ -84,3 +89,6 @@ class CMSPublisher(Protocol):
     async def update_post(self, external_id: str, payload: dict[str, Any]) -> CMSPost: ...
 
     async def aclose(self) -> None: ...
+
+
+PublishingAdapter = CMSPublisher

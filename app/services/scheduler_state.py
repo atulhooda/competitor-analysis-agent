@@ -99,14 +99,14 @@ class SchedulerStateService:
         if paused:
             warnings.append(f"paused: {reason}")
         if settings.automated_publishing_enabled and not self._cms_configured:
-            warnings.append("AUTOMATED_PUBLISHING_ENABLED=true but WordPress isn't configured")
+            warnings.append(f"AUTOMATED_PUBLISHING_ENABLED=true but publishing isn't configured ({settings.cms_provider}): {settings.cms_hint}")  # fmt: skip
         if not self._llm_configured:
             warnings.append("GEMINI_API_KEY is not set: the analysis, generation and validation stages fail")  # fmt: skip
         if by_status.get(JobStatus.FAILED.value):
             warnings.append(f"{by_status[JobStatus.FAILED.value]} job(s) failed today: `jobs list --status failed`")  # fmt: skip
         if stuck:
             warnings.append(f"{stuck} running job(s) without a recent heartbeat: recovered by the worker once their process is gone")  # fmt: skip
-        target = "publish" if settings.wordpress_allow_direct_publish else settings.wordpress_default_status  # fmt: skip
+        target = "publish" if settings.publish_allow_direct_publish else settings.publish_default_status  # fmt: skip
         budget = settings.llm_daily_token_budget
         tokens_left = max(budget - used, 0) if budget > 0 else None
         return SchedulerStatus(
@@ -118,7 +118,7 @@ class SchedulerStateService:
             timezone=settings.scheduler_timezone,
             automated_publishing=settings.automated_publishing_enabled,
             auto_approve=settings.publish_auto_approve,
-            direct_publish=settings.wordpress_allow_direct_publish,
+            direct_publish=settings.publish_allow_direct_publish,
             publish_target=target,
             max_concurrent_pipelines=settings.max_concurrent_pipelines,
             llm_tokens_left_today=tokens_left,

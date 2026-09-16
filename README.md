@@ -8,9 +8,11 @@ opportunities, and generates and publishes original blog posts.
 > and stored in PostgreSQL; Gemini analyzes what competitors publish (Phase 3); opportunities
 > are scored deterministically (Phase 4); an **approved** opportunity becomes a researched,
 > cited, edited draft (Phase 5), which Phase 6 fact-checks, scores and revises until it is
-> `ready` or `needs_review`. Phase 7 sends a ready article to WordPress once its exact version
-> is approved. Phase 8 runs all of it on a schedule, within daily limits, and **everything
-> automatic is off by default**. **Phase 8 introduces autonomous scheduling and pipeline
+> `ready` or `needs_review`. Phase 7 publishes a ready article once its exact version is
+> approved: to **your own website's GitHub repository**, as a branch, an MDX file and a pull
+> request that a merge takes live (WordPress was the first adapter and is being retired).
+> Phase 8 runs all of it on a schedule, within daily limits, and **everything automatic is
+> off by default**. **Phase 8 introduces autonomous scheduling and pipeline
 > orchestration. Social media automation is intentionally deferred to Phase 9.** See
 > [MIGRATION_PLAN.md](MIGRATION_PLAN.md) for the architecture and roadmap.
 
@@ -158,22 +160,25 @@ completed article → fact-check → originality → SEO package → metrics →
 **Phase 6 validates and prepares articles but does not publish them.** See
 [Article validation](#article-validation).
 
-**Publishing (Phase 7).** Sends an approved, ready article to WordPress:
+**Publishing (Phase 7 + the GitHub adapter).** Sends an approved, ready article to your
+website's repository:
 
 ```
-ready article → approval (this exact version and quality report) → render (safe HTML)
-  → preflight → idempotency check → WordPress draft → verify → publication recorded
+ready article → approval (this exact version and quality report) → render (MDX)
+  → preflight → branch blog/<slug> → src/content/blog/<slug>.mdx → pull request
+  → Vercel preview verified → (merge → production deployment → live URL verified)
 ```
 
 - **Approved, exactly.** An approval covers one version and one quality report. A new
   version or a new validation voids it.
-- **Drafts by default.** A post is made public only when you ask for it and
-  `WORDPRESS_ALLOW_DIRECT_PUBLISH` is on.
-- **Never twice.** One publication per version and site; a lost response is reconciled,
-  never retried blindly.
+- **A pull request by default.** The post goes live only when you ask for it and
+  `PUBLISH_ALLOW_DIRECT_PUBLISH` is on; then the pull request is squash-merged and the live
+  page is checked before the publication counts.
+- **Never twice.** One publication per version and repository; a branch, a file, a pull
+  request and a merge are each looked up before they are made, so a lost answer or a crash
+  never creates a duplicate.
 
-**Phase 7 publishes only approved, ready article versions and defaults to WordPress drafts.**
-See [Publishing](#publishing).
+**Phase 7 publishes only approved, ready article versions.** See [Publishing](#publishing).
 
 **Scheduling and the autonomous pipeline (Phase 8).** Runs the whole chain on a schedule:
 
@@ -183,7 +188,7 @@ schedule → scan → analyze → opportunities → generate (top N) → validat
 ```
 
 - **Off by default.** `SCHEDULER_ENABLED=false`, `AUTOMATED_PUBLISHING_ENABLED=false`,
-  `PUBLISH_AUTO_APPROVE=false`, `WORDPRESS_ALLOW_DIRECT_PUBLISH=false`: nothing runs, and
+  `PUBLISH_AUTO_APPROVE=false`, `PUBLISH_ALLOW_DIRECT_PUBLISH=false`: nothing runs, and
   nothing is sent to WordPress, until you turn it on.
 - **Daily limits, per local day.** `MAX_ARTICLES_GENERATED_PER_DAY` (3) is applied before any
   article is written; `MAX_ARTICLES_PER_DAY` (1) counts successful public posts and is
@@ -356,7 +361,7 @@ uv run python -m app articles seo 1                  # keywords + evidence, meta
 uv run python -m app articles revisions 1            # the edited version and every revision, with scores
 uv run python -m app articles revise 1 --note "..."  # one more revision of the recommended version
 
-# Approval and publishing (WordPress drafts by default)
+# Approval and publishing (a pull request on the site's repository by default)
 uv run python -m app articles approval 1             # recommended version, score, gates, approval state
 uv run python -m app articles approve 1 --note "..." # approve that exact version (asks to confirm; --yes)
 uv run python -m app articles reject 1 --note "..."  # reject it, with a reason
@@ -364,7 +369,7 @@ uv run python -m app articles approvals 1            # every decision, and why i
 uv run python -m app articles preflight 1            # every check, WordPress included (read-only)
 uv run python -m app articles publish 1 --dry-run    # preflight + rendered HTML + WordPress request; changes nothing
 uv run python -m app articles publish 1              # create or update the WordPress draft
-uv run python -m app articles publish 1 --status publish   # make it public (needs WORDPRESS_ALLOW_DIRECT_PUBLISH)
+uv run python -m app articles publish 1 --status publish   # make it public (needs PUBLISH_ALLOW_DIRECT_PUBLISH)
 uv run python -m app articles publication 1          # post id, URL, what was mapped, every attempt
 uv run python -m app articles publications 1         # every publication (one per version and site)
 
@@ -1109,22 +1114,46 @@ factual claims). One revision fixed them (29 of 30 claims supported), and the sc
 
 ## Publishing
 
-Phase 7 turns an approved, ready article version into a WordPress post. **Phase 7 publishes
-only approved, ready article versions and defaults to WordPress drafts. Scheduling is not
-included.** Nothing is posted to social media.
+Phase 7 turns an approved, ready article version into a post on your website. The core
+(approval, preflight, idempotency, the publication ledger, verification) is target-neutral;
+an adapter knows the target. **The GitHub adapter is the publishing target** (`CMS_PROVIDER=
+github`, the default): the site's own repository. The WordPress adapter was the first one
+and is kept only until it is removed. **Phase 7 publishes only approved, ready article
+versions.** Nothing is posted to social media.
 
 ### The flow
 
 ```
 article (ready)
   → recommended version → its current quality report → a live approval of both
-  → render (CMS-neutral safe HTML + metadata)
+  → render (target-neutral: safe HTML, MDX-safe Markdown, metadata)
   → preflight (article, version, quality, approval, content, citations, links, SEO fields,
-               target status, CMS config, WordPress itself, the post, the slug, category,
-               tags, idempotency)
-  → idempotency check → create or update the WordPress draft → verify it → record it
+               target status, the target's config and access, the existing post, the slug,
+               category, tags, idempotency)
+  → idempotency check → create or update the draft → verify it → record it
   (→ make it public, only if asked and allowed → verify → mark the opportunity used)
 ```
+
+### GitHub: the site's repository
+
+The website (Next.js, deployed by Vercel) keeps its posts as `src/content/blog/<slug>.mdx`
+files. The adapter ([app/cms/github/](app/cms/github/)) publishes the way a person would:
+
+| Step | What happens |
+|---|---|
+| File | `<slug>.mdx` in the content directory: the site's frontmatter contract (`title`, `description`, `publishedAt` as a quoted ISO date, the configured author, `category` from a fixed mapping, 3–6 lowercase `tags`, `draft: false`), the article body (intro paragraphs, H2/H3, lists, inline source links, FAQ), a "Related reading" list of existing site pages, exactly one `<BlogCTA />` and a closing italic byline. Two keys the site ignores carry ownership: `agentPublication` (the publication's marker) and `agentSource` |
+| Draft | Branch `blog/<slug>` from `main`, commit `Add blog post: <title>`, a pull request whose description carries the article's provenance (score, opportunity, sources, expected URL). The branch's **Vercel preview deployment** must succeed and serve the post before the draft counts as verified |
+| Publish | Only with `PUBLISH_ALLOW_DIRECT_PUBLISH=true`: the pull request is **squash-merged**, the production deployment of the merge commit must succeed, and `https://<site>/blog/<slug>` must return the page (200, title, canonical URL, published metadata). Only then is the publication `published`; merged but not verified stays an unknown outcome the next run resolves |
+| Category | Never the model's choice: guides, how-tos and everything else → `Playbook`; comparisons → `Comparison`; data-led research → `Industry Data`. `Product`, `Announcements` and `Research Paper` are never chosen automatically |
+| Slug | The Phase 6 SEO slug under the site's rules (lowercase ASCII, `[a-z0-9-]`, no leading, trailing or double dash). The filename is the URL; a slug already used by a post that isn't the agent's blocks publishing |
+| Internal links | Only to pages in the site's sitemap (read at preflight) or its blog directory; others become plain text. Source citations are ordinary Markdown links to the stored sources |
+| Safety | Prose is escaped so it can never become JSX, an `import`/`export` line, a Markdown block or an autolink; the whole file is validated (frontmatter round-trip, one CTA, no stray brace or tag) before it is written. The site's own build is the last gate |
+| Idempotency | The branch, the file, the pull request and the merge are each looked up before they are made. A lost answer, a crash after the branch, after the commit or after the pull request, a lost pull request number or a merge that timed out all reconcile against `main`, the `blog/*` branches, open pull requests and the marker in the frontmatter |
+| Protection | If Vercel's Deployment Protection blocks the preview, the run stops with a clear error and nothing is merged: nothing is bypassed |
+| Token | `GITHUB_TOKEN`, a fine-grained personal access token for that one repository with *Contents* and *Pull requests* read/write, sent to `api.github.com` only. The site and its previews are fetched without credentials |
+
+`articles publish <id> --dry-run` shows the exact MDX file, branch and pull request title
+without touching GitHub.
 
 The API queues publishing in the background (`202`, `{"publication_id": ..., "status":
 "queued"}`); the CLI runs it straight away. One run per article at a time: publishing shares
@@ -1155,7 +1184,7 @@ publication already in progress.
   article with no decision records an automatic approval (method `auto`). It never overrides
   a rejection, and it still needs an explicit publish request: nothing publishes by itself.
 
-### WordPress setup
+### WordPress setup (the earlier adapter, `CMS_PROVIDER=wordpress`)
 
 1. Use a WordPress site served over **HTTPS**. Application Passwords need HTTPS (http is
    accepted here only for `localhost`).
@@ -1183,13 +1212,13 @@ never followed).
 
 ### Drafts and direct publishing
 
-- **Draft by default.** `WORDPRESS_DEFAULT_STATUS=draft`. `pending` leaves the post "Pending
+- **Draft by default.** `PUBLISH_DEFAULT_STATUS=draft`. `pending` leaves the post "Pending
   Review" in WordPress.
 - **Making a post public.** Use `--status publish` / `{"status": "publish"}`, which needs
-  **`WORDPRESS_ALLOW_DIRECT_PUBLISH=true`**. With `PUBLISH_DRAFT_FIRST=true` (default) the
+  **`PUBLISH_ALLOW_DIRECT_PUBLISH=true`**. With `PUBLISH_DRAFT_FIRST=true` (default) the
   draft is written and verified first, then made public and verified again.
 - **Fully automatic publication** needs both switches, `PUBLISH_AUTO_APPROVE=true` and
-  `WORDPRESS_ALLOW_DIRECT_PUBLISH=true` (plus `WORDPRESS_DEFAULT_STATUS=publish`), and still
+  `PUBLISH_ALLOW_DIRECT_PUBLISH=true` (plus `PUBLISH_DEFAULT_STATUS=publish`), and still
   an explicit publish request. Phase 7 has no scheduler.
 - **A public post is never taken back to draft.** Updating a public post needs the publish
   target.
@@ -1375,13 +1404,13 @@ review:
 SCHEDULER_ENABLED=true
 FULL_PIPELINE_SCHEDULE=0 6 * * *     # 06:00 every day, in SCHEDULER_TIMEZONE
 AUTOMATED_PUBLISHING_ENABLED=true    # the pipeline may send articles to WordPress...
-# WORDPRESS_ALLOW_DIRECT_PUBLISH=false (default): ...as drafts only
+# PUBLISH_ALLOW_DIRECT_PUBLISH=false (default): ...as drafts only
 # PUBLISH_AUTO_APPROVE=false (default): only articles a person approved
 ```
 
 Then start the worker next to the API: `uv run python -m app worker`. Fully automatic public
 posting needs all four of `AUTOMATED_PUBLISHING_ENABLED`, `PUBLISH_AUTO_APPROVE`,
-`WORDPRESS_ALLOW_DIRECT_PUBLISH` and a non-zero `MAX_ARTICLES_PER_DAY`. Check what a run would
+`PUBLISH_ALLOW_DIRECT_PUBLISH` and a non-zero `MAX_ARTICLES_PER_DAY`. Check what a run would
 do with `pipeline run --dry-run` first.
 
 ### Schedules and time zones
@@ -1606,13 +1635,21 @@ All settings are environment variables (or `.env`); see [`.env.example`](.env.ex
 | `ORIGINALITY_COMMON_DOC_FREQUENCY` / `_MIN_PASSAGE_WORDS` | `3` / `12` | Pages that make a phrase common; shortest passage checked |
 | `SEO_TITLE_MAX_CHARS` / `SEO_DESCRIPTION_MIN_CHARS` / `_MAX_CHARS` | `60` / `70` / `160` | Meta tag lengths |
 | `SEO_MAX_KEYWORD_DENSITY` | `0.03` | Keyword density above which repetition is stuffing |
-| `CMS_PROVIDER` | `wordpress` | The CMS publishing goes to (WordPress only, so far) |
+| `CMS_PROVIDER` | `github` | The publishing target: `github` (the site's repository) or `wordpress` (the earlier adapter) |
+| `PUBLISH_SITE_URL` | *(empty)* | The public site the articles appear on (live-URL verification, internal links) |
+| `GITHUB_REPO` / `GITHUB_TOKEN` | *(empty)* | The site's repository (`owner/name`) and a fine-grained token with Contents and Pull requests read/write on it (secret; never logged) |
+| `GITHUB_BASE_BRANCH` / `GITHUB_CONTENT_DIR` / `GITHUB_BRANCH_PREFIX` | `main` / `src/content/blog` / `blog/` | Where posts live and the branch each is proposed on |
+| `GITHUB_API_URL` | `https://api.github.com` | The API host (GitHub Enterprise only) |
+| `GITHUB_DEPLOY_TIMEOUT_SECONDS` / `GITHUB_DEPLOY_POLL_SECONDS` | `900` / `15` | Waiting for Vercel's preview or production deployment |
+| `PUBLISH_AUTHOR_NAME` / `_ROLE` / `_INITIALS` / `_LINKEDIN` | `Engageo Team` / `AI Content` / `EN` / *(empty)* | The byline of agent-written posts (configuration, never model output) |
+| `PUBLISH_CTA_TITLE` / `_BODY` / `_LABEL` / `_HREF` | see `.env.example` | The one call-to-action block every post ends with |
+| `PUBLISH_BYLINE` | see `.env.example` | The closing italic byline paragraph |
 | `CMS_REQUEST_TIMEOUT` / `CMS_MAX_RETRIES` | `30` / `2` | Seconds per CMS request; retries of transient failures only |
 | `WORDPRESS_BASE_URL` | *(empty)* | Your site (https; http only for localhost; no credentials in it) |
 | `WORDPRESS_USERNAME` / `WORDPRESS_APPLICATION_PASSWORD` | *(empty)* | The WordPress user and an Application Password (secret; never logged or stored) |
-| `WORDPRESS_DEFAULT_STATUS` | `draft` | `draft`, `pending` or `publish` (`publish` needs `WORDPRESS_ALLOW_DIRECT_PUBLISH`) |
+| `PUBLISH_DEFAULT_STATUS` | `draft` | `draft` (GitHub: a pull request with a verified preview), `pending` or `publish` (`publish` needs `PUBLISH_ALLOW_DIRECT_PUBLISH`) |
 | `WORDPRESS_DEFAULT_AUTHOR_ID` / `WORDPRESS_DEFAULT_CATEGORY_ID` | *(empty)* | Post author; category when the SEO package has none |
-| `WORDPRESS_ALLOW_DIRECT_PUBLISH` | `false` | Required to make a post public |
+| `PUBLISH_ALLOW_DIRECT_PUBLISH` | `false` | Required to make a post public (GitHub: to merge the pull request) |
 | `WORDPRESS_CREATE_MISSING_TERMS` | `false` | Create missing categories and tags (else a missing category blocks; missing tags are left out) |
 | `PUBLISH_AUTO_APPROVE` | `false` | Approve ready articles automatically when publishing (never over a rejection) |
 | `PUBLISH_DRAFT_FIRST` | `true` | Going public: a verified draft first |
@@ -1719,7 +1756,8 @@ app/
     quality_decision.py        score, gates, issue order, best-version choice (no LLM)
     quality_review.py          the Gemini judge and revisions
     approvals.py, approval_rules.py   approval decisions and when they stop applying
-    article_render.py          CMS-neutral safe HTML: citations, sources, links, FAQ (no LLM)
+    article_render.py          target-neutral safe HTML: citations, sources, links, FAQ (no LLM)
+    article_markdown.py        the same body as MDX-safe Markdown: escaping, inline citations
     publishing.py              publishing runs: preflight, idempotency, reconciliation, verify
     daily_limits.py            daily allowances per local day; the atomic publishing slot
     jobs.py                    jobs: queue, claim, locks, heartbeat, retries, recovery, cancel
@@ -1727,9 +1765,11 @@ app/
     scheduler_state.py         pause / resume and the status dashboard
   scheduling/                  schedules and days (cron, time zones), retry policy, the
                                APScheduler worker, wiring
-  cms/                         CMS-neutral interface (CMSPublisher) and the WordPress adapter
-    wordpress/client.py        REST API: auth, bounded retries, error mapping, read-only mode
-    wordpress/publisher.py     posts, categories, tags, payloads, ownership, verification
+  cms/                         target-neutral interface (PublishingAdapter) and its adapters
+    github/client.py           GitHub REST API: token, bounded read retries, error mapping, read-only
+    github/mdx.py              the site's content contract: frontmatter, slug, category, safety
+    github/publisher.py        branch, file, pull request, merge, Vercel deployments, live checks
+    wordpress/                 the earlier adapter (client, publisher), kept until removed
   prompts/                     versioned prompts + their structured-output schemas
   db/                          models (by layer), sessions, advisory locks, queries, migrations
   llm/                         provider-agnostic LLM interface + Gemini provider

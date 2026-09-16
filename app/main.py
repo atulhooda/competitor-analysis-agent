@@ -133,10 +133,11 @@ def _log_startup(settings: Settings) -> None:
         llm_configured=settings.llm_configured,  # never log the key itself
         llm_daily_token_budget=settings.llm_daily_token_budget,
         cms_provider=settings.cms_provider,
-        cms_configured=settings.cms_configured,  # never log the site credentials
-        publish_default_status=settings.wordpress_default_status,
+        cms_configured=settings.cms_configured,  # never log the credentials or the token
+        cms_site=settings.cms_site,
+        publish_default_status=settings.publish_default_status,
         publish_auto_approve=settings.publish_auto_approve,
-        publish_direct_allowed=settings.wordpress_allow_direct_publish,
+        publish_direct_allowed=settings.publish_allow_direct_publish,
         scheduler_enabled=settings.scheduler_enabled,
         scheduler_timezone=settings.scheduler_timezone,
         automated_publishing=settings.automated_publishing_enabled,

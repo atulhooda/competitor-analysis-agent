@@ -196,7 +196,7 @@ async def test_a_generation_limit_of_zero_writes_nothing(rig: Rig) -> None:
 
 
 async def test_without_direct_publishing_the_pipeline_leaves_drafts(rig: Rig) -> None:
-    job = await rig.run(wordpress_allow_direct_publish=False)
+    job = await rig.run(publish_allow_direct_publish=False)
     assert job.status is JobStatus.COMPLETED, job.last_error
     [article] = await rig.articles()
     assert summary(job, "publish")["drafts"] == [article.id]

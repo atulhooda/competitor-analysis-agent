@@ -289,11 +289,11 @@ class PipelineService:
             await asyncio.sleep(1.0)
 
     def _publish_target(self) -> TargetStatus:
-        """Public only with WORDPRESS_ALLOW_DIRECT_PUBLISH; otherwise WORDPRESS_DEFAULT_STATUS
+        """Public only with PUBLISH_ALLOW_DIRECT_PUBLISH; otherwise PUBLISH_DEFAULT_STATUS
         (a draft by default)."""
-        if self._settings.wordpress_allow_direct_publish:
+        if self._settings.publish_allow_direct_publish:
             return TargetStatus.PUBLISH
-        return TargetStatus(self._settings.wordpress_default_status)
+        return TargetStatus(self._settings.publish_default_status)
 
     # ── stages ───────────────────────────────────────────────────────────────
 
@@ -543,7 +543,7 @@ class PipelineService:
         if limit == 0:
             return StageResult(StageStatus.SKIPPED, {"limit": 0}, ["MAX_ARTICLES_PER_DAY=0: nothing is published"])  # fmt: skip
         if not self._s.cms.configured:
-            return _failed("AUTOMATED_PUBLISHING_ENABLED=true but WordPress isn't configured (WORDPRESS_BASE_URL, WORDPRESS_USERNAME, WORDPRESS_APPLICATION_PASSWORD)", ErrorKind.PERMANENT)  # fmt: skip
+            return _failed(f"AUTOMATED_PUBLISHING_ENABLED=true but publishing isn't configured: {self._s.cms.configuration_hint}", ErrorKind.PERMANENT)  # fmt: skip
         target = self._publish_target()
         progress = self._progress(ctx, Stage.PUBLISH)
         done: dict[str, dict[str, Any]] = dict(progress.get("done") or {})
@@ -696,7 +696,7 @@ class PipelineService:
         if not settings.publish_auto_approve:
             notes.append("PUBLISH_AUTO_APPROVE=false: only articles a person approved are sent")
         if target is not TargetStatus.PUBLISH:
-            notes.append(f"WORDPRESS_ALLOW_DIRECT_PUBLISH=false: posts are left as {target.value}s (they don't count toward MAX_ARTICLES_PER_DAY)")  # fmt: skip
+            notes.append(f"PUBLISH_ALLOW_DIRECT_PUBLISH=false: posts are left as {target.value}s (they don't count toward MAX_ARTICLES_PER_DAY)")  # fmt: skip
         if spent := await self._budget_spent():
             notes.append(f"Gemini stages would be skipped: {spent}")
         return PipelinePlan(

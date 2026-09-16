@@ -61,8 +61,8 @@ class TargetStatus(StrEnum):
     """Where publishing leaves the CMS post."""
 
     DRAFT = "draft"
-    PENDING = "pending"  # WordPress "Pending Review"
-    PUBLISH = "publish"  # public: needs WORDPRESS_ALLOW_DIRECT_PUBLISH
+    PENDING = "pending"  # a review state where the target has one (WordPress "Pending Review"); otherwise a draft
+    PUBLISH = "publish"  # public (GitHub: merged and deployed): needs PUBLISH_ALLOW_DIRECT_PUBLISH
 
 
 class CMSPostStatus(StrEnum):
@@ -124,6 +124,15 @@ class RenderedDocument(BaseModel):
     category: str | None
     tags: list[str]
     body_html: str = Field(description="Escaped HTML, without the H1 (the CMS shows the title)")
+    body_markdown: str = Field(default="", description="The same body as MDX-safe Markdown (file-based targets); no H1, no frontmatter")  # fmt: skip
+    headings: list[str] = Field(default_factory=list, description="The H2 texts, in order")
+    secondary_keywords: list[str] = Field(default_factory=list)
+    # Provenance for the target (a PR description, a review note): set by the publisher.
+    article_id: int | None = None
+    version_id: int | None = None
+    content_type: str | None = Field(default=None, description="The brief's content format (guide, comparison, ...)")  # fmt: skip
+    quality_score: float | None = None
+    opportunity_title: str | None = None
     sources: list[RenderedSource]
     faq: list[RenderedFAQ]
     links: list[RenderedLink]

@@ -21,7 +21,7 @@ never retried blindly: the post is looked up by slug and marker first and adopte
 A post that isn't ours is never updated, even if its slug matches.
 
 **Draft first.** Publishing leaves a draft unless the target is ``publish``, which needs
-``WORDPRESS_ALLOW_DIRECT_PUBLISH``; with ``PUBLISH_DRAFT_FIRST`` (default) the draft is
+``PUBLISH_ALLOW_DIRECT_PUBLISH``; with ``PUBLISH_DRAFT_FIRST`` (default) the draft is
 written and verified before it goes public. A public post is never taken back to draft.
 """
 
@@ -152,6 +152,7 @@ class _Snapshot:
     lineage: Publication | None  # the article's latest publication that reached the CMS
     marker: str
     key: str | None
+    opportunity_title: str | None = None
 
 
 @dataclass
@@ -189,7 +190,7 @@ class PublishingService:
         self._approvals = ApprovalService(sessions, settings, now=now)
 
     def _target(self, target: TargetStatus | str | None) -> TargetStatus:
-        return TargetStatus(target or self._settings.wordpress_default_status)
+        return TargetStatus(target or self._settings.publish_default_status)
 
     # ── read-only ────────────────────────────────────────────────────────────
 
@@ -226,7 +227,7 @@ class PublishingService:
         call. Publications made by hand keep Phase 7's behavior (they still count)."""
         wanted = self._target(target)
         if not self._cms.configured:
-            raise CMSConfigurationError("WordPress isn't configured: set WORDPRESS_BASE_URL, WORDPRESS_USERNAME and WORDPRESS_APPLICATION_PASSWORD (an Application Password)")  # fmt: skip
+            raise CMSConfigurationError(self._cms.configuration_hint)
         now = self._now()
         async with self._sessions() as session, session.begin():
             article = await session.get(Article, article_id, with_for_update=True)
@@ -248,8 +249,8 @@ class PublishingService:
             problem = authorization_problem(article, snap.report, approval or snap.live)
             if problem or approval is None:
                 raise ApprovalRequiredError(f"Article {article_id} can't be published: {problem}")
-            if wanted is TargetStatus.PUBLISH and not self._settings.wordpress_allow_direct_publish:
-                raise PublishingConflictError("Making a post public needs WORDPRESS_ALLOW_DIRECT_PUBLISH=true (drafts don't)")  # fmt: skip
+            if wanted is TargetStatus.PUBLISH and not self._settings.publish_allow_direct_publish:
+                raise PublishingConflictError("Making a post public needs PUBLISH_ALLOW_DIRECT_PUBLISH=true (drafts don't)")  # fmt: skip
             if snap.version is None or snap.key is None:
                 raise PublishingConflictError(f"Article {article_id} has no publishable version")
             publication = snap.publication
@@ -620,6 +621,7 @@ class PublishingService:
         publication = await session.scalar(select(Publication).where(Publication.idempotency_key == key)) if key else None  # fmt: skip
         lineage = await session.scalar(select(Publication).where(Publication.article_id == article_id, Publication.cms == self._cms.name, Publication.site == site, Publication.external_id.is_not(None)).order_by(Publication.id.desc()).limit(1))  # fmt: skip
         existing_marker = publication or lineage or await session.scalar(select(Publication).where(Publication.article_id == article_id, Publication.site == site).order_by(Publication.id.desc()).limit(1))  # fmt: skip
+        opportunity = await session.get(Opportunity, article.opportunity_id)
         return _Snapshot(
             article=article,
             version=version,
@@ -634,12 +636,16 @@ class PublishingService:
             lineage=lineage,
             marker=existing_marker.marker if existing_marker is not None else uuid.uuid4().hex,
             key=key,
+            opportunity_title=opportunity.title if opportunity is not None else None,
         )
 
     def _render(self, snap: _Snapshot) -> RenderedDocument | None:
         if snap.content is None:
             return None
-        return render_article(snap.content, sources=snap.sources, seo=snap.seo.package if snap.seo else None, allowed_internal=snap.allowed_internal, allowed_external=snap.allowed_external)  # fmt: skip
+        doc = render_article(snap.content, sources=snap.sources, seo=snap.seo.package if snap.seo else None, allowed_internal=snap.allowed_internal, allowed_external=snap.allowed_external)  # fmt: skip
+        # Provenance the target may show (a pull request description): no secret, no id
+        # the reader can't use.
+        return doc.model_copy(update={"article_id": snap.article.id, "version_id": snap.version.id if snap.version else None, "content_type": snap.article.content_type, "quality_score": snap.report.overall_score if snap.report else None, "opportunity_title": snap.opportunity_title})  # fmt: skip
 
     # ── preflight ────────────────────────────────────────────────────────────
 
@@ -678,8 +684,8 @@ class PublishingService:
         seo = snap.seo.package if snap.seo else None
         missing = [name for name, value in (("primary keyword", seo.primary_keyword if seo else ""), ("meta title", seo.meta_title if seo else ""), ("meta description", seo.meta_description if seo else ""), ("slug", seo.slug if seo else "")) if not value.strip()]  # fmt: skip
         add("seo", not missing, f"keyword '{seo.primary_keyword}', meta title and description, slug '{doc.slug if doc else seo.slug}'" if seo and not missing else f"missing: {', '.join(missing)}")  # fmt: skip
-        if target is TargetStatus.PUBLISH and not s.wordpress_allow_direct_publish:
-            add("target_status", False, "making a post public needs WORDPRESS_ALLOW_DIRECT_PUBLISH=true")  # fmt: skip
+        if target is TargetStatus.PUBLISH and not s.publish_allow_direct_publish:
+            add("target_status", False, "making a post public needs PUBLISH_ALLOW_DIRECT_PUBLISH=true")  # fmt: skip
         else:
             add("target_status", True, f"leaves the post as {target.value}" + (" (a verified draft first)" if target is TargetStatus.PUBLISH and s.publish_draft_first else ""))  # fmt: skip
         add("cms_config", self._cms.configured, f"{self._cms.name} at {self._cms.site}" if self._cms.configured else "WordPress isn't configured: set WORDPRESS_BASE_URL, WORDPRESS_USERNAME and WORDPRESS_APPLICATION_PASSWORD")  # fmt: skip
@@ -728,7 +734,7 @@ class PublishingService:
                 add("post", False, f"{publisher.name} post {known} no longer carries this system's marker (edited outside?): it won't be overwritten")  # fmt: skip
                 post = None
             elif post.status is CMSPostStatus.PUBLISHED and target is not TargetStatus.PUBLISH:
-                add("post", False, f"post {known} is public: updating a public post needs the publish target (and WORDPRESS_ALLOW_DIRECT_PUBLISH); it is never taken back to {target.value}")  # fmt: skip
+                add("post", False, f"post {known} is public: updating a public post needs the publish target (and PUBLISH_ALLOW_DIRECT_PUBLISH); it is never taken back to {target.value}")  # fmt: skip
             else:
                 if post.status is CMSPostStatus.PUBLISHED and post.slug and post.slug != doc.slug:
                     slug = post.slug
@@ -747,7 +753,7 @@ class PublishingService:
             add("slug", False, f"slug '{slug}' is used by {publisher.name} post(s) {', '.join(p.external_id for p in foreign)} not created by this system: rename one of them (it is never overwritten)")  # fmt: skip
         else:
             add("slug", True, f"slug '{slug}' is free" if post is None else f"slug '{slug}' is this article's")  # fmt: skip
-        terms = await publisher.resolve_terms(doc.category, doc.tags, create=False)
+        terms = await publisher.resolve_terms(doc.category, doc.tags, create=False, content_type=doc.content_type)  # fmt: skip
         create = s.wordpress_create_missing_terms
         if terms.missing_category:
             add("category", create, f"category '{terms.missing_category}' isn't in {publisher.name}" + (": it will be created" if create else ": create it there, or set WORDPRESS_CREATE_MISSING_TERMS=true"))  # fmt: skip

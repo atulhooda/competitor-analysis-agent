@@ -250,7 +250,7 @@ async def test_the_status_shows_switches_counts_next_runs_and_warnings(sched: Sc
     assert schedule.expression == "0 6 * * *"
     assert schedule.last_status is JobStatus.COMPLETED
     assert schedule.next_runs[0] == datetime(2026, 9, 15, 0, 30, tzinfo=UTC)
-    assert any("WordPress isn't configured" in w for w in status.warnings)
+    assert any("publishing isn't configured (github)" in w for w in status.warnings)
     listing = await scheduling.state.schedules(count=3)
     assert [r - listing[0].next_runs[0] for r in listing[0].next_runs] == [timedelta(0), timedelta(days=1), timedelta(days=2)]  # fmt: skip
 

@@ -50,12 +50,13 @@ class Rig:
     # Automated publishing fully on (the tests turn switches off one at a time), one article
     # generated and published per day, only the approved opportunity eligible.
     DEFAULTS: ClassVar[dict[str, Any]] = {
+        "cms_provider": "wordpress",
         "wordpress_base_url": BASE,
         "wordpress_username": USERNAME,
         "wordpress_application_password": PASSWORD,
         "cms_max_retries": 1,
         "automated_publishing_enabled": True,
-        "wordpress_allow_direct_publish": True,
+        "publish_allow_direct_publish": True,
         "publish_auto_approve": True,
         "pipeline_approve_opportunities": False,
         "max_articles_generated_per_day": 1,

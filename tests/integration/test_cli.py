@@ -427,7 +427,7 @@ def test_publishing_commands(configured: Path, monkeypatch: pytest.MonkeyPatch, 
     from tests.fakewordpress import BASE, PASSWORD, USERNAME, FakeWordPress
     from tests.pipeline import ARTICLE_COMPANY
 
-    settings = cli_module.get_settings().model_copy(update={"wordpress_base_url": BASE, "wordpress_username": USERNAME, "wordpress_application_password": SecretStr(PASSWORD), "cms_max_retries": 0})  # fmt: skip
+    settings = cli_module.get_settings().model_copy(update={"cms_provider": "wordpress", "wordpress_base_url": BASE, "wordpress_username": USERNAME, "wordpress_application_password": SecretStr(PASSWORD), "cms_max_retries": 0})  # fmt: skip
     monkeypatch.setattr("app.cli.get_settings", lambda: settings)
     fake = FakeLLM()
     monkeypatch.setattr("app.cli.LazyLLM", functools.partial(LazyLLM, provider=fake))

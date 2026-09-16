@@ -60,7 +60,7 @@ class Pub:
         return self.world.article_id
 
     def settings(self, **overrides: Any) -> Settings:
-        values: dict[str, Any] = {"wordpress_base_url": BASE, "wordpress_username": USERNAME, "wordpress_application_password": PASSWORD, "cms_max_retries": 1}  # fmt: skip
+        values: dict[str, Any] = {"cms_provider": "wordpress", "wordpress_base_url": BASE, "wordpress_username": USERNAME, "wordpress_application_password": PASSWORD, "cms_max_retries": 1}  # fmt: skip
         values.update(overrides)
         return make_settings(database_url=self.world.env.settings.database_url.get_secret_value(), **values)  # fmt: skip
 
@@ -256,7 +256,7 @@ async def test_preflight_blocks_with_reasons(pub: Pub) -> None:
     assert not report.ready
     failed = {c.name: c.detail for c in report.checks if not c.passed and c.blocking}
     assert "approve it first" in failed["approval"]
-    assert "WORDPRESS_ALLOW_DIRECT_PUBLISH" in failed["target_status"]
+    assert "PUBLISH_ALLOW_DIRECT_PUBLISH" in failed["target_status"]
     unconfigured = PublishingService(pub.world.env.engine, pub.world.env.sessions, pub.world.settings(), LazyCMS(pub.world.settings()))  # type: ignore[arg-type]  # fmt: skip
     offline = await unconfigured.preflight(pub.article_id)
     assert {c.name for c in offline.checks if not c.passed} >= {"cms_config", "cms"}
@@ -449,11 +449,11 @@ async def test_missing_tags_are_left_out_with_a_warning(pub: Pub) -> None:
 
 async def test_going_public_needs_the_switch_and_goes_through_a_verified_draft(pub: Pub) -> None:
     await pub.approve()
-    with pytest.raises(PublishingConflictError, match="WORDPRESS_ALLOW_DIRECT_PUBLISH"):
+    with pytest.raises(PublishingConflictError, match="PUBLISH_ALLOW_DIRECT_PUBLISH"):
         await pub.publish(TargetStatus.PUBLISH)
     assert pub.wp.calls == []
 
-    _, outcome = await pub.publish(TargetStatus.PUBLISH, wordpress_allow_direct_publish=True)
+    _, outcome = await pub.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True)
 
     assert outcome.status is PublicationStatus.PUBLISHED, outcome.error
     [post] = pub.wp.posts.values()
@@ -473,7 +473,7 @@ async def test_going_public_needs_the_switch_and_goes_through_a_verified_draft(p
 
 async def test_direct_publication_without_a_draft_first(pub: Pub) -> None:
     await pub.approve()
-    _, outcome = await pub.publish(TargetStatus.PUBLISH, wordpress_allow_direct_publish=True, publish_draft_first=False)  # fmt: skip
+    _, outcome = await pub.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True, publish_draft_first=False)  # fmt: skip
     assert outcome.status is PublicationStatus.PUBLISHED
     assert await pub.attempts(outcome.publication_id) == [("create", "succeeded")]
 
@@ -481,7 +481,7 @@ async def test_direct_publication_without_a_draft_first(pub: Pub) -> None:
 async def test_a_failed_publication_leaves_the_opportunity_alone(pub: Pub) -> None:
     await pub.approve()
     pub.wp.fail("update_post", 403, 403, 403)  # going public fails after the draft
-    _, outcome = await pub.publish(TargetStatus.PUBLISH, wordpress_allow_direct_publish=True)
+    _, outcome = await pub.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True)
     assert outcome.status is PublicationStatus.FAILED
     assert (await pub.opportunity()).status == "approved"
     assert [p["status"] for p in pub.wp.posts.values()] == ["draft"]
@@ -489,20 +489,20 @@ async def test_a_failed_publication_leaves_the_opportunity_alone(pub: Pub) -> No
 
 async def test_a_new_version_needs_a_new_approval_and_updates_the_same_post(pub: Pub) -> None:
     await pub.approve()
-    _, first = await pub.publish(TargetStatus.PUBLISH, wordpress_allow_direct_publish=True)
+    _, first = await pub.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True)
     post_id = first.external_id
     pub.world.fake.judge_default = 5
     await pub.world.revise(note="Add a short example")  # v2 is recommended and ready
     assert (await pub.article()).status == "ready"
 
     with pytest.raises(ApprovalRequiredError):  # v2 isn't approved: WordPress keeps v1
-        await pub.publish(TargetStatus.PUBLISH, wordpress_allow_direct_publish=True)
+        await pub.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True)
     with pytest.raises(PublishingConflictError):
         await pub.publish(TargetStatus.PUBLISH)  # and never without the switch
     assert len(pub.wp.posts) == 1
     await pub.approve("v2 reviewed")
 
-    _, second = await pub.publish(TargetStatus.PUBLISH, wordpress_allow_direct_publish=True)
+    _, second = await pub.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True)
 
     assert second.status is PublicationStatus.PUBLISHED, second.error
     assert second.publication_id != first.publication_id  # a new publication (v2)...
@@ -519,7 +519,7 @@ async def test_a_new_version_needs_a_new_approval_and_updates_the_same_post(pub:
 
 async def test_a_public_post_is_never_taken_back_to_draft(pub: Pub) -> None:
     await pub.approve()
-    await pub.publish(TargetStatus.PUBLISH, wordpress_allow_direct_publish=True)
+    await pub.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True)
     pub.world.fake.judge_default = 5
     await pub.world.revise(note="Add a short example")
     await pub.approve()

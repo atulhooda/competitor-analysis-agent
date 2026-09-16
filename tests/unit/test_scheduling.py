@@ -180,7 +180,7 @@ def test_backoff_doubles_and_is_capped() -> None:
 
 def test_the_defaults_are_the_safe_ones() -> None:
     s = make_settings()
-    assert (s.scheduler_enabled, s.automated_publishing_enabled, s.publish_auto_approve, s.wordpress_allow_direct_publish, s.publish_draft_first) == (False, False, False, False, True)  # fmt: skip
+    assert (s.scheduler_enabled, s.automated_publishing_enabled, s.publish_auto_approve, s.publish_allow_direct_publish, s.publish_draft_first) == (False, False, False, False, True)  # fmt: skip
     assert (s.max_articles_generated_per_day, s.max_articles_per_day, s.max_concurrent_pipelines, s.job_stale_after_minutes) == (3, 1, 1, 60)  # fmt: skip
     assert s.scheduler_timezone == "Asia/Kolkata"
     assert s.scheduler_tz == IST

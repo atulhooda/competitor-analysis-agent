@@ -168,7 +168,7 @@ async def run_worker(settings: Settings, *, stop: asyncio.Event | None = None) -
             with contextlib.suppress(NotImplementedError, RuntimeError):
                 loop.add_signal_handler(sig, stop.set)
                 handled.append(sig)
-        log.info("worker.started", enabled=settings.scheduler_enabled, timezone=settings.scheduler_timezone, schedules={s.setting.upper(): s.expression for s in worker.specs}, automated_publishing=settings.automated_publishing_enabled, auto_approve=settings.publish_auto_approve, direct_publish=settings.wordpress_allow_direct_publish, max_articles_generated_per_day=settings.max_articles_generated_per_day, max_articles_per_day=settings.max_articles_per_day, max_concurrent_pipelines=settings.max_concurrent_pipelines)  # fmt: skip
+        log.info("worker.started", enabled=settings.scheduler_enabled, timezone=settings.scheduler_timezone, schedules={s.setting.upper(): s.expression for s in worker.specs}, automated_publishing=settings.automated_publishing_enabled, auto_approve=settings.publish_auto_approve, direct_publish=settings.publish_allow_direct_publish, max_articles_generated_per_day=settings.max_articles_generated_per_day, max_articles_per_day=settings.max_articles_per_day, max_concurrent_pipelines=settings.max_concurrent_pipelines)  # fmt: skip
         if not settings.scheduler_enabled:
             log.warning("worker.schedules_disabled", detail="SCHEDULER_ENABLED=false: no schedule fires; queued jobs (manual runs, retries) still run")  # fmt: skip
         await worker.catch_up()

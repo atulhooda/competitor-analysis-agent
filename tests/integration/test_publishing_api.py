@@ -18,7 +18,7 @@ from tests.pipeline import ARTICLE_COMPANY
 
 @pytest.fixture
 async def client(db_url: str, clock: FakeClock) -> AsyncIterator[httpx.AsyncClient]:
-    settings: Settings = make_settings(app_env="development", database_url=db_url, wordpress_base_url=BASE, wordpress_username=USERNAME, wordpress_application_password=PASSWORD, cms_max_retries=0)  # fmt: skip
+    settings: Settings = make_settings(app_env="development", database_url=db_url, cms_provider="wordpress", wordpress_base_url=BASE, wordpress_username=USERNAME, wordpress_application_password=PASSWORD, cms_max_retries=0)  # fmt: skip
     fake = FakeLLM()
     async for c in client_for(settings, clock, fake):
         assert (await c.post("/api/v1/competitors", json={"slug": "acme", "name": "acme", "website": f"{SITE}/", "tracked_pages": [f"{SITE}/pricing"]})).status_code == 201  # fmt: skip
@@ -96,7 +96,7 @@ async def test_approve_preflight_and_publish_in_the_background(client: httpx.Asy
         assert [a["decision"] for a in approvals] == ["approved"]
         live = await client.post(f"/api/v1/articles/{article_id}/publish", json={"status": "publish"})  # fmt: skip
         assert live.status_code == 409
-        assert "WORDPRESS_ALLOW_DIRECT_PUBLISH" in live.json()["detail"]
+        assert "PUBLISH_ALLOW_DIRECT_PUBLISH" in live.json()["detail"]
 
 
 async def test_rejection_and_refusals(client: httpx.AsyncClient) -> None:
@@ -127,10 +127,11 @@ async def unconfigured(db_url: str, clock: FakeClock) -> AsyncIterator[httpx.Asy
 async def test_publishing_needs_the_cms_configured(unconfigured: httpx.AsyncClient) -> None:
     refused = await unconfigured.post("/api/v1/articles/1/publish")
     assert refused.status_code == 503
-    assert "WORDPRESS_BASE_URL" in refused.json()["detail"]
+    assert "GITHUB_REPO" in refused.json()["detail"]  # the GitHub adapter is the default target
+    assert "GITHUB_TOKEN" in refused.json()["detail"]
     assert PASSWORD not in refused.text
     health = (await unconfigured.get("/health")).json()
-    assert health["cms"] == {"provider": "wordpress", "configured": False}
+    assert health["cms"] == {"provider": "github", "configured": False}
 
 
 @pytest.fixture

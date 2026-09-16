@@ -45,6 +45,10 @@ QUALITY_COMPONENTS = (
 )
 
 
+_GITHUB_REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_BRANCH_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*/$")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -182,18 +186,44 @@ class Settings(BaseSettings):
     seo_max_keyword_density: float = Field(default=0.03, gt=0, le=0.2)
 
     # ── Publishing (Phase 7: approved, ready versions only; drafts by default) ─
-    cms_provider: Literal["wordpress"] = "wordpress"
+    # Where approved articles go: github (the site's own repository: a branch, an MDX file,
+    # a pull request, a merge) is the publishing target. wordpress is the earlier adapter,
+    # kept only until it is removed; it is never selected unless set explicitly.
+    cms_provider: Literal["github", "wordpress"] = "github"
     cms_request_timeout: float = Field(default=30.0, gt=0, le=300)  # seconds per CMS request
     cms_max_retries: int = Field(default=2, ge=0, le=5)  # transient failures only
+    # The public site the articles appear on (live-URL verification, internal links).
+    publish_site_url: str | None = None  # e.g. https://www.engageoagency.com
+    # GitHub: the site's repository and how posts are laid out in it.
+    github_repo: str | None = None  # owner/name, e.g. siddharthpathania/engageo-website
+    github_token: SecretStr | None = (
+        None  # fine-grained: Contents + Pull requests (read/write), this repo only
+    )
+    github_base_branch: str = "main"
+    github_content_dir: str = "src/content/blog"  # one <slug>.mdx per post
+    github_branch_prefix: str = "blog/"  # the branch of a post: blog/<slug>
+    github_api_url: str = "https://api.github.com"
+    github_deploy_timeout_seconds: int = Field(default=900, ge=30, le=3_600)  # waiting for Vercel
+    github_deploy_poll_seconds: float = Field(default=15.0, ge=0.5, le=120)
+    # The byline of agent-written posts: fixed configuration, never model output.
+    publish_author_name: str = "Engageo Team"
+    publish_author_role: str = "AI Content"
+    publish_author_initials: str = "EN"
+    publish_author_linkedin: str | None = None  # no profile for the team byline
+    publish_cta_title: str = "See Engageo in action"
+    publish_cta_body: str = "15 minutes, no deck. See how Engageo answers every missed call, follows up on WhatsApp and books the patient into your calendar."  # fmt: skip
+    publish_cta_label: str = "Book a demo"
+    publish_cta_href: str = "/contact?intent=demo"
+    publish_byline: str = "The Engageo Team builds AI missed-call recovery and WhatsApp automation for Indian clinics and hospitals. This article was researched and written with AI assistance and checked against its sources before publication."  # fmt: skip
     wordpress_base_url: str | None = None  # e.g. https://blog.example.com (no credentials)
     wordpress_username: str | None = None
     wordpress_application_password: SecretStr | None = None  # an Application Password
-    wordpress_default_status: Literal["draft", "pending", "publish"] = "draft"
+    publish_default_status: Literal["draft", "pending", "publish"] = "draft"
     wordpress_default_author_id: int | None = Field(default=None, ge=1)
     wordpress_default_category_id: int | None = Field(
         default=None, ge=1
     )  # when the SEO package has none
-    wordpress_allow_direct_publish: bool = False  # required to make a post public
+    publish_allow_direct_publish: bool = False  # required to make a post public
     wordpress_create_missing_terms: bool = False  # create missing categories and tags
     publish_auto_approve: bool = False  # approve ready articles automatically when publishing
     publish_draft_first: bool = True  # going public: a verified draft first
@@ -269,9 +299,62 @@ class Settings(BaseSettings):
                 raise ValueError("WORDPRESS_BASE_URL must not contain credentials, a query or a fragment: set WORDPRESS_USERNAME and WORDPRESS_APPLICATION_PASSWORD")  # fmt: skip
             if parts.scheme == "http" and not _is_loopback(host):
                 raise ValueError("WORDPRESS_BASE_URL must use https (http only for localhost): credentials are sent with every request")  # fmt: skip
-        if self.wordpress_default_status == "publish" and not self.wordpress_allow_direct_publish:
-            raise ValueError("WORDPRESS_DEFAULT_STATUS=publish needs WORDPRESS_ALLOW_DIRECT_PUBLISH=true")  # fmt: skip
+        if self.publish_default_status == "publish" and not self.publish_allow_direct_publish:
+            raise ValueError("PUBLISH_DEFAULT_STATUS=publish needs PUBLISH_ALLOW_DIRECT_PUBLISH=true")  # fmt: skip
+        if self.publish_site_url:
+            parts = urlsplit(self.publish_site_url.strip())
+            host = (parts.hostname or "").lower()
+            if parts.scheme not in ("https", "http") or not host:
+                raise ValueError("PUBLISH_SITE_URL must be an http(s) URL, e.g. https://www.engageoagency.com")  # fmt: skip
+            if parts.username or parts.password or parts.query or parts.fragment:
+                raise ValueError("PUBLISH_SITE_URL must be the plain site address: no credentials, query or fragment")  # fmt: skip
+            if parts.scheme == "http" and not _is_loopback(host):
+                raise ValueError("PUBLISH_SITE_URL must use https (http only for localhost)")
+        if self.publish_cta_href and not self.publish_cta_href.startswith("/"):
+            raise ValueError("PUBLISH_CTA_HREF must be a site-relative path such as /contact?intent=demo")  # fmt: skip
         return self
+
+    @field_validator("github_repo")
+    @classmethod
+    def _valid_repo(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        repo = value.strip().removeprefix("https://github.com/").removesuffix(".git").strip("/")
+        if not _GITHUB_REPO.match(repo):
+            raise ValueError(f"GITHUB_REPO must be owner/name (got {value!r})")
+        return repo
+
+    @field_validator("github_content_dir")
+    @classmethod
+    def _valid_content_dir(cls, value: str) -> str:
+        path = value.strip().strip("/")
+        if not path or ".." in path.split("/") or any(c.isspace() for c in path):
+            raise ValueError("GITHUB_CONTENT_DIR must be a relative directory path such as src/content/blog")  # fmt: skip
+        return path
+
+    @field_validator("github_branch_prefix")
+    @classmethod
+    def _valid_branch_prefix(cls, value: str) -> str:
+        prefix = value.strip().strip("/") + "/"
+        if not _BRANCH_PREFIX.match(prefix) or ".." in prefix:
+            raise ValueError("GITHUB_BRANCH_PREFIX must be a branch name prefix such as blog/")
+        return prefix
+
+    @field_validator("github_base_branch")
+    @classmethod
+    def _valid_base_branch(cls, value: str) -> str:
+        branch = value.strip()
+        if not branch or not _BRANCH_PREFIX.match(branch + "/") or ".." in branch:
+            raise ValueError("GITHUB_BASE_BRANCH must be a branch name such as main")
+        return branch
+
+    @field_validator("publish_author_initials")
+    @classmethod
+    def _valid_initials(cls, value: str) -> str:
+        initials = value.strip().upper()
+        if not 1 <= len(initials) <= 3 or not initials.isalpha():
+            raise ValueError("PUBLISH_AUTHOR_INITIALS must be 1-3 letters")
+        return initials
 
     @field_validator("scheduler_timezone")
     @classmethod
@@ -304,16 +387,34 @@ class Settings(BaseSettings):
 
     @property
     def cms_configured(self) -> bool:
-        """True when the CMS URL and credentials are all set (their values are never shown)."""
+        """True when the publishing target is fully configured (secret values are never
+        shown): the repository, token and site for github; URL and credentials for
+        wordpress."""
+        if self.cms_provider == "github":
+            return bool(self.github_repo and self.github_token and self.site_url)
         return bool(self.wordpress_base_url and self.wordpress_username and self.wordpress_application_password)  # fmt: skip
 
     @property
     def cms_site(self) -> str | None:
-        """The CMS site, normalized (identifies where a publication lives)."""
+        """Where a publication lives, normalized: the repository for github, the site URL
+        for wordpress (part of a publication's idempotency key)."""
+        if self.cms_provider == "github":
+            return self.github_repo
         if not self.wordpress_base_url:
             return None
-        parts = urlsplit(self.wordpress_base_url.strip())
-        return f"{parts.scheme}://{(parts.hostname or '').lower()}{f':{parts.port}' if parts.port else ''}{parts.path.rstrip('/')}"  # fmt: skip
+        return _normalized_site(self.wordpress_base_url)
+
+    @property
+    def site_url(self) -> str | None:
+        """The public site, normalized (no trailing slash)."""
+        return _normalized_site(self.publish_site_url) if self.publish_site_url else None
+
+    @property
+    def cms_hint(self) -> str:
+        """What to set for publishing to work with the configured provider."""
+        if self.cms_provider == "github":
+            return "GitHub publishing isn't configured: set GITHUB_REPO (owner/name), GITHUB_TOKEN (a fine-grained token with Contents and Pull requests read/write on that repository) and PUBLISH_SITE_URL"  # fmt: skip
+        return "WordPress isn't configured: set WORDPRESS_BASE_URL, WORDPRESS_USERNAME and WORDPRESS_APPLICATION_PASSWORD (an Application Password)"  # fmt: skip
 
     @property
     def analysis_model(self) -> str:
@@ -348,6 +449,11 @@ class Settings(BaseSettings):
         """Product token used to match robots.txt groups, e.g. ``CompetitorMonitorBot``."""
         match = re.match(r"[A-Za-z0-9_.-]+", self.crawler_user_agent)
         return match.group(0).split("/")[0] if match else self.crawler_user_agent
+
+
+def _normalized_site(url: str) -> str:
+    parts = urlsplit(url.strip())
+    return f"{parts.scheme}://{(parts.hostname or '').lower()}{f':{parts.port}' if parts.port else ''}{parts.path.rstrip('/')}"  # fmt: skip
 
 
 def _is_loopback(host: str) -> bool:

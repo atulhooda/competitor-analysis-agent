@@ -124,7 +124,7 @@ async def publish_article(
     """Publish the article's recommended version: `202` with the queued publication
     (`status: queued`); the CMS work runs in the background. Needs a `ready` article and an
     approval of that exact version and quality report. Leaves a draft unless `status` is
-    `publish` (which needs WORDPRESS_ALLOW_DIRECT_PUBLISH). The same version is never
+    `publish` (which needs PUBLISH_ALLOW_DIRECT_PUBLISH). The same version is never
     published twice: the existing post is checked and updated only if needed."""
     target = body.status if body else None
     try:

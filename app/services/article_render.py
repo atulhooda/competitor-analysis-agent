@@ -29,6 +29,7 @@ from app.domain.articles import ArticleContent, BlockType
 from app.domain.publishing import RenderedDocument, RenderedFAQ, RenderedLink, RenderedSource
 from app.domain.quality import SEOPackage
 from app.services.article_content import slugify, word_count
+from app.services.article_markdown import MarkdownLink, render_markdown_body
 
 RENDER_VERSION = "render/1"
 # One or more adjacent markers: "[S1][S2]" or "[S1, S3]" become one group of references.
@@ -171,11 +172,12 @@ def render_article(
     if r.unknown:
         notes.append(f"citation label(s) {', '.join(r.unknown)} have no stored source: left out")  # fmt: skip
     body = "\n".join(parts) + "\n"
+    markdown = render_markdown_body(content, sources=r.sources, links=[MarkdownLink(k.kind, k.anchor, k.url, k.title) for k in links], faq=faq)  # fmt: skip
     slug = slugify(seo.slug if seo and seo.slug else content.title)
     excerpt = (seo.meta_description if seo else "") or content.description
     category = seo.category if seo and seo.category else None
     tags = list(seo.tags) if seo else []
-    fingerprint = {"title": content.title, "slug": slug, "excerpt": excerpt, "body": body, "category": category, "tags": tags}  # fmt: skip
+    fingerprint = {"title": content.title, "slug": slug, "excerpt": excerpt, "body": body, "markdown": markdown.text, "category": category, "tags": tags}  # fmt: skip
     return RenderedDocument(
         render_version=RENDER_VERSION,
         title=content.title,
@@ -186,6 +188,9 @@ def render_article(
         category=category,
         tags=tags,
         body_html=body,
+        body_markdown=markdown.text,
+        headings=markdown.headings,
+        secondary_keywords=list(seo.secondary_keywords) if seo else [],
         sources=rendered_sources,
         faq=faq,
         links=[

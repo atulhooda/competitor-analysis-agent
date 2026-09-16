@@ -153,7 +153,7 @@ class ApprovalDecisionResponse(BaseModel):
 class PublishRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    status: TargetStatus | None = Field(default=None, description="draft (default: WORDPRESS_DEFAULT_STATUS), pending, or publish (needs WORDPRESS_ALLOW_DIRECT_PUBLISH)")  # fmt: skip
+    status: TargetStatus | None = Field(default=None, description="draft (default: PUBLISH_DEFAULT_STATUS), pending, or publish (needs PUBLISH_ALLOW_DIRECT_PUBLISH)")  # fmt: skip
 
 
 class PublishResponse(BaseModel):

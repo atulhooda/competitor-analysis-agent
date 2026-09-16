@@ -2104,7 +2104,7 @@ def article_preflight_cmd(
     status: Annotated[
         TargetStatus | None,
         typer.Option(
-            "--status", help="draft, pending or publish (default: WORDPRESS_DEFAULT_STATUS)."
+            "--status", help="draft, pending or publish (default: PUBLISH_DEFAULT_STATUS)."
         ),
     ] = None,
     json_output: bool = typer.Option(False, "--json"),
@@ -2138,7 +2138,7 @@ def publish_article_cmd(
         TargetStatus | None,
         typer.Option(
             "--status",
-            help="draft, pending or publish (publish needs WORDPRESS_ALLOW_DIRECT_PUBLISH).",
+            help="draft, pending or publish (publish needs PUBLISH_ALLOW_DIRECT_PUBLISH).",
         ),
     ] = None,
     dry_run: bool = typer.Option(
