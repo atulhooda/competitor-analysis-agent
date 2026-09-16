@@ -688,7 +688,7 @@ class PublishingService:
             add("target_status", False, "making a post public needs PUBLISH_ALLOW_DIRECT_PUBLISH=true")  # fmt: skip
         else:
             add("target_status", True, f"leaves the post as {target.value}" + (" (a verified draft first)" if target is TargetStatus.PUBLISH and s.publish_draft_first else ""))  # fmt: skip
-        add("cms_config", self._cms.configured, f"{self._cms.name} at {self._cms.site}" if self._cms.configured else "WordPress isn't configured: set WORDPRESS_BASE_URL, WORDPRESS_USERNAME and WORDPRESS_APPLICATION_PASSWORD")  # fmt: skip
+        add("cms_config", self._cms.configured, f"{self._cms.name} at {self._cms.site}" if self._cms.configured else self._cms.configuration_hint)  # fmt: skip
         pub = snap.publication
         plan = _Plan(report=self._report(snap, checks, target, "create"))
         if pub is not None and pub.status in IN_FLIGHT_PUBLICATION and pub.run_id not in (None, run_id):  # fmt: skip

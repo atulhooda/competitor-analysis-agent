@@ -260,6 +260,18 @@ async def test_a_dry_run_shows_the_file_and_changes_nothing(git: Git) -> None:
     assert TOKEN not in dry.model_dump_json()
 
 
+async def test_an_unconfigured_target_names_the_github_settings_in_preflight(git: Git) -> None:
+    await git.approve()
+    dry = await git.service(github_token=None).dry_run(git.article_id)
+    assert not dry.preflight.ready
+    config = next(c for c in dry.preflight.checks if c.name == "cms_config")
+    assert not config.passed
+    assert "GITHUB_REPO" in config.detail
+    assert "GITHUB_TOKEN" in config.detail
+    assert "WORDPRESS" not in config.detail
+    assert git.gh.calls == []
+
+
 async def test_nothing_reaches_github_without_the_publish_target_allowed(git: Git) -> None:
     await git.approve()
     with pytest.raises(PublishingConflictError, match="PUBLISH_ALLOW_DIRECT_PUBLISH"):
