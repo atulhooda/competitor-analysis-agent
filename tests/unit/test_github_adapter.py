@@ -460,3 +460,54 @@ async def test_resolve_terms_never_creates_anything_and_lowercases_tags(rig: Rig
     assert terms.category.name == "Comparison"
     assert terms.missing_category is None
     assert terms.created == ()
+
+
+# ── Vercel protection bypass ─────────────────────────────────────────────────
+
+BYPASS = "bypass-secret-0123456789abcdefghij"
+
+
+def bypass_adapter(rig: Rig, secret: str | None, *, timeout: float = 100.0) -> GitHubPublishingAdapter:  # fmt: skip
+    client = GitHubClient(API, REPO, SecretStr(TOKEN), timeout=5, max_retries=1, user_agent="test-agent", sleep=rig.clock.sleep, backoff=0.1)  # fmt: skip
+    site = SiteClient(timeout=5, user_agent="test-agent", bypass_secret=SecretStr(secret) if secret else None)  # fmt: skip
+    return GitHubPublishingAdapter(client, site, base_branch=BASE, config=config(), deploy_timeout=timeout, deploy_poll=5.0, sleep=rig.clock.sleep, clock=rig.clock, today=lambda: date(2026, 9, 16))  # fmt: skip
+
+
+async def test_the_bypass_secret_unlocks_a_protected_preview(rig: Rig) -> None:
+    rig.gh.preview_protected = True
+    rig.gh.bypass_secret = BYPASS
+    adapter = bypass_adapter(rig, BYPASS)
+    post = await adapter.create_post(await payload_for(adapter, document()))
+    assert post.status is CMSPostStatus.DRAFT
+    previews = [r for r in rig.gh.requests if r.url.host.endswith(".vercel.app")]
+    assert previews
+    assert all(r.headers.get("x-vercel-protection-bypass") == BYPASS for r in previews)
+
+
+async def test_the_bypass_secret_goes_to_preview_hosts_only(rig: Rig) -> None:
+    rig.gh.preview_protected = True
+    rig.gh.bypass_secret = BYPASS
+    adapter = bypass_adapter(rig, BYPASS)
+    draft = await adapter.create_post(await payload_for(adapter, document()))
+    await adapter.update_post(draft.external_id, await payload_for(adapter, document(), TargetStatus.PUBLISH))  # fmt: skip
+    for request in rig.gh.requests:
+        sent = "x-vercel-protection-bypass" in request.headers
+        assert sent == request.url.host.endswith(".vercel.app"), request.url
+        assert BYPASS not in request.headers.get("authorization", "")
+
+
+async def test_a_rejected_bypass_secret_says_so_and_merges_nothing(rig: Rig) -> None:
+    rig.gh.preview_protected = True
+    rig.gh.bypass_secret = BYPASS
+    adapter = bypass_adapter(rig, "wrong-secret-0123456789abcdefghij")
+    with pytest.raises(CMSProtectedError, match="bypass secret was rejected") as info:
+        await adapter.create_post(await payload_for(adapter, document(), TargetStatus.PUBLISH))
+    assert "wrong-secret" not in str(info.value)
+    assert rig.gh.pulls[61].merged_at is None
+
+
+async def test_without_a_secret_a_protected_preview_names_the_setting(rig: Rig) -> None:
+    rig.gh.preview_protected = True
+    adapter = bypass_adapter(rig, None)
+    with pytest.raises(CMSProtectedError, match="VERCEL_PROTECTION_BYPASS_SECRET"):
+        await adapter.create_post(await payload_for(adapter, document()))

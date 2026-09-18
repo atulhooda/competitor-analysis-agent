@@ -117,7 +117,7 @@ class LazyCMS:
                 transport=self._transport,
                 sleep=self._sleep,
             )
-            site = SiteClient(timeout=s.cms_request_timeout, user_agent=s.crawler_user_agent, transport=self._transport)  # fmt: skip
+            site = SiteClient(timeout=s.cms_request_timeout, user_agent=s.crawler_user_agent, transport=self._transport, bypass_secret=s.vercel_protection_bypass_secret)  # fmt: skip
             extra: dict[str, Any] = {"clock": self._clock} if self._clock is not None else {}
             return GitHubPublishingAdapter(client, site, base_branch=s.github_base_branch, config=site_config(s), deploy_timeout=s.github_deploy_timeout_seconds, deploy_poll=s.github_deploy_poll_seconds, sleep=self._sleep, today=lambda: utcnow().astimezone(s.scheduler_tz).date(), **extra)  # fmt: skip
         if not (s.wordpress_base_url and s.wordpress_username and s.wordpress_application_password):

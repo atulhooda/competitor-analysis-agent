@@ -255,6 +255,9 @@ async def test_a_dry_run_shows_the_file_and_changes_nothing(git: Git) -> None:
     assert dry.payload["path"].startswith("src/content/blog/")
     assert dry.payload["content"].startswith("---\ntitle:")
     assert dry.payload["branch"].startswith("blog/")
+    assert dry.payload["commit_message"].startswith("Add blog post: ")  # the real payload
+    assert dry.payload["pr_title"] == dry.payload["commit_message"]
+    assert "Vercel preview" in dry.payload["pr_body"]
     assert git.gh.mutations == []
     assert {c.name for c in dry.preflight.checks} >= {"cms", "slug", "category", "idempotency"}
     assert TOKEN not in dry.model_dump_json()

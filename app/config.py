@@ -205,6 +205,9 @@ class Settings(BaseSettings):
     github_api_url: str = "https://api.github.com"
     github_deploy_timeout_seconds: int = Field(default=900, ge=30, le=3_600)  # waiting for Vercel
     github_deploy_poll_seconds: float = Field(default=15.0, ge=0.5, le=120)
+    # Vercel "Protection Bypass for Automation": lets the verifier read protected preview
+    # deployments. Sent only to *.vercel.app hosts, never to the site or to GitHub.
+    vercel_protection_bypass_secret: SecretStr | None = None
     # The byline of agent-written posts: fixed configuration, never model output.
     publish_author_name: str = "Engageo Team"
     publish_author_role: str = "AI Content"
@@ -254,7 +257,7 @@ class Settings(BaseSettings):
     pipeline_approve_opportunities: bool = True
     pipeline_min_opportunity_score: float = Field(default=60.0, ge=0, le=100)
 
-    @field_validator("api_key", "gemini_api_key", "wordpress_application_password", mode="before")
+    @field_validator("api_key", "gemini_api_key", "wordpress_application_password", "github_token", "vercel_protection_bypass_secret", mode="before")  # fmt: skip
     @classmethod
     def _blank_secret_is_unset(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value

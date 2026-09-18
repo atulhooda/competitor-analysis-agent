@@ -36,6 +36,7 @@ from urllib.parse import urlsplit
 
 import httpx
 import structlog
+from pydantic import SecretStr
 
 from app.cms.base import CMSCheck, CMSPost, TermRef, TermResolution
 from app.cms.errors import (
@@ -100,15 +101,30 @@ def _plain_text(page: str) -> str:
     return " ".join(html.unescape(_TAGS.sub(" ", page)).split())
 
 
-class SiteClient:
-    """Reads the public site and preview deployments. No credentials, no redirects."""
+BYPASS_HOST_SUFFIX = ".vercel.app"
+BYPASS_HEADER = "x-vercel-protection-bypass"
 
-    def __init__(self, *, timeout: float = 30.0, user_agent: str = "competitor-analysis-agent", transport: httpx.AsyncBaseTransport | None = None) -> None:  # fmt: skip
+
+class SiteClient:
+    """Reads the public site and preview deployments. No redirects, and no credential
+    except Vercel's protection-bypass secret, sent only to ``*.vercel.app`` previews."""
+
+    def __init__(self, *, timeout: float = 30.0, user_agent: str = "competitor-analysis-agent", transport: httpx.AsyncBaseTransport | None = None, bypass_secret: SecretStr | None = None) -> None:  # fmt: skip
         self._http = httpx.AsyncClient(headers={"User-Agent": user_agent, "Cache-Control": "no-cache", "Accept": "text/html,application/xml;q=0.9,*/*;q=0.8"}, timeout=timeout, follow_redirects=False, transport=transport)  # fmt: skip
+        self._bypass = bypass_secret
+
+    @property
+    def has_bypass(self) -> bool:
+        return self._bypass is not None
+
+    @staticmethod
+    def bypass_applies(url: str) -> bool:
+        return (urlsplit(url).hostname or "").lower().endswith(BYPASS_HOST_SUFFIX)
 
     async def fetch(self, url: str) -> httpx.Response:
+        headers = {BYPASS_HEADER: self._bypass.get_secret_value()} if self._bypass is not None and self.bypass_applies(url) else None  # fmt: skip
         try:
-            return await self._http.get(url)
+            return await self._http.get(url, headers=headers)
         except httpx.TimeoutException as exc:
             raise CMSTimeoutError(f"GET {url}: no answer ({type(exc).__name__})") from exc
         except httpx.TransportError as exc:
@@ -535,7 +551,9 @@ class GitHubPublishingAdapter:
         text = response.text or ""
         host = urlsplit(url).hostname or ""
         if status in (401, 403) or (300 <= status < 400 and "vercel" in response.headers.get("location", "")) or "Authentication Required" in text[:4000]:  # fmt: skip
-            raise CMSProtectedError(f"{url} is protected (Vercel Deployment Protection answered {status}): automated verification can't proceed; decide on protection before publishing this way")  # fmt: skip
+            if self._site.has_bypass and self._site.bypass_applies(url):
+                raise CMSProtectedError(f"{url} is protected and the bypass secret was rejected ({status}): check VERCEL_PROTECTION_BYPASS_SECRET against the project's Deployment Protection settings")  # fmt: skip
+            raise CMSProtectedError(f"{url} is protected (Vercel Deployment Protection answered {status}): automated verification can't proceed; set VERCEL_PROTECTION_BYPASS_SECRET (Protection Bypass for Automation) or disable Vercel Authentication for previews")  # fmt: skip
         if status != 200:
             return [f"{url} answered {status}"]
         plain = _plain_text(text)

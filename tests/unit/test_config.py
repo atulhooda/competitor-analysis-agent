@@ -164,6 +164,9 @@ def test_publishing_settings_are_validated() -> None:
     assert "abcd" not in repr(configured)  # the password is a secret
     assert Settings(_env_file=None, cms_provider="wordpress", wordpress_base_url="http://localhost:8080").cms_site == "http://localhost:8080"  # type: ignore[call-arg]  # fmt: skip
     assert Settings(_env_file=None, wordpress_application_password=" ").wordpress_application_password is None  # type: ignore[call-arg]  # fmt: skip
+    assert Settings(_env_file=None, github_token=" ").github_token is None  # type: ignore[call-arg]
+    assert Settings(_env_file=None, vercel_protection_bypass_secret="").vercel_protection_bypass_secret is None  # type: ignore[call-arg]  # fmt: skip
+    assert "s3cret" not in repr(Settings(_env_file=None, vercel_protection_bypass_secret="s3cret"))  # type: ignore[call-arg]  # fmt: skip
     for bad, message in (
         ({"wordpress_base_url": "http://blog.example.com"}, "must use https"),
         (

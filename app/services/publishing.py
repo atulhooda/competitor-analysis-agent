@@ -40,7 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.cms import LazyCMS
 from app.cms.base import CMSPost, CMSPublisher, TermResolution
-from app.cms.errors import CMSConfigurationError, CMSError, CMSTransientError
+from app.cms.errors import CMSConfigurationError, CMSError, CMSTransientError, CMSValidationError
 from app.config import Settings
 from app.core.errors import AppError
 from app.core.timeutils import utcnow
@@ -213,7 +213,14 @@ class PublishingService:
         payload = None
         if document is not None:
             doc = document.model_copy(update={"slug": plan.slug or document.slug})
-            payload = self._cms.preview_payload(doc, status=wanted, terms=plan.terms or TermResolution(None, ()), marker=snap.marker)  # fmt: skip
+            terms = plan.terms or TermResolution(None, ())
+            if publisher is not None:  # the exact payload a run would send (no request is made)
+                try:
+                    payload = publisher.build_payload(doc, status=wanted, terms=terms, marker=snap.marker)  # fmt: skip
+                except CMSValidationError as exc:
+                    raise PublishingConflictError(str(exc)) from exc
+            else:
+                payload = self._cms.preview_payload(doc, status=wanted, terms=terms, marker=snap.marker)  # fmt: skip
         return DryRunReport(preflight=plan.report, document=document, payload=payload)
 
     # ── requests ─────────────────────────────────────────────────────────────

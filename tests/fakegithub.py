@@ -66,6 +66,7 @@ class FakeGitHub:
     preview_outcome: str = "success"
     production_outcome: str = "success"
     preview_protected: bool = False
+    bypass_secret: str | None = None  # accepted in the x-vercel-protection-bypass header
     # Per action ("get_repo", "get_ref", "create_ref", "get_contents", "put_contents",
     # "list_pulls", "create_pull", "get_pull", "merge", "deployments", "site", "preview"):
     # failures to inject, in order: an HTTP status, "timeout" (nothing happened), "lost"
@@ -365,6 +366,7 @@ class FakeGitHub:
 
     def _site(self, request: httpx.Request) -> httpx.Response:
         self.calls.append((request.method, f"site:{request.url.path}"))
+        self.requests.append(request)
         failure = self._injected("site")
         if failure is not None:
             return self._failure(failure, request)
@@ -375,10 +377,11 @@ class FakeGitHub:
 
     def _preview(self, request: httpx.Request) -> httpx.Response:
         self.calls.append((request.method, f"preview:{request.url.host}{request.url.path}"))
+        self.requests.append(request)
         failure = self._injected("preview")
         if failure is not None:
             return self._failure(failure, request)
-        if self.preview_protected:
+        if self.preview_protected and not (self.bypass_secret and request.headers.get("x-vercel-protection-bypass") == self.bypass_secret):  # fmt: skip
             return httpx.Response(401, text="<html><body>Authentication Required</body></html>", headers={"set-cookie": "_vercel_sso_nonce=x"})  # fmt: skip
         deployment = next((d for d in self.deployments if d.url and httpx.URL(d.url).host == request.url.host), None)  # fmt: skip
         if deployment is None:
