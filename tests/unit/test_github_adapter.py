@@ -30,7 +30,13 @@ from app.cms.errors import (
 from app.cms.github import GitHubClient, GitHubPublishingAdapter, SiteClient, SiteConfig
 from app.cms.github.mdx import split_frontmatter
 from app.cms.github.publisher import parse_external_id
-from app.domain.publishing import CMSPostStatus, RenderedDocument, RenderedSource, TargetStatus
+from app.domain.publishing import (
+    CMSPostStatus,
+    RenderedCover,
+    RenderedDocument,
+    RenderedSource,
+    TargetStatus,
+)
 from tests.fakegithub import API, BASE, CONTENT_DIR, REPO, SITE, TOKEN, FakeGitHub
 
 MARKER = "0123456789abcdef0123456789abcdef"
@@ -63,15 +69,37 @@ def config(**overrides: Any) -> SiteConfig:
     return SiteConfig(**values)
 
 
+COVER_BYTES = b"\x89PNG\r\n\x1a\nfake cover bytes"
+
+
+@dataclass
+class Covers:
+    """A stand-in for ``CoverService``: it never generates, it only hands over the stored
+    picture, and it counts how often the adapter asked for it."""
+
+    data: bytes | None = COVER_BYTES
+    asked: list[tuple[int, int]] = field(default_factory=list)
+
+    async def image(self, article_id: int, version_id: int) -> tuple[RenderedCover, bytes] | None:
+        self.asked.append((article_id, version_id))
+        return (cover(), self.data) if self.data is not None else None
+
+
+def cover(**overrides: Any) -> RenderedCover:
+    values: dict[str, Any] = {"filename": "ai-receptionist-costs.png", "mime": "image/png", "alt": "Abstract editorial illustration about AI receptionist cost", "width": 1536, "height": 864, "sha256": "d" * 64}  # fmt: skip
+    values.update(overrides)
+    return RenderedCover(**values)
+
+
 @dataclass
 class Rig:
     gh: FakeGitHub
     clock: Clock
 
-    def adapter(self, *, token: str = TOKEN, read_only: bool = False, retries: int = 1, timeout: float = 100.0) -> GitHubPublishingAdapter:  # fmt: skip
+    def adapter(self, *, token: str = TOKEN, read_only: bool = False, retries: int = 1, timeout: float = 100.0, covers: Covers | None = None) -> GitHubPublishingAdapter:  # fmt: skip
         client = GitHubClient(API, REPO, SecretStr(token), timeout=5, max_retries=retries, user_agent="test-agent", read_only=read_only, sleep=self.clock.sleep, backoff=0.1)  # fmt: skip
         site = SiteClient(timeout=5, user_agent="test-agent")
-        return GitHubPublishingAdapter(client, site, base_branch=BASE, config=config(), deploy_timeout=timeout, deploy_poll=5.0, sleep=self.clock.sleep, clock=self.clock, today=lambda: date(2026, 9, 16))  # fmt: skip
+        return GitHubPublishingAdapter(client, site, base_branch=BASE, config=config(), deploy_timeout=timeout, deploy_poll=5.0, sleep=self.clock.sleep, clock=self.clock, today=lambda: date(2026, 9, 16), covers=covers)  # fmt: skip
 
 
 @pytest.fixture
@@ -368,6 +396,80 @@ async def test_a_direct_publish_target_goes_through_the_preview_too(rig: Rig) ->
     assert post.status is CMSPostStatus.PUBLISHED
     calls = [c[1] for c in rig.gh.calls]
     assert calls.index(next(c for c in calls if c.startswith("preview:"))) < calls.index(f"/repos/{REPO}/pulls/61/merge")  # fmt: skip
+
+
+# ── the cover image ──────────────────────────────────────────────────────────
+
+COVER_PATH = "public/blog/covers/ai-receptionist-costs-2026.png"
+
+
+async def test_without_a_cover_nothing_about_the_post_changes(rig: Rig) -> None:
+    covers = Covers()
+    adapter = rig.adapter(covers=covers)
+    post = await adapter.create_post(await payload_for(adapter, document()))
+    assert post.status is CMSPostStatus.DRAFT
+    assert covers.asked == []  # the document carries no cover: the source is never asked
+    assert rig.gh.images(branch="blog/ai-receptionist-costs-2026") == []
+    assert "coverImage" not in (rig.gh.file("ai-receptionist-costs-2026", branch="blog/ai-receptionist-costs-2026") or "")  # fmt: skip
+
+
+async def test_the_cover_is_committed_to_the_branch_and_named_in_the_frontmatter(rig: Rig) -> None:  # fmt: skip
+    covers = Covers()
+    adapter = rig.adapter(covers=covers)
+    payload = await payload_for(adapter, document(cover=cover()))
+    assert payload["cover"] == {"path": COVER_PATH, "url": "/blog/covers/ai-receptionist-costs-2026.png", "article_id": 7, "version_id": 21, "mime": "image/png", "sha256": "d" * 64, "alt": cover().alt}  # fmt: skip
+    assert COVER_BYTES not in repr(payload).encode()  # metadata only: never the picture
+    post = await adapter.create_post(payload)
+    assert post.status is CMSPostStatus.DRAFT
+    branch = "blog/ai-receptionist-costs-2026"
+    assert covers.asked == [(7, 21)]
+    assert rig.gh.image(COVER_PATH, branch=branch) == COVER_BYTES
+    assert rig.gh.image(COVER_PATH) is None  # not on main until the pull request is merged
+    fields, _ = split_frontmatter(rig.gh.file("ai-receptionist-costs-2026", branch=branch) or "")
+    assert fields is not None
+    assert fields["coverImage"] == "/blog/covers/ai-receptionist-costs-2026.png"
+    assert (fields["coverWidth"], fields["coverHeight"]) == (1536, 864)
+
+
+async def test_a_retried_publish_finds_the_cover_and_asks_for_nothing(rig: Rig) -> None:
+    covers = Covers()
+    adapter = rig.adapter(covers=covers)
+    payload = await payload_for(adapter, document(cover=cover()))
+    await adapter.create_post(payload)
+    assert covers.asked == [(7, 21)]
+    commits = [c for c in rig.gh.mutations if c[1].endswith(COVER_PATH)]
+    # A second run over the same version: the file is on the branch, so it is neither
+    # fetched from the cover source again nor committed again.
+    await adapter.create_post(payload)
+    await adapter.update_post("pr:61", payload)
+    assert covers.asked == [(7, 21)]
+    assert [c for c in rig.gh.mutations if c[1].endswith(COVER_PATH)] == commits
+    assert rig.gh.image(COVER_PATH, branch="blog/ai-receptionist-costs-2026") == COVER_BYTES
+
+
+async def test_the_cover_is_merged_with_the_post(rig: Rig) -> None:
+    adapter = rig.adapter(covers=Covers())
+    doc = document(cover=cover())
+    draft = await adapter.create_post(await payload_for(adapter, doc))
+    post = await adapter.update_post(draft.external_id, await payload_for(adapter, doc, TargetStatus.PUBLISH))  # fmt: skip
+    assert post.status is CMSPostStatus.PUBLISHED
+    assert rig.gh.image(COVER_PATH) == COVER_BYTES
+
+
+async def test_a_cover_that_cannot_be_had_publishes_the_post_anyway(rig: Rig) -> None:
+    covers = Covers(data=None)
+    adapter = rig.adapter(covers=covers)
+    post = await adapter.create_post(await payload_for(adapter, document(cover=cover())))
+    assert post.status is CMSPostStatus.DRAFT
+    assert covers.asked == [(7, 21)]
+    assert rig.gh.images(branch="blog/ai-receptionist-costs-2026") == []
+
+
+async def test_an_adapter_without_a_cover_source_commits_no_picture(rig: Rig) -> None:
+    adapter = rig.adapter()
+    post = await adapter.create_post(await payload_for(adapter, document(cover=cover())))
+    assert post.status is CMSPostStatus.DRAFT
+    assert rig.gh.images(branch="blog/ai-receptionist-costs-2026") == []
 
 
 # ── identities ───────────────────────────────────────────────────────────────

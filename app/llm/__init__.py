@@ -10,6 +10,8 @@ Importing this package does not import any provider SDK.
 from app.llm.base import (
     Citation,
     Grounding,
+    ImageRequest,
+    ImageResponse,
     LLMProvider,
     LLMRequest,
     LLMResponse,
@@ -34,6 +36,8 @@ from app.llm.factory import LazyLLM, create_llm_provider, get_llm
 __all__ = [
     "Citation",
     "Grounding",
+    "ImageRequest",
+    "ImageResponse",
     "LLMAuthenticationError",
     "LLMBudgetExceededError",
     "LLMConfigurationError",

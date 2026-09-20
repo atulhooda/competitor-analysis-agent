@@ -1,6 +1,7 @@
 """GeminiProvider tests. The Gemini API is mocked at the HTTP level with respx, so the real
 SDK builds and parses every request, but no network call is made and no real key is used."""
 
+import base64
 import json
 from collections.abc import AsyncIterator
 
@@ -10,6 +11,7 @@ import respx
 from pydantic import BaseModel
 
 from app.llm import (
+    ImageRequest,
     LLMAuthenticationError,
     LLMInvalidRequestError,
     LLMProvider,
@@ -293,3 +295,83 @@ async def test_requests_without_tools_send_none_and_report_no_grounding(provider
     assert "tools" not in json.loads(route.calls.last.request.content)
     assert result.raw.grounding.search_queries == ()
     assert result.raw.grounding.retrieved_urls == ()
+
+
+# ── images ───────────────────────────────────────────────────────────────────
+
+# A real 1x1 PNG and a minimal JPEG header, so the provider's own size reader has something
+# to read. The bytes never leave the provider as base64.
+PNG = bytes.fromhex("89504e470d0a1a0a0000000d49484452000004000000024000080200000091a2b3c4")
+JPEG = bytes.fromhex("ffd8ffe000104a46494600010100000100010000ffc000110800f0014003012200")
+
+
+def image_interaction(data: bytes, mime: str = "image/png", **extra: object) -> dict[str, object]:
+    """An interaction whose model output is one image content part, as the SDK parses it."""
+    body = interaction()
+    body["steps"] = [{"type": "model_output", "content": [{"type": "image", "mime_type": mime, "data": base64.b64encode(data).decode()}]}]  # fmt: skip
+    body.update(extra)
+    return body
+
+
+@pytest.fixture
+async def image_provider() -> AsyncIterator[GeminiProvider]:
+    p = GeminiProvider(api_key=FAKE_KEY, model="gemini-test-model", image_model="gemini-test-image", timeout_seconds=5, max_retries=1)  # fmt: skip
+    yield p
+    await p.aclose()
+
+
+async def test_an_image_request_asks_for_the_image_modality(image_provider: GeminiProvider) -> None:
+    assert image_provider.default_image_model == "gemini-test-image"
+    with respx.mock() as router:
+        route = router.post(url__regex=INTERACTIONS).respond(200, json=image_interaction(PNG))
+        response = await image_provider.generate_image(ImageRequest(prompt="Draw a calm desk"))
+    body = json.loads(route.calls.last.request.content)
+    assert body["input"] == "Draw a calm desk"
+    assert body["store"] is False
+    assert body["response_modalities"] == ["image"]
+    assert body["response_format"] == {"type": "image", "aspect_ratio": "16:9", "delivery": "inline"}  # fmt: skip
+    assert "system_instruction" not in body
+    assert body["model"] == "gemini-test-image"  # GEMINI_IMAGE_MODEL, not GEMINI_MODEL
+    assert response.data == PNG
+    assert (response.mime_type, response.provider) == ("image/png", "gemini")
+    assert (response.width, response.height) == (1024, 576)  # read from the PNG's own header
+    assert response.usage.total_tokens == 20
+
+
+async def test_the_native_size_is_read_from_a_jpeg_too(image_provider: GeminiProvider) -> None:
+    with respx.mock() as router:
+        router.post(url__regex=INTERACTIONS).respond(200, json=image_interaction(JPEG, "image/jpeg"))  # fmt: skip
+        response = await image_provider.generate_image(ImageRequest(prompt="x"))
+    assert (response.mime_type, response.width, response.height) == ("image/jpeg", 320, 240)
+
+
+async def test_an_answer_without_an_image_raises_with_the_billed_usage(image_provider: GeminiProvider) -> None:  # fmt: skip
+    with respx.mock() as router:
+        router.post(url__regex=INTERACTIONS).respond(200, json=interaction("I can't draw that."))
+        with pytest.raises(LLMResponseError, match="no image") as exc:
+            await image_provider.generate_image(ImageRequest(prompt="x"))
+    assert exc.value.usage is not None
+    assert exc.value.usage.total_tokens == 20
+    assert "I can't draw that." in str(exc.value)
+
+
+async def test_an_image_of_a_type_the_site_cannot_serve_is_not_returned(image_provider: GeminiProvider) -> None:  # fmt: skip
+    with respx.mock() as router:
+        router.post(url__regex=INTERACTIONS).respond(200, json=image_interaction(PNG, "image/gif"))
+        with pytest.raises(LLMResponseError, match="no image"):
+            await image_provider.generate_image(ImageRequest(prompt="x"))
+
+
+async def test_image_http_errors_map_to_provider_neutral_errors(image_provider: GeminiProvider) -> None:  # fmt: skip
+    with respx.mock() as router:
+        router.post(url__regex=INTERACTIONS).mock(return_value=api_error(400))
+        with pytest.raises(LLMInvalidRequestError):
+            await image_provider.generate_image(ImageRequest(prompt="x"))
+
+
+def test_image_request_validation() -> None:
+    with pytest.raises(ValueError, match="prompt"):
+        ImageRequest(prompt=" ")
+    with pytest.raises(ValueError, match="aspect_ratio"):
+        ImageRequest(prompt="x", aspect_ratio="wide")
+    assert ImageRequest(prompt="x").aspect_ratio == "16:9"

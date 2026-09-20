@@ -86,6 +86,7 @@ from app.services.article_content import structural_problems
 from app.services.article_render import render_article
 from app.services.articles import ArticleConflictError, ArticleNotFoundError, ArticleRunActiveError
 from app.services.checkpoints import new_run
+from app.services.covers import CoverService
 from app.services.daily_limits import reserve_publication_slot
 from app.services.runs import fail_abandoned_runs, finish_run, run_slot_free
 
@@ -180,13 +181,18 @@ class PublishingService:
         *,
         now: Callable[[], datetime] = utcnow,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        covers: CoverService | None = None,
     ) -> None:
+        """``covers`` (PUBLISH_COVER_IMAGES) gives each published version one generated cover
+        picture. It is consulted only once a run is about to change the target, so blocked
+        publications, dry runs and no-op republishes never make an image."""
         self._engine = engine
         self._sessions = sessions
         self._settings = settings
         self._cms = cms
         self._now = now
         self._sleep = sleep
+        self._covers = covers
         self._approvals = ApprovalService(sessions, settings, now=now)
 
     def _target(self, target: TargetStatus | str | None) -> TargetStatus:
@@ -339,7 +345,7 @@ class PublishingService:
                 publication = await session.get_one(Publication, publication_id)
                 publication.status, publication.last_error, publication.updated_at = _FINAL[target].value, None, self._now()  # fmt: skip
             return await self._finish(run_id, publication_id, RunStatus.SUCCEEDED, plan, None, action="none", warnings=plan.warnings)  # fmt: skip
-        doc = document.model_copy(update={"slug": plan.slug or document.slug})
+        doc = await self._with_cover(document.model_copy(update={"slug": plan.slug or document.slug}), run_id, plan.warnings)  # fmt: skip
         try:  # the last checks (and the daily slot) come before any change to the CMS
             await self._begin_submit(publication_id, article_id, target, limit)
         except _LimitReached as exc:
@@ -360,6 +366,18 @@ class PublishingService:
             return await self._finish(run_id, publication_id, RunStatus.FAILED, plan, "verification failed: " + "; ".join(problems))  # fmt: skip
         await self._record_success(run_id, publication_id, article_id, post, doc, terms, target, plan.warnings + warnings)  # fmt: skip
         return await self._finish(run_id, publication_id, RunStatus.SUCCEEDED, plan, None, status=_FINAL[target], action=plan.report.action, warnings=plan.warnings + warnings)  # fmt: skip
+
+    async def _with_cover(self, doc: RenderedDocument, run_id: int, warnings: list[str]) -> RenderedDocument:  # fmt: skip
+        """The document plus the metadata of this version's cover picture, generated once
+        and stored. Without a cover service, or when a cover can't be had, the document is
+        returned untouched, a warning is recorded and the post is published without one."""
+        if self._covers is None or not self._covers.enabled:
+            return doc
+        cover = await self._covers.cover(doc, run_id=run_id)
+        if cover is None:
+            warnings.append("no cover image could be generated: the post is published without one")
+            return doc
+        return doc.model_copy(update={"cover": cover})
 
     async def _write(self, publisher: CMSPublisher, publication_id: int, run_id: int, marker: str, post: CMSPost | None, doc: RenderedDocument, terms: TermResolution, target: TargetStatus) -> CMSPost:  # fmt: skip
         """Create or update the post; a public target goes through a verified draft first
@@ -491,8 +509,9 @@ class PublishingService:
                 "links": [link.model_dump(mode="json") for link in doc.links],
                 "sources": [s.model_dump(mode="json") for s in doc.sources],
                 "faq": len(doc.faq),
-                "image_suggestion": image,  # a suggestion: no image is generated or uploaded
+                "image_suggestion": image,  # a suggestion the model made; not what was published
                 "featured_image": None,
+                "cover_image": doc.cover.model_dump(mode="json") if doc.cover else None,
                 "word_count": doc.word_count,
                 "warnings": warnings,
                 "notes": doc.notes,

@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from app.domain.publishing import CMSPostStatus, RenderedDocument, TargetStatus
+from app.domain.publishing import CMSPostStatus, RenderedCover, RenderedDocument, TargetStatus
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,17 @@ class TermResolution:
     missing_tags: tuple[str, ...] = ()
     created: tuple[str, ...] = ()  # "category: X", "tag: Y"
     notes: tuple[str, ...] = field(default_factory=tuple)
+
+
+class CoverSource(Protocol):
+    """Where an adapter gets the bytes of an article version's cover picture.
+
+    An adapter asks only when the picture is missing at the target, so a retried publish
+    neither regenerates nor re-commits one. ``None`` means "no cover to commit", never
+    "make one": generation belongs to ``app.services.covers.CoverService``.
+    """
+
+    async def image(self, article_id: int, version_id: int) -> tuple[RenderedCover, bytes] | None: ...  # fmt: skip
 
 
 class CMSPublisher(Protocol):
@@ -92,3 +103,13 @@ class CMSPublisher(Protocol):
 
 
 PublishingAdapter = CMSPublisher
+
+__all__ = [
+    "CMSCheck",
+    "CMSPost",
+    "CMSPublisher",
+    "CoverSource",
+    "PublishingAdapter",
+    "TermRef",
+    "TermResolution",
+]

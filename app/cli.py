@@ -85,6 +85,7 @@ from app.services.company import (
     list_company_profiles,
     save_company_profile,
 )
+from app.services.covers import CoverService
 from app.services.editorial import EditorialRunAlreadyActiveError, EditorialService, ProposalOutcome
 from app.services.intelligence import IntelligenceService
 from app.services.jobs import JobConflictError, JobNotFoundError
@@ -2203,8 +2204,10 @@ def _print_preflight(report: PreflightReport) -> None:
 
 def _publishing(engine: AsyncEngine, sessions: SessionFactory) -> tuple[PublishingService, LazyCMS]:  # fmt: skip
     settings = get_settings()
-    cms = LazyCMS(settings)
-    return PublishingService(engine, sessions, settings, cms), cms
+    # The image model is built on first use, so a publication without covers needs no key.
+    covers = CoverService(sessions, settings, LazyLLM(settings))
+    cms = LazyCMS(settings, covers=covers)
+    return PublishingService(engine, sessions, settings, cms, covers=covers), cms
 
 
 @articles_cli.command("preflight")

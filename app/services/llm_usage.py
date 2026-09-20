@@ -26,6 +26,8 @@ from app.db.models import LLMCall
 from app.db.session import SessionFactory
 from app.domain.analysis import LLMCallStatus, LLMPurpose
 from app.llm import (
+    ImageRequest,
+    ImageResponse,
     LLMBudgetExceededError,
     LLMError,
     LLMProvider,
@@ -41,6 +43,9 @@ log = structlog.get_logger(__name__)
 
 # In every budget error message (the scheduler reports such stops as skipped_due_to_budget).
 BUDGET_REACHED = "LLM token budget reached"
+# What one generated picture is budgeted at before it is made. Gemini bills an image as a
+# fixed block of output tokens; the ledger then records what it actually reported.
+IMAGE_OUTPUT_TOKENS = 2_000
 
 
 @dataclass
@@ -122,6 +127,35 @@ class BudgetedLLM:
             status=LLMCallStatus.SUCCEEDED, usage=result.raw.usage, response_id=result.raw.response_id,
         )  # fmt: skip
         return result
+
+    async def image(
+        self,
+        request: ImageRequest,
+        *,
+        purpose: LLMPurpose,
+        prompt_version: str,
+        items: int = 1,
+    ) -> ImageResponse:
+        """One generated picture, budgeted and recorded exactly like a text call. The bytes
+        never reach the ledger or the log: only the tokens they cost."""
+        request_chars = len(request.prompt)
+        await self._check_budget(estimate_tokens(request_chars) + IMAGE_OUTPUT_TOKENS)
+        model = request.model or self._provider.default_image_model
+        started = time.monotonic()
+        try:
+            response = await self._provider.generate_image(request)
+        except LLMError as exc:
+            usage = exc.usage if isinstance(exc, LLMResponseError) else None
+            await self._record(
+                purpose, prompt_version, model, items, request_chars, started,
+                status=LLMCallStatus.FAILED, usage=usage, error=f"{type(exc).__name__}: {exc}",
+            )  # fmt: skip
+            raise
+        await self._record(
+            purpose, prompt_version, response.model, items, request_chars, started,
+            status=LLMCallStatus.SUCCEEDED, usage=response.usage, response_id=response.response_id,
+        )  # fmt: skip
+        return response
 
     def estimate(self, request: LLMRequest) -> int:
         """Tokens a call is budgeted at before it's made: the prompt plus a quarter of the

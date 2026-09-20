@@ -14,13 +14,15 @@ from sqlalchemy import select
 
 from app.cms import LazyCMS
 from app.cms.github.mdx import split_frontmatter
-from app.config import Settings
+from app.config import DEFAULT_GEMINI_IMAGE_MODEL, Settings
 from app.crawling.fetcher import PoliteFetcher
 from app.db import queries
 from app.db.models import (
     Article,
     ArticleApproval,
+    ArticleCover,
     Job,
+    LLMCall,
     Opportunity,
     Publication,
     PublicationAttempt,
@@ -28,12 +30,16 @@ from app.db.models import (
 )
 from app.db.session import create_engine as create_async_db_engine
 from app.db.session import create_session_factory
+from app.domain.analysis import LLMPurpose
 from app.domain.articles import ArticleStatus
 from app.domain.history import RunStatus, RunTrigger
 from app.domain.jobs import JobStatus, StageStatus
 from app.domain.opportunities import OpportunityStatus
 from app.domain.publishing import ApprovalChannel, PublicationStatus, TargetStatus
+from app.llm import LazyLLM, LLMResponseError
+from app.prompts import cover_image
 from app.services.approvals import ApprovalService
+from app.services.covers import CoverService
 from app.services.daily_limits import published_on
 from app.services.publishing import (
     PublishingConflictError,
@@ -42,7 +48,7 @@ from app.services.publishing import (
     PublishRequestResult,
 )
 from tests.fakegithub import BASE, REPO, SITE, TOKEN, FakeGitHub
-from tests.fakellm import FakeLLM
+from tests.fakellm import COVER_PNG, COVER_SIZE, FakeLLM
 from tests.fakesite import (
     NOW,
     FakeClock,
@@ -88,7 +94,13 @@ class Git:
 
     def service(self, **overrides: Any) -> PublishingService:
         s = self.settings(**overrides)
-        return PublishingService(self.world.env.engine, self.world.env.sessions, s, LazyCMS(s, sleep=self.clock.sleep, clock=self.clock), now=self.world.env.wall, sleep=no_sleep)  # type: ignore[arg-type]  # fmt: skip
+        covers = self.covers(**overrides)
+        cms = LazyCMS(s, sleep=self.clock.sleep, clock=self.clock, covers=covers)
+        return PublishingService(self.world.env.engine, self.world.env.sessions, s, cms, now=self.world.env.wall, sleep=no_sleep, covers=covers)  # type: ignore[arg-type]  # fmt: skip
+
+    def covers(self, **overrides: Any) -> CoverService:
+        s = self.settings(**overrides)
+        return CoverService(self.world.env.sessions, s, LazyLLM(s, provider=self.world.fake), now=self.world.env.wall)  # fmt: skip
 
     async def approve(self) -> None:
         await ApprovalService(self.world.env.sessions, self.settings(), now=self.world.env.wall).approve(self.article_id, channel=ApprovalChannel.CLI, approver="atul", note="Reviewed.")  # fmt: skip
@@ -304,6 +316,169 @@ async def test_secrets_never_reach_the_ledger_or_the_pull_request(git: Git) -> N
     assert TOKEN not in haystack
 
 
+# ── cover images ─────────────────────────────────────────────────────────────
+
+COVERS: dict[str, Any] = {"publish_cover_images": True}
+
+
+async def covers_of(git: Git) -> list[ArticleCover]:
+    async with git.world.env.sessions() as session:
+        return list(await session.scalars(select(ArticleCover).order_by(ArticleCover.id)))
+
+
+async def cover_calls(git: Git) -> list[LLMCall]:
+    async with git.world.env.sessions() as session:
+        return list(await session.scalars(select(LLMCall).where(LLMCall.purpose == LLMPurpose.COVER_IMAGE.value).order_by(LLMCall.id)))  # fmt: skip
+
+
+def cover_path(git: Git) -> str:
+    [pr] = git.gh.pulls.values()
+    return f"public/blog/covers/{pr.head.removeprefix('blog/')}.png"
+
+
+async def test_by_default_no_cover_is_generated_or_committed(git: Git) -> None:
+    await git.approve()
+    _, outcome = await git.publish()
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert git.world.fake.image_requests == []
+    assert await covers_of(git) == []
+    assert git.gh.images(branch=next(iter(git.gh.pulls.values())).head) == []
+    file = git.gh.file(next(iter(git.gh.pulls.values())).head.removeprefix("blog/"), branch=next(iter(git.gh.pulls.values())).head)  # fmt: skip
+    assert file is not None
+    assert "coverImage" not in file
+
+
+async def test_the_post_carries_a_cover_that_is_committed_to_its_own_branch(git: Git) -> None:
+    await git.approve()
+    result, outcome = await git.publish(**COVERS)
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    [pr] = git.gh.pulls.values()
+    fields, _ = split_frontmatter(git.gh.file(pr.head.removeprefix("blog/"), branch=pr.head) or "")
+    assert fields is not None
+    slug = pr.head.removeprefix("blog/")
+    assert fields["coverImage"] == f"/blog/covers/{slug}.png"
+    assert (fields["coverWidth"], fields["coverHeight"]) == COVER_SIZE
+    assert git.gh.image(cover_path(git), branch=pr.head) == COVER_PNG
+    assert git.gh.image(cover_path(git)) is None  # only on the post's branch
+    [row] = await covers_of(git)
+    assert (row.article_id, row.mime, row.byte_size) == (git.article_id, "image/png", len(COVER_PNG))  # fmt: skip
+    assert row.prompt_version == cover_image.VERSION
+    publication = await git.publication(result.publication_id or 0)
+    assert publication.version_id == row.version_id
+    assert publication.details["cover_image"]["sha256"] == row.sha256
+    assert publication.details["cover_image"]["alt"] == row.alt
+    assert "bytes" not in str(publication.details)
+
+
+async def test_the_image_prompt_never_carries_the_article_as_an_instruction(git: Git) -> None:
+    await git.approve()
+    await git.publish(**COVERS)
+    [request] = git.world.fake.image_requests
+    assert request.aspect_ratio == "16:9"
+    head, _, rest = request.prompt.partition("<subject>")
+    subject, _, tail = rest.partition("</subject>")
+    article = await git.world.article()
+    assert article.title in subject
+    assert article.title not in head
+    assert article.title not in tail
+    assert "No text anywhere in the image" in head
+    assert "No identifiable people" in head
+    assert tail.strip().endswith("Produce one image.")
+
+
+async def test_the_cover_call_is_in_the_ledger_under_its_own_purpose(git: Git) -> None:
+    await git.approve()
+    result, _ = await git.publish(**COVERS)
+    [call] = await cover_calls(git)
+    assert call.run_id == result.run_id
+    assert call.status == "succeeded"
+    assert call.model == DEFAULT_GEMINI_IMAGE_MODEL  # GEMINI_IMAGE_MODEL, not GEMINI_MODEL
+    assert call.prompt_version == cover_image.VERSION
+    assert call.total_tokens > 0  # the daily budget and the run's usage count it
+
+
+async def test_the_cover_is_generated_once_and_reused_by_a_second_publish(git: Git) -> None:
+    await git.approve()
+    await git.publish(**COVERS)
+    [row] = await covers_of(git)
+    commits = [c for c in git.gh.mutations if c[1].endswith(f"{cover_path(git)}")]
+    assert len(commits) == 1
+    _, outcome = await git.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True, **COVERS)  # fmt: skip
+    assert outcome.status is PublicationStatus.PUBLISHED, outcome.error
+    assert len(git.world.fake.image_requests) == 1  # the image model was called exactly once
+    assert [c.sha256 for c in await covers_of(git)] == [row.sha256]
+    assert len(await cover_calls(git)) == 1
+    assert [c for c in git.gh.mutations if c[1].endswith(f"{cover_path(git)}")] == commits
+    assert git.gh.image(cover_path(git)) == COVER_PNG  # merged to main with the post
+
+
+async def test_a_publish_retried_after_a_lost_answer_neither_regenerates_nor_duplicates_it(git: Git) -> None:  # fmt: skip
+    await git.approve()
+    git.gh.fail("create_pull", "lost")
+    result, outcome = await git.publish(**COVERS)
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert await git.attempts(result.publication_id or 0) == [("create", "unknown"), ("reconcile", "succeeded")]  # fmt: skip
+    [pr] = git.gh.pulls.values()
+    commits = [c for c in git.gh.mutations if c[1].endswith(f"{cover_path(git)}")]
+    assert len(commits) == 1
+    assert git.gh.image(cover_path(git), branch=pr.head) == COVER_PNG
+    assert len(git.world.fake.image_requests) == 1
+    assert len(await covers_of(git)) == 1
+
+
+async def test_a_generation_failure_publishes_without_a_cover_and_warns(git: Git) -> None:
+    await git.approve()
+    git.world.fake.image_failures.append(LLMResponseError("the model refused to draw this (fake)"))
+    result, outcome = await git.publish(**COVERS)
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert outcome.status is PublicationStatus.DRAFT_CREATED
+    assert any("no cover image" in w for w in outcome.warnings), outcome.warnings
+    assert await covers_of(git) == []
+    [pr] = git.gh.pulls.values()
+    file = git.gh.file(pr.head.removeprefix("blog/"), branch=pr.head)
+    assert file is not None
+    assert "coverImage" not in file
+    assert git.gh.images(branch=pr.head) == []
+    [call] = await cover_calls(git)
+    assert call.status == "failed"  # the attempt is still on the ledger
+    publication = await git.publication(result.publication_id or 0)
+    assert publication.details["cover_image"] is None
+    assert any("no cover image" in w for w in publication.details["warnings"])
+
+
+async def test_an_image_type_the_site_cannot_serve_is_never_committed(git: Git) -> None:
+    git.world.fake.image_mime = "image/gif"
+    await git.approve()
+    _, outcome = await git.publish(**COVERS)
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert any("no cover image" in w for w in outcome.warnings), outcome.warnings
+    assert await covers_of(git) == []
+    assert git.gh.images(branch=next(iter(git.gh.pulls.values())).head) == []
+
+
+async def test_the_stored_picture_is_what_the_adapter_is_handed(git: Git) -> None:
+    await git.approve()
+    await git.publish(**COVERS)
+    [row] = await covers_of(git)
+    found = await git.covers(**COVERS).image(row.article_id, row.version_id)
+    assert found is not None
+    rendered, data = found
+    assert data == COVER_PNG
+    assert (rendered.sha256, rendered.mime, rendered.width, rendered.height) == (row.sha256, "image/png", *COVER_SIZE)  # fmt: skip
+    assert await git.covers(**COVERS).image(row.article_id, row.version_id + 999) is None
+
+
+async def test_a_dry_run_shows_the_frontmatter_without_generating_a_picture(git: Git) -> None:
+    await git.approve()
+    dry = await git.service(**COVERS).dry_run(git.article_id)
+    assert dry.preflight.ready
+    assert git.world.fake.image_requests == []
+    assert await covers_of(git) == []
+    assert dry.payload is not None
+    assert "coverImage" not in dry.payload["content"]
+    assert git.gh.mutations == []
+
+
 # ── the Phase 8 pipeline with the GitHub adapter ─────────────────────────────
 
 
@@ -355,6 +530,22 @@ async def test_the_pipeline_publishes_one_article_through_a_pull_request(grig: t
     assert approval.method == "auto"
     assert job.report["today"]["published"] == 1
     assert TOKEN not in str(job_row.details)
+
+
+async def test_the_autonomous_pipeline_publishes_a_post_with_its_cover(grig: tuple[GitRig, FakeGitHub]) -> None:  # fmt: skip
+    rig, gh = grig
+    job = await rig.run(publish_cover_images=True)
+    assert job.status is JobStatus.COMPLETED, job.last_error
+    [pr] = list(gh.pulls.values())
+    slug = pr.head.removeprefix("blog/")
+    assert gh.image(f"public/blog/covers/{slug}.png") == COVER_PNG  # merged to main
+    fields, _ = split_frontmatter(gh.file(slug) or "")
+    assert fields is not None
+    assert fields["coverImage"] == f"/blog/covers/{slug}.png"
+    async with rig.env.sessions() as session:
+        assert len(list(await session.scalars(select(ArticleCover)))) == 1
+        calls = list(await session.scalars(select(LLMCall).where(LLMCall.purpose == LLMPurpose.COVER_IMAGE.value)))  # fmt: skip
+    assert len(calls) == 1  # one image call for the whole autonomous run
 
 
 async def test_running_the_pipeline_again_creates_no_second_pull_request(grig: tuple[GitRig, FakeGitHub]) -> None:  # fmt: skip

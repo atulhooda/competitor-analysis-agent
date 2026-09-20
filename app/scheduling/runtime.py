@@ -17,6 +17,7 @@ from app.db.session import SessionFactory, create_engine, create_session_factory
 from app.llm import LazyLLM, LLMProvider
 from app.services.analysis import AnalysisService
 from app.services.articles import ArticleService
+from app.services.covers import CoverService
 from app.services.editorial import EditorialService
 from app.services.jobs import JobService
 from app.services.opportunities import OpportunityService
@@ -51,14 +52,15 @@ async def standalone(settings: Settings, *, pooled: bool = True, fetcher: Polite
     sessions = create_session_factory(engine)
     active_fetcher = fetcher or PoliteFetcher(settings)
     lazy_llm = LazyLLM(settings, provider=llm)
-    lazy_cms = cms or LazyCMS(settings)
+    covers = CoverService(sessions, settings, lazy_llm)
+    lazy_cms = cms or LazyCMS(settings, covers=covers)
     services = PipelineServices(
         scans=ScanService(engine, sessions, active_fetcher, settings),
         analyses=AnalysisService(engine, sessions, lazy_llm, settings),
         opportunities=OpportunityService(engine, sessions, lazy_llm, settings),
         articles=ArticleService(engine, sessions, lazy_llm, settings, resolver=resolver),
         quality=QualityService(engine, sessions, lazy_llm, settings, resolver=resolver),
-        publishing=PublishingService(engine, sessions, settings, lazy_cms),
+        publishing=PublishingService(engine, sessions, settings, lazy_cms, covers=covers),
         cms=lazy_cms,
         llm=lazy_llm,
         editorial=EditorialService(engine, sessions, lazy_llm, settings, fetcher=active_fetcher),

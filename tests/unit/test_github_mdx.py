@@ -25,7 +25,13 @@ from app.cms.github.mdx import (
     validate,
 )
 from app.domain.articles import ArticleContent, BlockType, ContentBlock, ContentSection, SectionKind
-from app.domain.publishing import RenderedDocument, RenderedFAQ, RenderedLink, RenderedSource
+from app.domain.publishing import (
+    RenderedCover,
+    RenderedDocument,
+    RenderedFAQ,
+    RenderedLink,
+    RenderedSource,
+)
 from app.services.article_markdown import MarkdownLink, mdx_escape, render_markdown_body
 
 MARKER = "0123456789abcdef0123456789abcdef"
@@ -291,6 +297,63 @@ def test_the_author_linkedin_is_only_written_when_configured() -> None:
 def test_validation_catches_what_would_break_the_build_or_the_contract(text: str, problem: str) -> None:  # fmt: skip
     problems = validate(text % MARKER if "%s" in text else text, marker=MARKER)
     assert any(problem in p for p in problems), problems
+
+
+# ── the cover image ──────────────────────────────────────────────────────────
+
+
+def cover(**overrides: Any) -> RenderedCover:
+    values: dict[str, Any] = {"filename": "missed-calls.png", "mime": "image/png", "alt": "Abstract editorial illustration about missed calls", "width": 1536, "height": 864, "sha256": "a" * 64}  # fmt: skip
+    values.update(overrides)
+    return RenderedCover(**values)
+
+
+def test_a_document_without_a_cover_writes_no_cover_keys() -> None:
+    mdx = compose(document(), marker=MARKER, config=config(), allowed_paths=ALLOWED, published_on=date(2026, 9, 16))  # fmt: skip
+    fields, _ = split_frontmatter(mdx.text)
+    assert fields is not None
+    assert not {"coverImage", "coverWidth", "coverHeight"} & set(fields)
+    assert mdx.cover_path is None
+
+
+def test_the_cover_is_named_after_the_post_and_sits_between_tags_and_draft() -> None:
+    mdx = compose(document(cover=cover()), marker=MARKER, config=config(), allowed_paths=ALLOWED, published_on=date(2026, 9, 16))  # fmt: skip
+    assert mdx.cover_path == "public/blog/covers/why-clinics-miss-calls-the-2026-data.png"
+    assert "\ntags:\n  - 'missed calls'\n  - 'clinics'\n  - 'patient calls'\ncoverImage: '/blog/covers/why-clinics-miss-calls-the-2026-data.png'\ncoverWidth: 1536\ncoverHeight: 864\ndraft: false\n" in mdx.text  # fmt: skip
+    fields, _ = split_frontmatter(mdx.text)
+    assert fields is not None
+    assert fields["coverImage"] == "/blog/covers/why-clinics-miss-calls-the-2026-data.png"
+    assert (fields["coverWidth"], fields["coverHeight"]) == (1536, 864)  # numbers, not strings
+    assert validate(mdx.text, marker=MARKER) == []
+
+
+def test_the_cover_directory_and_url_prefix_are_configuration() -> None:
+    mdx = compose(document(cover=cover(filename="x.jpg", mime="image/jpeg")), marker=MARKER, config=config(cover_dir="static/img", cover_url_prefix="/img"), allowed_paths=ALLOWED, published_on=date(2026, 9, 16))  # fmt: skip
+    assert mdx.cover_path == "static/img/why-clinics-miss-calls-the-2026-data.jpg"
+    assert "coverImage: '/img/why-clinics-miss-calls-the-2026-data.jpg'" in mdx.text
+
+
+def test_a_cover_of_unknown_size_is_referenced_without_dimensions() -> None:
+    mdx = compose(document(cover=cover(width=None, height=None)), marker=MARKER, config=config(), allowed_paths=ALLOWED, published_on=date(2026, 9, 16))  # fmt: skip
+    fields, _ = split_frontmatter(mdx.text)
+    assert fields is not None
+    assert "coverImage" in fields
+    assert not {"coverWidth", "coverHeight"} & set(fields)
+    assert validate(mdx.text, marker=MARKER) == []
+
+
+@pytest.mark.parametrize(
+    ("keys", "problem"),
+    [
+        ("coverImage: 'blog/covers/x.png'", "site-absolute image path"),
+        ("coverImage: '/blog/covers/x.pdf'", "site-absolute image path"),
+        ("coverImage: '/blog/covers/x.png'\ncoverWidth: '1536'", "positive number"),
+        ("coverWidth: 1536", "coverWidth without a coverImage"),
+    ],
+)
+def test_validation_rejects_a_cover_the_site_would_ignore(keys: str, problem: str) -> None:
+    text = f"---\ntitle: 'T'\npublishedAt: '2026-09-16'\ndescription: 'd'\ncategory: 'Playbook'\ntags: []\n{keys}\ndraft: false\nagentPublication: '{MARKER}'\n---\n\n<BlogCTA title=\"a\" />\n"  # fmt: skip
+    assert any(problem in p for p in validate(text, marker=MARKER)), validate(text, marker=MARKER)
 
 
 def test_the_pull_request_description_carries_provenance_and_no_secret() -> None:

@@ -134,6 +134,7 @@ class LLMPurpose(StrEnum):
     QUALITY_JUDGE = "quality_judge"
     ARTICLE_REVISION = "article_revision"
     EDITORIAL_TOPICS = "editorial_topics"  # article ideas from the company profile alone
+    COVER_IMAGE = "cover_image"  # the cover picture of a published post (an image model)
 
 
 class LLMCallStatus(StrEnum):

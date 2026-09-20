@@ -4,9 +4,14 @@ Vercel deploys.
 
     PublishingService → PublishingAdapter → GitHubPublishingAdapter → GitHub API → the site's repo
 
-- **Every step is "ensure", never "create blindly".** A branch, a file, a pull request and a
-  merge are each looked up before they are made, so a retry after a lost answer, a crash or
-  a timeout continues from what exists: one branch, one file, one pull request, one merge.
+- **Every step is "ensure", never "create blindly".** A branch, a file, a cover image, a
+  pull request and a merge are each looked up before they are made, so a retry after a lost
+  answer, a crash or a timeout continues from what exists: one branch, one file, one
+  picture, one pull request, one merge.
+- **The cover image.** When the article has one (PUBLISH_COVER_IMAGES), it is committed to
+  the same branch as the post and named in its frontmatter. The bytes come from the injected
+  ``CoverSource`` and only when the file is missing on that branch: a retried publish never
+  regenerates or re-commits a picture.
 - **Identities.** A post's external id is ``pr:<number>`` once a pull request exists,
   ``branch:<name>`` while only the branch and file exist, and ``main:<slug>`` for a post on
   the base branch without a known pull request. Ownership is the ``agentPublication``
@@ -38,7 +43,7 @@ import httpx
 import structlog
 from pydantic import SecretStr
 
-from app.cms.base import CMSCheck, CMSPost, TermRef, TermResolution
+from app.cms.base import CMSCheck, CMSPost, CoverSource, TermRef, TermResolution
 from app.cms.errors import (
     CMSAuthError,
     CMSConflictError,
@@ -150,9 +155,11 @@ class GitHubPublishingAdapter:
         clock: Callable[[], float] = time.monotonic,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         today: Callable[[], date] | None = None,
+        covers: CoverSource | None = None,
     ) -> None:
         self._gh = client
         self._site = site
+        self._covers = covers
         self._repo = client.repo
         self._base = base_branch
         self._config = config
@@ -264,12 +271,18 @@ class GitHubPublishingAdapter:
         notes = list(mdx.notes)
         if self._allowed_paths is None:
             notes.append("internal links were checked against the default site pages only (the sitemap wasn't read)")  # fmt: skip
+        cover = None
+        if mdx.cover_path and document.cover is not None and document.article_id and document.version_id:  # fmt: skip
+            # Where the picture goes and how to ask for it: never the bytes (this payload is
+            # hashed, stored on every attempt and printed by dry runs).
+            cover = {"path": mdx.cover_path, "url": mdx.frontmatter["coverImage"], "article_id": document.article_id, "version_id": document.version_id, "mime": document.cover.mime, "sha256": document.cover.sha256, "alt": document.cover.alt}  # fmt: skip
         return {
             "slug": mdx.slug,
             "path": mdx.path,
             "branch": mdx.branch,
             "title": mdx.title,
             "status": status.value,
+            "cover": cover,
             "frontmatter": dict(mdx.frontmatter),
             "body": mdx.text[len(frontmatter_text(mdx.frontmatter)) + 1 :],
             "content": mdx.text,
@@ -311,6 +324,7 @@ class GitHubPublishingAdapter:
         verified (and, for a public target, the pull request merged and verified live)."""
         branch, path = str(payload["branch"]), str(payload["path"])
         await self._ensure_branch(branch)
+        await self._ensure_cover(branch, payload)
         await self._ensure_file(branch, path, str(payload["content"]), str(payload["commit_message"]))  # fmt: skip
         pr = await self._ensure_pr(branch, str(payload["pr_title"]), str(payload["pr_body"]))
         if pr is None:  # nothing to propose: the base branch already holds this file
@@ -329,10 +343,12 @@ class GitHubPublishingAdapter:
             if pr.get("state") != "open":
                 raise CMSConflictError(f"pull request #{value} was closed without being merged: reopen it, or delete branch {pr['head']['ref']} to start over")  # fmt: skip
             head_branch = str(pr["head"]["ref"])
+            await self._ensure_cover(head_branch, payload)
             await self._ensure_file(head_branch, path, str(payload["content"]), str(payload["commit_message"]))  # fmt: skip
             pr = await self._gh.get(f"repos/{self._repo}/pulls/{value}")
             return await self._from_pr(pr, payload)
         if kind == "branch":
+            await self._ensure_cover(value, payload)
             await self._ensure_file(value, path, str(payload["content"]), str(payload["commit_message"]))  # fmt: skip
             pr = await self._ensure_pr(value, str(payload["pr_title"]), str(payload["pr_body"]))
             if pr is None:
@@ -393,6 +409,7 @@ class GitHubPublishingAdapter:
         follow = {**payload, "content": text, "frontmatter": updated, "commit_message": f"Update blog post: {payload['title']}", "pr_title": f"Update blog post: {payload['title']}"}  # fmt: skip
         branch = str(payload["branch"])
         await self._ensure_branch(branch)
+        await self._ensure_cover(branch, follow)
         await self._ensure_file(branch, str(payload["path"]), text, str(follow["commit_message"]))
         pr = await self._ensure_pr(branch, str(follow["pr_title"]), str(payload["pr_body"]))
         if pr is None:
@@ -435,6 +452,28 @@ class GitHubPublishingAdapter:
         log.info("github.branch", repo=self._repo, branch=branch, base=self._base)
         ref = await self._gh.get(f"repos/{self._repo}/git/ref/heads/{branch}")
         return str(ref["object"]["sha"])
+
+    async def _ensure_cover(self, branch: str, payload: dict[str, Any]) -> None:
+        """The post's cover picture on its own branch, committed at most once.
+
+        The file is looked up first, exactly like the branch, the post and the pull request.
+        Only when it is missing is the cover source asked for the bytes — so a publish
+        retried after a lost answer, a follow-up pull request or a second publication of the
+        same version neither regenerates the picture nor commits it again. A cover that
+        can't be had is a warning: the post is published with the frontmatter it has."""
+        cover = payload.get("cover")
+        if not isinstance(cover, dict) or self._covers is None:
+            return
+        path = str(cover["path"])
+        if await self._gh.get_optional(f"repos/{self._repo}/contents/{path}", {"ref": branch}) is not None:  # fmt: skip
+            return
+        found = await self._covers.image(int(cover["article_id"]), int(cover["version_id"]))
+        if found is None:
+            log.warning("github.cover_unavailable", repo=self._repo, branch=branch, path=path)
+            return
+        data = found[1]
+        await self._gh.put(f"repos/{self._repo}/contents/{path}", {"message": f"Add cover image: {payload['title']}", "content": base64.b64encode(data).decode(), "branch": branch})  # fmt: skip
+        log.info("github.cover", repo=self._repo, branch=branch, path=path, bytes=len(data))
 
     async def _ensure_file(self, branch: str, path: str, content: str, message: str) -> None:
         current = await self._read(path, branch)

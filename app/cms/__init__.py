@@ -14,7 +14,15 @@ from typing import Any
 
 import httpx
 
-from app.cms.base import CMSCheck, CMSPost, CMSPublisher, PublishingAdapter, TermRef, TermResolution
+from app.cms.base import (
+    CMSCheck,
+    CMSPost,
+    CMSPublisher,
+    CoverSource,
+    PublishingAdapter,
+    TermRef,
+    TermResolution,
+)
 from app.cms.errors import CMSConfigurationError, CMSError
 from app.cms.github import GitHubClient, GitHubPublishingAdapter, SiteClient, SiteConfig
 from app.cms.github.mdx import compose
@@ -40,6 +48,8 @@ def site_config(settings: Settings) -> SiteConfig:
         cta_label=settings.publish_cta_label,
         cta_href=settings.publish_cta_href,
         byline=settings.publish_byline,
+        cover_dir=settings.cover_image_dir,
+        cover_url_prefix=settings.cover_image_url_prefix,
     )
 
 
@@ -51,11 +61,15 @@ class LazyCMS:
         transport: httpx.AsyncBaseTransport | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] | None = None,
+        covers: CoverSource | None = None,
     ) -> None:
+        """``covers`` supplies the bytes of a generated cover image to the GitHub adapter,
+        which asks for them only when the picture is missing on the post's branch."""
         self._settings = settings
         self._transport = transport
         self._sleep = sleep
         self._clock = clock
+        self._covers = covers
         self._publisher: PublishingAdapter | None = None
 
     @property
@@ -119,7 +133,7 @@ class LazyCMS:
             )
             site = SiteClient(timeout=s.cms_request_timeout, user_agent=s.crawler_user_agent, transport=self._transport, bypass_secret=s.vercel_protection_bypass_secret)  # fmt: skip
             extra: dict[str, Any] = {"clock": self._clock} if self._clock is not None else {}
-            return GitHubPublishingAdapter(client, site, base_branch=s.github_base_branch, config=site_config(s), deploy_timeout=s.github_deploy_timeout_seconds, deploy_poll=s.github_deploy_poll_seconds, sleep=self._sleep, today=lambda: utcnow().astimezone(s.scheduler_tz).date(), **extra)  # fmt: skip
+            return GitHubPublishingAdapter(client, site, base_branch=s.github_base_branch, config=site_config(s), deploy_timeout=s.github_deploy_timeout_seconds, deploy_poll=s.github_deploy_poll_seconds, sleep=self._sleep, today=lambda: utcnow().astimezone(s.scheduler_tz).date(), covers=self._covers if s.publish_cover_images else None, **extra)  # fmt: skip
         if not (s.wordpress_base_url and s.wordpress_username and s.wordpress_application_password):
             raise CMSConfigurationError(s.cms_hint)
         wp = WordPressClient(
@@ -142,6 +156,7 @@ __all__ = [
     "CMSError",
     "CMSPost",
     "CMSPublisher",
+    "CoverSource",
     "LazyCMS",
     "PublishingAdapter",
     "TermRef",

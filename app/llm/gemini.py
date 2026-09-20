@@ -5,6 +5,9 @@ This is the only module in the application that imports the Gemini SDK.
 Phase 1) never loads it.
 """
 
+import base64
+import binascii
+import struct
 from typing import Any
 
 import httpx
@@ -15,6 +18,8 @@ from pydantic import BaseModel, ValidationError
 from app.llm.base import (
     Citation,
     Grounding,
+    ImageRequest,
+    ImageResponse,
     LLMRequest,
     LLMResponse,
     LLMUsage,
@@ -34,6 +39,11 @@ from app.llm.errors import (
 PROVIDER_NAME = "gemini"
 _USABLE_STATUSES = frozenset({"completed", "incomplete"})
 _CONNECTION_ERRORS = frozenset({"APITimeoutError", "APIConnectionError", "NoResponseError"})
+# An image model answers with an IMAGE content part only when the modality is asked for.
+# "inline" delivery keeps the bytes in the answer, so nothing has to be fetched afterwards.
+IMAGE_MODALITY = "image"
+IMAGE_DELIVERY = "inline"
+IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
 
 
 class GeminiProvider:
@@ -42,6 +52,7 @@ class GeminiProvider:
         *,
         api_key: str,
         model: str,
+        image_model: str = "",
         timeout_seconds: float = 120.0,
         max_retries: int = 2,
         client: genai.Client | None = None,
@@ -51,6 +62,7 @@ class GeminiProvider:
         if not model.strip():
             raise LLMConfigurationError("GEMINI_MODEL is empty")
         self._model = model
+        self._image_model = image_model.strip() or model
         self._client = client or genai.Client(
             api_key=api_key,
             http_options=genai_types.HttpOptions(
@@ -70,8 +82,61 @@ class GeminiProvider:
     def default_model(self) -> str:
         return self._model
 
+    @property
+    def default_image_model(self) -> str:
+        return self._image_model
+
     async def generate(self, request: LLMRequest) -> LLMResponse:
         return await self._create(request)
+
+    async def generate_image(self, request: ImageRequest) -> ImageResponse:
+        """One picture from a Gemini image model. The IMAGE response modality is asked for
+        explicitly; a model that answers with text only (a safety refusal) raises."""
+        model = request.model or self._image_model
+        body: dict[str, Any] = {
+            "model": model,
+            "input": request.prompt,
+            "store": False,  # stateless, like every other call
+            "response_modalities": [IMAGE_MODALITY],
+            "response_format": {
+                "type": "image",
+                "aspect_ratio": request.aspect_ratio,
+                "delivery": IMAGE_DELIVERY,
+            },
+        }
+        try:
+            interaction: Any = await self._client.aio.interactions.create(**body)
+        except Exception as exc:
+            mapped = _map_sdk_error(exc)
+            if mapped is None:
+                raise
+            raise mapped from exc
+
+        status = str(getattr(interaction, "status", "") or "")
+        usage = _usage(getattr(interaction, "usage", None))
+        if status not in _USABLE_STATUSES:
+            raise LLMResponseError(
+                f"Gemini interaction ended with status {status!r}{_errors(interaction)}",
+                usage=usage,
+            )
+        found = _image_part(interaction)
+        if found is None:
+            text = str(getattr(interaction, "output_text", "") or "").strip()
+            detail = f": it answered with text ({text[:200]!r})" if text else _errors(interaction)
+            raise LLMResponseError(f"Gemini returned no image (status {status!r}){detail}", usage=usage)  # fmt: skip
+        data, mime = found
+        width, height = _dimensions(data)
+        return ImageResponse(
+            data=data,
+            mime_type=mime,
+            provider=PROVIDER_NAME,
+            model=str(getattr(interaction, "model", None) or model),
+            usage=usage,
+            width=width,
+            height=height,
+            finish_reason=status,
+            response_id=getattr(interaction, "id", None) or None,
+        )
 
     async def generate_structured[T: BaseModel](
         self, request: LLMRequest, schema: type[T]
@@ -240,6 +305,82 @@ def _grounding(interaction: Any) -> Grounding:
         requested_urls=tuple(dict.fromkeys(requested)),
         retrieved_urls=tuple(retrieved),
     )
+
+
+def _image_part(interaction: Any) -> tuple[bytes, str] | None:
+    """The first usable image in the interaction's output, as (bytes, mime type).
+
+    The SDK's own shape is a flat image content part (``data`` as base64, ``mime_type``); a
+    nested ``image`` / ``inline_data`` holder is read too, the way ``_grounding`` reads steps
+    defensively. A part that only carries a ``uri`` is ignored: this process never fetches
+    an image, and a type the site can't serve is no image at all."""
+    for content in _output_contents(interaction):
+        if _attr(content, "type") not in (None, "image"):
+            continue
+        for holder in (content, _attr(content, "image"), _attr(content, "inline_data")):
+            if holder is None:
+                continue
+            mime = str(_attr(holder, "mime_type") or "").split(";")[0].strip().lower()
+            data = _decoded(_attr(holder, "data"))
+            if data and mime in IMAGE_MIME_TYPES:
+                return data, mime
+    return None
+
+
+def _attr(holder: Any, name: str) -> Any:
+    return holder.get(name) if isinstance(holder, dict) else getattr(holder, name, None)
+
+
+def _output_contents(interaction: Any) -> list[Any]:
+    """Every content part of the model's output, whichever shape the SDK returns."""
+    parts: list[Any] = []
+    for step in getattr(interaction, "steps", None) or []:
+        if getattr(step, "type", None) in (None, "model_output"):
+            parts += list(getattr(step, "content", None) or [])
+    for item in getattr(interaction, "output", None) or []:
+        parts += list(getattr(item, "content", None) or []) or [item]
+    return parts
+
+
+def _decoded(raw: Any) -> bytes:
+    """Image bytes from what the SDK gives: raw bytes, or standard or URL-safe base64."""
+    if isinstance(raw, bytes | bytearray):
+        return bytes(raw)
+    if not isinstance(raw, str) or not raw:
+        return b""
+    for altchars in (b"+/", b"-_"):
+        try:
+            return base64.b64decode(raw, altchars=altchars, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+    return b""
+
+
+def _dimensions(data: bytes) -> tuple[int | None, int | None]:
+    """Native pixel size read from the image's own header (PNG, JPEG, WebP). The site
+    renders the cover at its natural aspect ratio when both are known."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+        width, height = struct.unpack(">II", data[16:24])
+        return int(width), int(height)
+    if data[:2] == b"\xff\xd8":
+        offset = 2
+        while offset + 9 < len(data):
+            if data[offset] != 0xFF:
+                break
+            marker, length = data[offset + 1], int.from_bytes(data[offset + 2 : offset + 4], "big")
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                height, width = struct.unpack(">HH", data[offset + 5 : offset + 9])
+                return int(width), int(height)
+            offset += 2 + length
+    if data[:4] == b"RIFF" and data[8:15] == b"WEBPVP8":
+        if data[12:16] == b"VP8X":
+            width = int.from_bytes(data[24:27], "little") + 1
+            height = int.from_bytes(data[27:30], "little") + 1
+            return width, height
+        if data[12:16] == b"VP8 " and data[23:26] == b"\x9d\x01\x2a":
+            width, height = struct.unpack("<HH", data[26:30])
+            return width & 0x3FFF, height & 0x3FFF
+    return None, None
 
 
 def _errors(interaction: Any) -> str:

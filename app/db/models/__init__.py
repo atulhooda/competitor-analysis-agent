@@ -12,7 +12,8 @@
                (article drafts; Phase 5), ArticleClaimCheck, ArticleOriginalityFlag,
                ArticleQualityReport (validation; Phase 6)
 - publishing:  ArticleApproval, Publication, PublicationAttempt (Phase 7: approved, ready
-               versions only; drafts by default)
+               versions only; drafts by default), ArticleCover (the generated cover
+               picture of one article version)
 - scheduling:  Job, SchedulerState (Phase 8: jobs, checkpoints, the pause switch)
 - ops:         Run, RunEvent, LLMCall (what ran, when, what happened, what it cost)
 
@@ -44,7 +45,12 @@ from app.db.models.config import CompanyProfileVersion, Competitor
 from app.db.models.content import ChangeEvent, ContentItem, ContentVersion
 from app.db.models.jobs import Job, SchedulerState
 from app.db.models.ops import LLMCall, Run, RunEvent
-from app.db.models.publishing import ArticleApproval, Publication, PublicationAttempt
+from app.db.models.publishing import (
+    ArticleApproval,
+    ArticleCover,
+    Publication,
+    PublicationAttempt,
+)
 from app.db.models.raw import RawDocument
 from app.db.models.recommendation import (
     Opportunity,
@@ -58,6 +64,7 @@ __all__ = [
     "ArticleApproval",
     "ArticleCitation",
     "ArticleClaimCheck",
+    "ArticleCover",
     "ArticleOriginalityFlag",
     "ArticleQualityReport",
     "ArticleSource",

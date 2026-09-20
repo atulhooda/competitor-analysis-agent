@@ -9,12 +9,25 @@
   lifecycle status and what was mapped (never credentials).
 - ``PublicationAttempt``: every CMS change attempted for a publication and its outcome
   (succeeded, failed, or unknown and reconciled before any retry).
+- ``ArticleCover``: the generated cover picture of one article version (at most one, by a
+  unique constraint), with the prompt, prompt version and model that made it. Generated
+  once and reused by every retry and every later publication of that version.
 """
 
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, ForeignKey, Identity, Index, String, Text, text
+from sqlalchemy import (
+    BigInteger,
+    ForeignKey,
+    Identity,
+    Index,
+    LargeBinary,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.timeutils import utcnow
@@ -112,3 +125,25 @@ class PublicationAttempt(Base):
     error: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime] = mapped_column(default=utcnow)
     finished_at: Mapped[datetime | None]
+
+
+class ArticleCover(Base):
+    __tablename__ = "article_covers"
+    __table_args__ = (UniqueConstraint("article_id", "version_id"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    article_id: Mapped[int] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"))
+    version_id: Mapped[int] = mapped_column(ForeignKey("article_versions.id", ondelete="CASCADE"), index=True)  # fmt: skip
+    filename: Mapped[str] = mapped_column(Text)  # <slug>.<ext>: only the extension binds the site
+    mime: Mapped[str] = mapped_column(String(64))
+    width: Mapped[int | None]
+    height: Mapped[int | None]
+    # The picture itself. It never enters a rendered document, a payload or a log line.
+    data: Mapped[bytes] = mapped_column("bytes", LargeBinary)
+    byte_size: Mapped[int]
+    sha256: Mapped[str] = mapped_column(String(64))
+    alt: Mapped[str] = mapped_column(Text)
+    prompt: Mapped[str] = mapped_column(Text)
+    prompt_version: Mapped[str] = mapped_column(String(64))
+    model: Mapped[str] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)

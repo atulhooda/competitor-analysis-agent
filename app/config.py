@@ -29,6 +29,8 @@ ReasoningLevel = Literal["minimal", "low", "medium", "high"]
 
 # Latest stable Gemini model at the time of writing (see README). Override with GEMINI_MODEL.
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+# Gemini's image model, used only for blog cover images. Override with GEMINI_IMAGE_MODEL.
+DEFAULT_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
 DEFAULT_USER_AGENT = (
     "CompetitorMonitorBot/0.1 (+https://github.com/atulhooda/competitor-analysis-agent)"
 )
@@ -108,6 +110,8 @@ class Settings(BaseSettings):
     # (competitor profiles, landscape reports, change summaries, topic consolidation).
     gemini_analysis_model: str | None = None
     gemini_synthesis_model: str | None = None
+    # Blog cover images (PUBLISH_COVER_IMAGES); never used for text.
+    gemini_image_model: str = DEFAULT_GEMINI_IMAGE_MODEL
     analysis_reasoning_effort: ReasoningLevel = "low"
     synthesis_reasoning_effort: ReasoningLevel = "medium"
     # Cost controls. Tokens are counted from Gemini's reported usage.
@@ -224,6 +228,12 @@ class Settings(BaseSettings):
     publish_cta_label: str = "Book a demo"
     publish_cta_href: str = "/contact?intent=demo"
     publish_byline: str = "The Engageo Team builds AI missed-call recovery and WhatsApp automation for Indian clinics and hospitals. This article was researched and written with AI assistance and checked against its sources before publication."  # fmt: skip
+    # Cover images (off by default): one Gemini-generated picture per published post,
+    # committed to the site's repository on the post's own branch and named in its
+    # frontmatter. A failure to generate one never stops publishing.
+    publish_cover_images: bool = False
+    cover_image_dir: str = "public/blog/covers"  # in the site's repository
+    cover_image_url_prefix: str = "/blog/covers"  # what the frontmatter points at
     wordpress_base_url: str | None = None  # e.g. https://blog.example.com (no credentials)
     wordpress_username: str | None = None
     wordpress_application_password: SecretStr | None = None  # an Application Password
@@ -343,6 +353,22 @@ class Settings(BaseSettings):
         if not path or ".." in path.split("/") or any(c.isspace() for c in path):
             raise ValueError("GITHUB_CONTENT_DIR must be a relative directory path such as src/content/blog")  # fmt: skip
         return path
+
+    @field_validator("cover_image_dir")
+    @classmethod
+    def _valid_cover_dir(cls, value: str) -> str:
+        path = value.strip().strip("/")
+        if not path or ".." in path.split("/") or any(c.isspace() for c in path):
+            raise ValueError("COVER_IMAGE_DIR must be a relative directory path such as public/blog/covers")  # fmt: skip
+        return path
+
+    @field_validator("cover_image_url_prefix")
+    @classmethod
+    def _valid_cover_prefix(cls, value: str) -> str:
+        prefix = "/" + value.strip().strip("/")
+        if prefix == "/" or ".." in prefix.split("/") or any(c.isspace() for c in prefix):
+            raise ValueError("COVER_IMAGE_URL_PREFIX must be a site-absolute path such as /blog/covers")  # fmt: skip
+        return prefix
 
     @field_validator("github_branch_prefix")
     @classmethod

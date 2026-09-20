@@ -7,9 +7,11 @@ Discovered from the repository and kept here, not in the core:
   written as quoted ISO strings so the site emits correct published metadata; ``category``
   must be one of the site's six categories (an unknown value silently becomes Playbook
   there); ``tags`` are lowercase; ``draft`` must be ``false`` (a draft is invisible even on
-  preview deployments; the pull request is the review state); ``coverImage``/``cardImage``
-  are omitted (no image is generated). Two keys the site ignores carry ownership:
-  ``agentPublication`` (this publication's marker) and ``agentSource``.
+  preview deployments; the pull request is the review state); ``coverImage`` (with
+  ``coverWidth``/``coverHeight``, unquoted integers, which the detail page uses to render
+  the cover at its natural aspect ratio) appears only when a cover was generated
+  (PUBLISH_COVER_IMAGES); ``cardImage`` is never written. Two keys the site ignores carry
+  ownership: ``agentPublication`` (this publication's marker) and ``agentSource``.
 - **The slug is the filename.** The site derives it from the filename with its own rules,
   applied here first: lowercase ASCII, ``[a-z0-9-]``, no leading, trailing or double dash.
 - **Category.** A fixed mapping from the brief's content format: comparisons →
@@ -55,7 +57,11 @@ AGENT_SOURCE = "competitor-analysis-agent"
 MIN_TAGS, MAX_TAGS, MAX_TAG_LENGTH = 3, 6, 40
 MAX_SLUG_LENGTH = 80
 RELATED_HEADING = "Related reading"
-FRONTMATTER_ORDER = ("title", "description", "publishedAt", "updatedAt", "author", "authorRole", "authorInitials", "authorLinkedin", "category", "tags", "draft", "agentPublication", "agentSource")  # fmt: skip
+# The site's own order; coverImage sits between tags and draft, as its existing posts do.
+FRONTMATTER_ORDER = ("title", "description", "publishedAt", "updatedAt", "author", "authorRole", "authorInitials", "authorLinkedin", "category", "tags", "coverImage", "coverWidth", "coverHeight", "draft", "agentPublication", "agentSource")  # fmt: skip
+COVER_KEYS = ("coverImage", "coverWidth", "coverHeight")
+DEFAULT_COVER_DIR = "public/blog/covers"
+DEFAULT_COVER_URL_PREFIX = "/blog/covers"
 # Site paths that may carry a query (the site's own CTA targets).
 QUERY_PATHS = frozenset({"/contact"})
 _SLUG_ALLOWED = re.compile(r"[^a-z0-9-]+")
@@ -81,6 +87,9 @@ class SiteConfig:
     cta_label: str
     cta_href: str
     byline: str
+    # Where a generated cover is committed, and what the frontmatter points at.
+    cover_dir: str = DEFAULT_COVER_DIR
+    cover_url_prefix: str = DEFAULT_COVER_URL_PREFIX
     categories: tuple[str, ...] = CATEGORIES
     query_paths: frozenset[str] = QUERY_PATHS
 
@@ -102,6 +111,7 @@ class MDXDocument:
     internal_links: tuple[str, ...]
     dropped_links: tuple[str, ...] = ()
     notes: tuple[str, ...] = field(default_factory=tuple)
+    cover_path: str | None = None  # the image file in the repository, when there is a cover
 
 
 # ── the pieces ───────────────────────────────────────────────────────────────
@@ -142,8 +152,18 @@ def site_tags(tags: Iterable[str], *extra: Iterable[str]) -> list[str]:
 def yaml_scalar(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, int):  # coverWidth / coverHeight: the site reads them as numbers
+        return str(value)
     text = str(value).replace("\n", " ").strip()
     return "'" + text.replace("'", "''") + "'"
+
+
+def cover_extension(filename: str, mime: str) -> str:
+    """The extension the cover file keeps in the repository, from its name or its type."""
+    suffix = filename[filename.rfind(".") :].lower() if "." in filename else ""
+    if suffix in (".png", ".jpg", ".jpeg", ".webp"):
+        return suffix
+    return {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(mime.split(";")[0].strip().lower(), ".png")  # fmt: skip
 
 
 def frontmatter_text(fields: dict[str, Any]) -> str:
@@ -284,6 +304,13 @@ def compose(document: RenderedDocument, *, marker: str, config: SiteConfig, allo
         fields["updatedAt"] = updated_on.isoformat()
     if config.author_linkedin:
         fields["authorLinkedin"] = config.author_linkedin
+    cover_path: str | None = None
+    if document.cover is not None:
+        suffix = cover_extension(document.cover.filename, document.cover.mime)
+        cover_path = f"{config.cover_dir}/{slug}{suffix}"
+        fields["coverImage"] = f"{config.cover_url_prefix}/{slug}{suffix}"
+        if document.cover.width and document.cover.height:
+            fields["coverWidth"], fields["coverHeight"] = document.cover.width, document.cover.height  # fmt: skip
     body, kept, dropped = filter_internal_links(document.body_markdown, config, allowed_paths)
     related, related_paths = related_reading(document.links, config, allowed_paths, already=kept)
     parts = [body.strip(), related, cta_block(config), "---", f"*{jsx_attr(config.byline).replace('*', '')}*"]  # fmt: skip
@@ -304,6 +331,7 @@ def compose(document: RenderedDocument, *, marker: str, config: SiteConfig, allo
         internal_links=tuple(kept + related_paths),
         dropped_links=tuple(dropped),
         notes=tuple(notes),
+        cover_path=cover_path,
     )
 
 
@@ -330,6 +358,7 @@ def validate(text: str, *, marker: str, allowed_components: Collection[str] = ("
     tags = fields.get("tags")
     if not isinstance(tags, list) or not all(isinstance(t, str) and t == t.lower() for t in tags):
         problems.append("frontmatter: tags must be a list of lowercase strings")
+    problems += _cover_problems(fields)
     if _ESM_LINE.search(body):
         problems.append("body: a line starts with import/export (MDX would treat it as code)")
     stripped, opened = _without_components(body, allowed_components)
@@ -341,6 +370,24 @@ def validate(text: str, *, marker: str, allowed_components: Collection[str] = ("
         problems.append("body: a '<' before a letter outside a component (MDX would read a tag)")
     if re.search(r"^# ", body, re.MULTILINE):
         problems.append("body: an H1 (the site renders the title)")
+    return problems
+
+
+def _cover_problems(fields: dict[str, Any]) -> list[str]:
+    """The optional cover keys: a site-absolute image path, and two positive integers the
+    site reads as numbers (a quoted "1536" would be ignored there)."""
+    cover = fields.get("coverImage")
+    problems: list[str] = []
+    if cover is not None and (not isinstance(cover, str) or not cover.startswith("/") or any(c.isspace() for c in cover) or not cover.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))):  # fmt: skip
+        problems.append("frontmatter: coverImage must be a site-absolute image path such as /blog/covers/<slug>.png")  # fmt: skip
+    for key in ("coverWidth", "coverHeight"):
+        value = fields.get(key)
+        if value is None:
+            continue
+        if cover is None:
+            problems.append(f"frontmatter: {key} without a coverImage")
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            problems.append(f"frontmatter: {key} must be a positive number (unquoted)")
     return problems
 
 
@@ -395,10 +442,14 @@ __all__ = [
     "AUTOMATIC_CATEGORIES",
     "CATEGORIES",
     "CATEGORY_BY_FORMAT",
+    "COVER_KEYS",
     "DEFAULT_CATEGORY",
+    "DEFAULT_COVER_DIR",
+    "DEFAULT_COVER_URL_PREFIX",
     "MDXDocument",
     "SiteConfig",
     "compose",
+    "cover_extension",
     "cta_block",
     "filter_internal_links",
     "frontmatter_text",

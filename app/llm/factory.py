@@ -24,6 +24,7 @@ def create_llm_provider(settings: Settings) -> LLMProvider:
     return GeminiProvider(
         api_key=settings.gemini_api_key.get_secret_value(),
         model=settings.gemini_model,
+        image_model=settings.gemini_image_model,
         timeout_seconds=settings.llm_timeout_seconds,
         max_retries=settings.llm_max_retries,
     )

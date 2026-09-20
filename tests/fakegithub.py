@@ -6,6 +6,10 @@ go (success, failure, never reported) and whether previews are protected.
 The fake site serves ``/blog/<slug>`` from the base branch's content directory as the real
 site would (title, first heading, canonical, published metadata), and each preview
 deployment serves its branch's file at ``https://preview-<n>.vercel.app/blog/<slug>``.
+
+Binary files (cover images) are kept in ``blobs``, branch by branch, beside the text
+``trees``: they are committed, branched and merged exactly like a post, and ``image()``
+reads one back.
 """
 
 import base64
@@ -25,6 +29,7 @@ TOKEN = "github_pat_fake_token_0123456789abcdefghijklmnop"  # a fake test value,
 SITE = "https://www.engageoagency.com"
 CONTENT_DIR = "src/content/blog"
 BASE = "main"
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 _FRONT = re.compile(r"^---\n(.*?)\n---\n", re.S)
 
 
@@ -57,6 +62,8 @@ class FakeGitHub:
     push: bool = True
     # branch → {path: content}; the base branch starts with the site's existing posts.
     trees: dict[str, dict[str, str]] = field(default_factory=dict)
+    # branch → {path: bytes}: the files that aren't text (cover images).
+    blobs: dict[str, dict[str, bytes]] = field(default_factory=dict)
     branch_heads: dict[str, str] = field(default_factory=dict)
     pulls: dict[int, FakePullRequest] = field(default_factory=dict)
     deployments: list[FakeDeployment] = field(default_factory=list)
@@ -81,6 +88,7 @@ class FakeGitHub:
 
     def __post_init__(self) -> None:
         self.trees.setdefault(BASE, {})
+        self.blobs.setdefault(BASE, {})
         self.branch_heads.setdefault(BASE, "b" * 40)
 
     # ── setup ────────────────────────────────────────────────────────────────
@@ -101,6 +109,12 @@ class FakeGitHub:
 
     def file(self, slug: str, *, branch: str = BASE) -> str | None:
         return self.trees.get(branch, {}).get(f"{CONTENT_DIR}/{slug}.mdx")
+
+    def image(self, path: str, *, branch: str = BASE) -> bytes | None:
+        return self.blobs.get(branch, {}).get(path)
+
+    def images(self, *, branch: str = BASE) -> list[str]:
+        return sorted(self.blobs.get(branch, {}))
 
     def mount(self, router: respx.MockRouter) -> None:
         r = f"/repos/{re.escape(self.repo)}"
@@ -188,6 +202,7 @@ class FakeGitHub:
             return _error(422, "Reference already exists")
         source = next((b for b, sha in self.branch_heads.items() if sha == body["sha"]), BASE)
         self.trees[branch] = dict(self.trees[source])
+        self.blobs[branch] = dict(self.blobs.get(source, {}))
         self.branch_heads[branch] = self.branch_heads[source]
         if failure == "lost":
             raise httpx.ReadTimeout("timed out after the branch was created (fake)", request=request)  # fmt: skip
@@ -202,11 +217,14 @@ class FakeGitHub:
         if branch is None:
             return _error(404, "No commit found for the ref")
         tree = self.trees[branch]
+        blobs = self.blobs.get(branch, {})
         if path in tree:
-            return httpx.Response(200, json=self._file_json(path, tree[path]))
-        entries = sorted({p for p in tree if p.startswith(path + "/")})
+            return httpx.Response(200, json=self._file_json(path, tree[path].encode()))
+        if path in blobs:
+            return httpx.Response(200, json=self._file_json(path, blobs[path]))
+        entries = sorted({p for p in (*tree, *blobs) if p.startswith(path + "/")})
         if entries:
-            return httpx.Response(200, json=[{"name": p.rsplit("/", 1)[-1], "path": p, "type": "file", "sha": _content_sha(tree[p])} for p in entries])  # fmt: skip
+            return httpx.Response(200, json=[{"name": p.rsplit("/", 1)[-1], "path": p, "type": "file", "sha": _content_sha(tree[p].encode() if p in tree else blobs[p])} for p in entries])  # fmt: skip
         return _error(404, "Not Found")
 
     def _put_contents(self, request: httpx.Request, path: str) -> httpx.Response:
@@ -217,20 +235,24 @@ class FakeGitHub:
         branch = body.get("branch") or BASE
         if branch not in self.trees:
             return _error(404, "Branch not found")
-        tree = self.trees[branch]
-        if path in tree and body.get("sha") != _content_sha(tree[path]):
+        # Images are stored as bytes, everything else as the text the site's build reads.
+        store: dict[str, Any] = self.blobs.setdefault(branch, {}) if path.lower().endswith(IMAGE_SUFFIXES) else self.trees[branch]  # fmt: skip
+        current = store.get(path)
+        existing = None if current is None else _content_sha(current if isinstance(current, bytes) else current.encode())  # fmt: skip
+        if current is not None and body.get("sha") != existing:
             return _error(409, f"{path} does not match {body.get('sha')}")
-        if path not in tree and body.get("sha"):
+        if current is None and body.get("sha"):
             return _error(422, "sha given for a new file")
-        tree[path] = base64.b64decode(body["content"]).decode()
+        data = base64.b64decode(body["content"])
+        store[path] = data if path.lower().endswith(IMAGE_SUFFIXES) else data.decode()
         self.branch_heads[branch] = self._sha(branch + path)
         self._new_deployment(branch)
         if failure == "lost":
             raise httpx.ReadTimeout("timed out after the file was committed (fake)", request=request)  # fmt: skip
-        return httpx.Response(200 if body.get("sha") else 201, json={"content": self._file_json(path, tree[path]), "commit": {"sha": self.branch_heads[branch]}})  # fmt: skip
+        return httpx.Response(200 if body.get("sha") else 201, json={"content": self._file_json(path, data), "commit": {"sha": self.branch_heads[branch]}})  # fmt: skip
 
-    def _file_json(self, path: str, text: str) -> dict[str, Any]:
-        return {"type": "file", "name": path.rsplit("/", 1)[-1], "path": path, "sha": _content_sha(text), "content": base64.b64encode(text.encode()).decode()}  # fmt: skip
+    def _file_json(self, path: str, data: bytes) -> dict[str, Any]:
+        return {"type": "file", "name": path.rsplit("/", 1)[-1], "path": path, "sha": _content_sha(data), "content": base64.b64encode(data).decode()}  # fmt: skip
 
     # ── pull requests ────────────────────────────────────────────────────────
 
@@ -268,7 +290,7 @@ class FakeGitHub:
             return _error(422, "Validation Failed", errors=[{"message": f"head branch {head} not found"}])  # fmt: skip
         if any(p.head == head and p.state == "open" for p in self.pulls.values()):
             return _error(422, "Validation Failed", errors=[{"message": f"A pull request already exists for {OWNER}:{head}."}])  # fmt: skip
-        if self.trees[head] == self.trees[base]:
+        if self.trees[head] == self.trees[base] and self.blobs.get(head, {}) == self.blobs.get(base, {}):  # fmt: skip
             return _error(422, "Validation Failed", errors=[{"message": f"No commits between {base} and {head}"}])  # fmt: skip
         self.next_pull += 1
         pr = FakePullRequest(self.next_pull, head, base, str(body["title"]), str(body.get("body") or ""))  # fmt: skip
@@ -301,6 +323,7 @@ class FakeGitHub:
         if body.get("merge_method") != "squash":
             return _error(405, "Merge method not allowed")
         self.trees[pr.base].update(self.trees[pr.head])
+        self.blobs.setdefault(pr.base, {}).update(self.blobs.get(pr.head, {}))
         sha = self._sha(f"merge{pr.number}")
         self.branch_heads[pr.base] = sha
         pr.state, pr.merged_at, pr.merge_commit_sha = "closed", "2026-09-16T10:00:00Z", sha
@@ -396,10 +419,10 @@ def _yaml(text: str) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _content_sha(text: str) -> str:
+def _content_sha(data: bytes) -> str:
     import hashlib
 
-    return hashlib.sha1(text.encode()).hexdigest()  # noqa: S324 - a fake id, not security
+    return hashlib.sha1(data).hexdigest()  # noqa: S324 - a fake id, not security
 
 
 def _error(status: int, message: str, *, errors: list[dict[str, Any]] | None = None, headers: dict[str, str] | None = None) -> httpx.Response:  # fmt: skip
@@ -409,4 +432,4 @@ def _error(status: int, message: str, *, errors: list[dict[str, Any]] | None = N
     return httpx.Response(status, json=body, headers=headers)
 
 
-__all__ = ["API", "BASE", "CONTENT_DIR", "REPO", "SITE", "TOKEN", "FakeDeployment", "FakeGitHub", "FakePullRequest"]  # fmt: skip
+__all__ = ["API", "BASE", "CONTENT_DIR", "IMAGE_SUFFIXES", "REPO", "SITE", "TOKEN", "FakeDeployment", "FakeGitHub", "FakePullRequest"]  # fmt: skip

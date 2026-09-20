@@ -36,6 +36,7 @@ from app.scheduling.runtime import build_scheduling
 from app.services.analysis import AnalysisService
 from app.services.approvals import ApprovalService
 from app.services.articles import ArticleService
+from app.services.covers import CoverService
 from app.services.editorial import EditorialService
 from app.services.intelligence import IntelligenceService
 from app.services.landscape import LandscapeService
@@ -84,9 +85,12 @@ def create_app(
         app.state.editorial = EditorialService(engine, sessions, lazy_llm, settings, fetcher=active_fetcher)  # fmt: skip
         app.state.articles = ArticleService(engine, sessions, lazy_llm, settings, resolver=resolver)
         app.state.quality = QualityService(engine, sessions, lazy_llm, settings, resolver=resolver)
-        lazy_cms = cms or LazyCMS(settings)
+        covers = CoverService(sessions, settings, lazy_llm)
+        lazy_cms = cms or LazyCMS(settings, covers=covers)
         app.state.approvals = ApprovalService(sessions, settings)
-        app.state.publishing = PublishingService(engine, sessions, settings, lazy_cms)
+        app.state.publishing = PublishingService(
+            engine, sessions, settings, lazy_cms, covers=covers
+        )
         # Phase 8: jobs run the same service instances (the schedule itself is the worker's).
         services = PipelineServices(scans=app.state.scans, analyses=app.state.analyses, opportunities=app.state.opportunities, articles=app.state.articles, quality=app.state.quality, publishing=app.state.publishing, cms=lazy_cms, llm=lazy_llm, editorial=app.state.editorial)  # fmt: skip
         scheduling = build_scheduling(engine, sessions, settings, services)

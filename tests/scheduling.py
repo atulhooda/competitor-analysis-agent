@@ -23,6 +23,7 @@ from app.prompts.seo import SEOOut
 from app.scheduling.runtime import Scheduling, build_scheduling
 from app.services.analysis import AnalysisService
 from app.services.articles import ArticleService
+from app.services.covers import CoverService
 from app.services.editorial import EditorialService
 from app.services.jobs import JobContext, JobResult
 from app.services.opportunities import OpportunityService
@@ -76,7 +77,8 @@ class Rig:
         s = self.settings(**overrides)
         env = self.env
         llm = LazyLLM(s, provider=env.fake)
-        cms = LazyCMS(s, sleep=no_sleep)
+        covers = CoverService(env.sessions, s, llm, now=env.wall)
+        cms = LazyCMS(s, sleep=no_sleep, covers=covers)
         engine: Any = env.engine
         services = PipelineServices(
             scans=ScanService(engine, env.sessions, env.fetcher, s, now=env.wall),
@@ -91,7 +93,7 @@ class Rig:
                 engine, env.sessions, llm, s, now=env.wall, resolver=public_resolver
             ),
             publishing=PublishingService(
-                engine, env.sessions, s, cms, now=env.wall, sleep=no_sleep
+                engine, env.sessions, s, cms, now=env.wall, sleep=no_sleep, covers=covers
             ),
             cms=cms,
             llm=llm,

@@ -1210,9 +1210,32 @@ files. The adapter ([app/cms/github/](app/cms/github/)) publishes the way a pers
 | Idempotency | The branch, the file, the pull request and the merge are each looked up before they are made. A lost answer, a crash after the branch, after the commit or after the pull request, a lost pull request number or a merge that timed out all reconcile against `main`, the `blog/*` branches, open pull requests and the marker in the frontmatter |
 | Protection | If Vercel's Deployment Protection blocks the preview, the run stops with a clear error and nothing is merged: nothing is bypassed |
 | Token | `GITHUB_TOKEN`, a fine-grained personal access token for that one repository with *Contents* and *Pull requests* read/write, sent to `api.github.com` only. The site and its previews are fetched without credentials |
+| Cover image | With `PUBLISH_COVER_IMAGES=true`: one Gemini-generated illustration per post, committed to the same branch as `public/blog/covers/<slug>.png` and named in the frontmatter (`coverImage`, plus `coverWidth`/`coverHeight`). See [Cover images](#cover-images) |
 
 `articles publish <id> --dry-run` shows the exact MDX file, branch and pull request title
 without touching GitHub.
+
+### Cover images
+
+Off by default (`PUBLISH_COVER_IMAGES=false`): with it off, nothing here runs and a post is
+published exactly as it was before. With it on, each published post gets one cover picture.
+
+| | |
+|---|---|
+| What | One editorial illustration per article version, drawn by `GEMINI_IMAGE_MODEL` from the article's title, primary keyword, audience and your company profile's positioning and tone |
+| The prompt | [app/prompts/cover_image.py](app/prompts/cover_image.py), versioned like every other prompt. Its hard rules: **no text, letters, numbers, logos or watermarks** (models render text badly, and the site prints the title over the cover anyway), no identifiable people, nothing that could pass as a real photo of a real clinic, patient or medical record, nothing clinical and nothing that claims a result. The article's own words are **untrusted data** inside a delimited block, never instructions |
+| Alt text | Deterministic, from the article's keyword — it describes the illustration and claims nothing |
+| Where it goes | `public/blog/covers/<slug>.png` on the post's own branch, committed before the `.mdx` file, so the pull request and its preview deployment show the post with its cover |
+| Frontmatter | `coverImage: '/blog/covers/<slug>.png'` between `tags` and `draft`, with `coverWidth` / `coverHeight` as unquoted numbers (the site renders the detail header at the picture's natural aspect ratio; cards crop to 1200×630) |
+| Generated once | One `article_covers` row per (article, version), unique in the database. A retry after a lost answer, a second publication of the same version and a follow-up pull request all reuse it: the image model is called exactly once per version |
+| Committed once | The adapter looks the file up on the branch first, like the branch, the post and the pull request, and asks for the bytes only when it is missing |
+| Cost | One image call per published version, in the same `llm_calls` ledger (purpose `cover_image`) and the same `LLM_DAILY_TOKEN_BUDGET` as every text call |
+| Failure | Never fatal. No key, a budget stop, a refusal or an unusable answer is a warning on the publication, and the post is published without a cover |
+| Dry runs | Generate nothing: `--dry-run` shows the file as it stands, without a cover |
+
+The picture's bytes live in `article_covers` only. They never enter a rendered document, a
+CMS payload, a publication's details, a run summary or a log line — the publication records
+the cover's name, type, size, alt text and SHA-256.
 
 The API queues publishing in the background (`202`, `{"publication_id": ..., "status":
 "queued"}`); the CLI runs it straight away. One run per article at a time: publishing shares
@@ -1584,7 +1607,7 @@ PostgreSQL, managed with Alembic migrations (`migrations/`), in separate layers:
 | Recommendations (Phase 4) | `company_profiles`, `opportunities`, `opportunity_assessments`, `opportunity_evidence`, `opportunity_events` | Versioned company profiles; one opportunity per topic with its status; immutable scored assessments (breakdown, gaps, signals, suggestion, Gemini interpretation); the evidence each assessment rests on; the status and scoring timeline |
 | Generation (Phase 5) | `articles`, `article_steps`, `article_versions`, `article_sources`, `article_citations` | Article drafts linked to their opportunity, assessment and company profile version; the checkpoint log; immutable outline/draft/edited versions; retrieved research sources with their facts; claim → source citations. Never published |
 | Validation (Phase 6) | `article_claim_checks`, `article_originality_flags`, `article_quality_reports`; revision rows in `article_versions` | One verdict per (claim, cited source) and per uncited factual claim, with evidence and provenance; flagged passages with the page they overlap; each version's score, breakdown, gates and issues, linked to the steps it came from. The article points at its recommended version and report. Never published |
-| Publishing (Phase 7) | `article_approvals`, `publications`, `publication_attempts` | Decisions on an exact article version and quality report (never deleted; invalidated with a reason; one live per article); one publication per article version and CMS site (idempotency key, post id, URL, status, what was mapped, last preflight); every CMS change attempted and its outcome. No credentials |
+| Publishing (Phase 7) | `article_approvals`, `publications`, `publication_attempts`, `article_covers` | Decisions on an exact article version and quality report (never deleted; invalidated with a reason; one live per article); one publication per article version and CMS site (idempotency key, post id, URL, status, what was mapped, last preflight); every CMS change attempted and its outcome; one generated cover picture per article version, with the prompt, prompt version and model that made it. No credentials |
 | Scheduling (Phase 8) | `jobs`, `scheduler_state`; `publications.limit_day` | One row per execution (type, trigger, status, the scheduled time and its unique key, attempts, heartbeat, error kind, stage checkpoints and progress, the report; no secrets); the persisted pause switch; the local day an automated publication reserved |
 | Operations | `runs`, `run_events`, `llm_calls` | What ran, when, with what result (article runs carry `article_id`); every LLM call with its tokens |
 
@@ -1616,6 +1639,7 @@ topics = await llm.generate_structured(LLMRequest(prompt="..."), TopicList)  # a
 | `GEMINI_API_KEY` | For AI analysis | *(empty)* | Gemini API key. Create one in [Google AI Studio](https://aistudio.google.com/apikey). |
 | `GEMINI_MODEL` | No | `gemini-3.8-flash` | Model ID. Leave empty for the default. |
 | `GEMINI_ANALYSIS_MODEL` / `GEMINI_SYNTHESIS_MODEL` | No | `GEMINI_MODEL` | Per-route models: bulk per-page analysis vs. profiles, briefings, summaries, consolidation, opportunity interpretation |
+| `GEMINI_IMAGE_MODEL` | No | `gemini-3.1-flash-image` | The image model, used only for blog cover images (`PUBLISH_COVER_IMAGES`) and never for text. Also available: `gemini-3-pro-image`, `gemini-2.5-flash-image` |
 | `ANALYSIS_REASONING_EFFORT` / `SYNTHESIS_REASONING_EFFORT` | No | `low` / `medium` | Gemini `thinking_level` per route |
 | `LLM_MAX_TOKENS_PER_RUN` / `LLM_DAILY_TOKEN_BUDGET` | No | `400000` / `2000000` | Hard budgets checked before each call (`0` daily = unlimited) |
 | `LLM_TIMEOUT_SECONDS` | No | `120` | Per-request timeout |
@@ -1645,8 +1669,8 @@ topics = await llm.generate_structured(LLMRequest(prompt="..."), TopicList)  # a
 | 4 · Content opportunities | **Yes, top candidates only:** title, angle, why now, format, audience, rationale. Signals, relevance, gaps, scores and ranking are deterministic; works without a key. |
 | 5 · Article drafts | **Yes:** research (Google Search grounding and URL context), outline, draft, editorial pass. The brief, URL screening, citation checks and completion checks are deterministic. Nothing is published. |
 | 6 · Article validation | **Yes:** claim verdicts (with URL context re-reads), uncited-claim classification, SEO wording, the quality rubric, revisions. Evidence checks, originality, metrics, the score, gates and version selection are deterministic. Nothing is published. |
-| 7 · Publishing (current) | **No.** Approval, rendering, preflight, WordPress calls and reconciliation are deterministic. |
-| 8–10 · Scheduling, social, dashboard | Publishing itself never uses an LLM |
+| 7 · Publishing (current) | **Only the cover picture** (`PUBLISH_COVER_IMAGES`, off by default): an image model draws it, from a prompt the article can only supply data to. Approval, rendering, preflight, the CMS calls and reconciliation are deterministic. |
+| 8–10 · Scheduling, social, dashboard | Publishing decides nothing with an LLM; only a post's cover illustration is generated |
 
 ## Configuration reference
 
@@ -1706,6 +1730,8 @@ All settings are environment variables (or `.env`); see [`.env.example`](.env.ex
 | `PUBLISH_AUTHOR_NAME` / `_ROLE` / `_INITIALS` / `_LINKEDIN` | `Engageo Team` / `AI Content` / `EN` / *(empty)* | The byline of agent-written posts (configuration, never model output) |
 | `PUBLISH_CTA_TITLE` / `_BODY` / `_LABEL` / `_HREF` | see `.env.example` | The one call-to-action block every post ends with |
 | `PUBLISH_BYLINE` | see `.env.example` | The closing italic byline paragraph |
+| `PUBLISH_COVER_IMAGES` | `false` | Generate one cover illustration per published post, commit it to the post's branch and name it in the frontmatter |
+| `COVER_IMAGE_DIR` / `COVER_IMAGE_URL_PREFIX` | `public/blog/covers` / `/blog/covers` | Where the picture is committed in the site's repository, and the path `coverImage` points at |
 | `CMS_REQUEST_TIMEOUT` / `CMS_MAX_RETRIES` | `30` / `2` | Seconds per CMS request; retries of transient failures only |
 | `WORDPRESS_BASE_URL` | *(empty)* | Your site (https; http only for localhost; no credentials in it) |
 | `WORDPRESS_USERNAME` / `WORDPRESS_APPLICATION_PASSWORD` | *(empty)* | The WordPress user and an Application Password (secret; never logged or stored) |

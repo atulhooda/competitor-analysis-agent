@@ -112,6 +112,19 @@ class RenderedFAQ(BaseModel):
     answer: str
 
 
+class RenderedCover(BaseModel):
+    """The cover picture of one article version, described but never carried: the bytes stay
+    in ``article_covers`` and reach the target through the adapter's cover source. This model
+    is serialized into runs, publication details and dry-run output."""
+
+    filename: str = Field(description="<slug>.<ext>; only the extension binds the target")
+    mime: str
+    alt: str
+    width: int | None = None
+    height: int | None = None
+    sha256: str
+
+
 class RenderedDocument(BaseModel):
     """A CMS-neutral rendering of one article version: safe HTML plus its metadata."""
 
@@ -137,6 +150,7 @@ class RenderedDocument(BaseModel):
     faq: list[RenderedFAQ]
     links: list[RenderedLink]
     image: ImageSuggestion | None = Field(description="A suggestion only: no image is generated or uploaded")  # fmt: skip
+    cover: RenderedCover | None = Field(default=None, description="The generated cover, when PUBLISH_COVER_IMAGES is on; metadata only, never the bytes")  # fmt: skip
     word_count: int
     content_hash: str
     unknown_citations: list[str] = Field(default_factory=list)

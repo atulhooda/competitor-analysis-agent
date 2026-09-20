@@ -15,6 +15,8 @@ from pydantic import BaseModel
 
 from app.llm import (
     Grounding,
+    ImageRequest,
+    ImageResponse,
     LLMRequest,
     LLMResponse,
     LLMResponseError,
@@ -53,6 +55,19 @@ from app.prompts.topic_consolidation import ConsolidationOut, MergeGroupOut
 from app.services.article_content import split_sentences, strip_markers
 
 _DOCUMENT = re.compile(r'<document id="(D\d+)">\n(.*?)\n</document>', re.DOTALL)
+# A real 16x9 truecolour PNG (315 bytes): the cover the fake image model "draws". Valid
+# enough that the provider's own header reader finds its size.
+COVER_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000010000000090802000000b4483b65000001024944415478da15"
+    "d0a19180301445d12d620b404650002292027e01c8080a404452400a404650002292024e59cb3e7f66dedc9f"
+    "df644ae66449d624922dd993233993965cc99d3cc99b487e7eb3299bb3255bb3c8b66ccf8eeccc5a766577f6"
+    "646f267f204c610e4b5843842dece1086768e10a7778c21bc4078aa9988ba5588b28b6622f8ee22c5a711577"
+    "f1146fa17ca09aaab95aaab58a6aabf6eaa8ceaa555775574ff556ea079aa9999ba5599b68b6666f8ee66c5a"
+    "733577f3346fa37da09bbab95bbab58b6eebf6eee8ceae755777774ff776fa078669988765588718b6611f8e"
+    "e11cda700df7f00cef607c80899985f53f838d9d83f3ff828b9b87d7fffe002679f1e1db27e1b20000000049"
+    "454e44ae426082"
+)
+COVER_SIZE = (16, 9)
 _TYPE_TO_FORMAT = {
     "blog_post": "article",
     "pricing": "pricing_page",
@@ -165,6 +180,13 @@ class FakeLLM:
     # whether their text cites numbers that aren't in the company profile.
     editorial_pool: list[dict[str, Any]] = field(default_factory=lambda: list(EDITORIAL_POOL))
     editorial_numbers: bool = False
+    # Cover images: every prompt the image model was given, what it draws, and exceptions
+    # raised by the next image calls, in order (None = draw normally).
+    image_model: str = "fake-gemini-image"
+    image_requests: list[ImageRequest] = field(default_factory=list)
+    image_data: bytes = COVER_PNG
+    image_mime: str = "image/png"
+    image_failures: list[Exception | None] = field(default_factory=list)
     closed: bool = False
 
     @property
@@ -175,6 +197,10 @@ class FakeLLM:
     def default_model(self) -> str:
         return self.model
 
+    @property
+    def default_image_model(self) -> str:
+        return self.image_model
+
     def calls(self, schema: type[BaseModel]) -> list[LLMRequest]:
         return [request for request, s in self.requests if s is schema]
 
@@ -183,6 +209,27 @@ class FakeLLM:
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         raise NotImplementedError
+
+    async def generate_image(self, request: ImageRequest) -> ImageResponse:
+        self.image_requests.append(request)
+        if self.image_failures:
+            failure = self.image_failures.pop(0)
+            if failure is not None:
+                raise failure
+        width, height = COVER_SIZE if self.image_data is COVER_PNG else (None, None)
+        prompt_tokens = len(request.prompt) // 4
+        usage = LLMUsage(input_tokens=prompt_tokens, output_tokens=1_290, total_tokens=prompt_tokens + 1_290)  # fmt: skip
+        return ImageResponse(
+            data=self.image_data,
+            mime_type=self.image_mime,
+            provider="fake",
+            model=request.model or self.image_model,
+            usage=usage,
+            width=width,
+            height=height,
+            finish_reason="completed",
+            response_id=f"fake-image-{len(self.image_requests)}",
+        )
 
     async def generate_structured[T: BaseModel](
         self, request: LLMRequest, schema: type[T]
