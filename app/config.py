@@ -133,6 +133,12 @@ class Settings(BaseSettings):
     company_file: Path = Path("config/company.yaml")
     scoring_file: Path = Path("config/scoring.yaml")
 
+    # ── Editorial topics: article ideas from your company profile alone ──────
+    # Gemini proposes ideas; scores (strategic fit), exclusions and duplicate checks are
+    # deterministic. Each idea becomes an opportunity like any other (approval, article,
+    # quality, publishing). MAX_EDITORIAL_ARTICLES_PER_DAY (below) turns the pipeline on.
+    editorial_topics_per_run: int = Field(default=10, ge=1, le=25)  # ideas kept per proposal run
+
     # ── Articles (Phase 5: drafts only, never published) ─────────────────────
     gemini_writing_model: str | None = None  # research, outline, draft, edit (empty → GEMINI_MODEL)
     writing_reasoning_effort: ReasoningLevel = "medium"  # outline, draft, edit
@@ -239,13 +245,16 @@ class Settings(BaseSettings):
     scan_schedule: str | None = None
     analysis_schedule: str | None = None
     opportunity_schedule: str | None = None
+    editorial_schedule: str | None = None
     article_generation_schedule: str | None = None
     quality_schedule: str | None = None
     publish_schedule: str | None = None
     scheduler_catch_up_hours: int = Field(default=24, ge=0, le=168)  # 0: never catch up
     scheduler_poll_seconds: int = Field(default=30, ge=5, le=3_600)
     automated_publishing_enabled: bool = False  # the pipeline's publishing stage (kill switch)
-    max_articles_generated_per_day: int = Field(default=3, ge=0, le=100)  # 0: none
+    # Two separate daily generation allowances, one per opportunity origin.
+    max_articles_generated_per_day: int = Field(default=3, ge=0, le=100)  # competitors; 0: none
+    max_editorial_articles_per_day: int = Field(default=0, ge=0, le=100)  # editorial topics; 0: off
     max_articles_per_day: int = Field(default=1, ge=0, le=100)  # published per day; 0: none
     max_concurrent_pipelines: int = Field(default=1, ge=1, le=4)
     job_stale_after_minutes: int = Field(default=60, ge=5, le=1_440)
@@ -368,7 +377,7 @@ class Settings(BaseSettings):
             raise ValueError(f"SCHEDULER_TIMEZONE {value!r} isn't an IANA timezone (e.g. Asia/Kolkata, Europe/Berlin, UTC)") from exc  # fmt: skip
         return value
 
-    @field_validator("full_pipeline_schedule", "scan_schedule", "analysis_schedule", "opportunity_schedule", "article_generation_schedule", "quality_schedule", "publish_schedule")  # fmt: skip
+    @field_validator("full_pipeline_schedule", "scan_schedule", "analysis_schedule", "opportunity_schedule", "editorial_schedule", "article_generation_schedule", "quality_schedule", "publish_schedule")  # fmt: skip
     @classmethod
     def _valid_schedule(cls, value: str | None) -> str | None:
         if value is None or not value.strip():

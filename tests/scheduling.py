@@ -7,7 +7,7 @@ validate → approval → publish.
 """
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, ClassVar
 
@@ -23,6 +23,7 @@ from app.prompts.seo import SEOOut
 from app.scheduling.runtime import Scheduling, build_scheduling
 from app.services.analysis import AnalysisService
 from app.services.articles import ArticleService
+from app.services.editorial import EditorialService
 from app.services.jobs import JobContext, JobResult
 from app.services.opportunities import OpportunityService
 from app.services.pipeline import PipelineServices
@@ -46,6 +47,10 @@ class Rig:
     env: Env
     wp: FakeWordPress
     opportunity_id: int  # "ai agents", approved
+    site: list[str] = field(default_factory=list)  # slugs of the posts on "your site"
+
+    async def site_posts(self) -> list[str]:
+        return list(self.site)
 
     # Automated publishing fully on (the tests turn switches off one at a time), one article
     # generated and published per day, only the approved opportunity eligible.
@@ -90,6 +95,15 @@ class Rig:
             ),
             cms=cms,
             llm=llm,
+            editorial=EditorialService(
+                engine,
+                env.sessions,
+                llm,
+                s,
+                now=env.wall,
+                scoring=SCORING,
+                site_posts=self.site_posts,
+            ),
         )
         return build_scheduling(engine, env.sessions, s, services, now=env.wall, heartbeat_seconds=3_600)  # fmt: skip
 

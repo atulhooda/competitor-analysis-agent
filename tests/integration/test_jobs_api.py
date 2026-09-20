@@ -37,7 +37,7 @@ async def test_a_dry_run_returns_the_plan_and_changes_nothing(client: httpx.Asyn
     body = response.json()
     assert body["job"]["dry_run"] is True
     assert body["job"]["status"] == "completed"
-    assert body["plan"]["stages"] == ["scan", "analyze", "opportunities", "generate", "quality", "approval", "publish"]  # fmt: skip
+    assert body["plan"]["stages"] == ["scan", "analyze", "opportunities", "editorial", "generate", "quality", "approval", "publish"]  # fmt: skip
     assert "planning mode" in body["plan"]["notes"][0]
     assert response.headers["location"] == f"/api/v1/jobs/{body['job']['id']}"
 

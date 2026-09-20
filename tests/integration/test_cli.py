@@ -279,6 +279,45 @@ def test_company_and_opportunity_commands(configured: Path, monkeypatch: pytest.
     assert "opportunities" in runner.invoke(cli, ["runs"]).output
 
 
+def test_editorial_commands(configured: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:  # fmt: skip
+    import yaml
+
+    from app.llm import LazyLLM
+    from tests.fakellm import FakeLLM
+    from tests.pipeline import ARTICLE_COMPANY
+
+    fake = FakeLLM()
+    monkeypatch.setattr("app.cli.LazyLLM", functools.partial(LazyLLM, provider=fake))
+    refused = runner.invoke(cli, ["editorial", "propose"])
+    assert refused.exit_code == 2  # no company profile
+    assert "company import" in refused.output
+    company = tmp_path / "company.yaml"
+    company.write_text(yaml.safe_dump({"company": ARTICLE_COMPANY}), encoding="utf-8")
+    assert runner.invoke(cli, ["company", "import", "--file", str(company)]).exit_code == 0
+
+    dry = runner.invoke(cli, ["editorial", "propose", "--count", "2", "--dry-run", "--json"])
+    assert dry.exit_code == 0, dry.output
+    report = json.loads(dry.stdout)
+    assert report["summary"]["dry_run"] is True
+    assert [i["topic"] for i in report["ideas"] if not i["rejected"]] == ["AI agent handoff", "Evaluating AI agents"]  # fmt: skip
+    assert json.loads(runner.invoke(cli, ["editorial", "list", "--json"]).stdout) == []
+
+    proposed = runner.invoke(cli, ["editorial", "propose", "--count", "2"])
+    assert proposed.exit_code == 0, proposed.output
+    assert "created" in proposed.output
+    assert "excluded by your company profile ('Pricing')" in proposed.output
+    assert "your site not read" in proposed.output  # no PUBLISH_SITE_URL here
+    listed = json.loads(runner.invoke(cli, ["editorial", "list", "--json"]).stdout)
+    assert [(o["topic_label"], o["origin"], o["status"]) for o in listed] == [("AI agent handoff", "editorial", "new"), ("Evaluating AI agents", "editorial", "new")]  # fmt: skip
+    by_origin = json.loads(runner.invoke(cli, ["opportunities", "list", "--origin", "editorial", "--json"]).stdout)  # fmt: skip
+    assert [o["id"] for o in by_origin] == [o["id"] for o in listed]
+    table = runner.invoke(cli, ["editorial"])
+    assert table.exit_code == 0
+    assert "editorial" in table.output
+    assert "When an AI Agent Should Hand Off" in table.output
+    assert runner.invoke(cli, ["opportunities", "approve", str(listed[0]["id"])]).exit_code == 0
+
+
 # ── Phase 5 ──────────────────────────────────────────────────────────────────
 
 

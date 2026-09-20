@@ -17,6 +17,7 @@ from app.db.session import SessionFactory, create_engine, create_session_factory
 from app.llm import LazyLLM, LLMProvider
 from app.services.analysis import AnalysisService
 from app.services.articles import ArticleService
+from app.services.editorial import EditorialService
 from app.services.jobs import JobService
 from app.services.opportunities import OpportunityService
 from app.services.pipeline import PipelineService, PipelineServices
@@ -60,6 +61,7 @@ async def standalone(settings: Settings, *, pooled: bool = True, fetcher: Polite
         publishing=PublishingService(engine, sessions, settings, lazy_cms),
         cms=lazy_cms,
         llm=lazy_llm,
+        editorial=EditorialService(engine, sessions, lazy_llm, settings, fetcher=active_fetcher),
     )
     try:
         yield build_scheduling(engine, sessions, settings, services)

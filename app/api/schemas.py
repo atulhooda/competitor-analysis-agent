@@ -86,6 +86,13 @@ class OpportunityGenerateRequest(BaseModel):
     force: bool = Field(default=False, description="Re-assess and re-interpret even if unchanged")  # fmt: skip
 
 
+class EditorialProposeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    count: int | None = Field(default=None, ge=1, le=25, description="Ideas to keep (default: EDITORIAL_TOPICS_PER_RUN)")  # fmt: skip
+    dry_run: bool = Field(default=False, description="Return the ideas without saving them (still one Gemini call)")  # fmt: skip
+
+
 class OpportunityStatusUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -339,6 +339,12 @@ uv run python -m app opportunities show 12           # breakdown, gaps, why, int
 uv run python -m app opportunities evidence 12       # the stored evidence behind the current score
 uv run python -m app opportunities history 12        # every assessment, with why the score changed
 uv run python -m app opportunities approve 12 --note "for Q4"   # also: review, reject, use, expire, reopen
+uv run python -m app opportunities list --origin editorial   # or: competitors
+
+# Editorial topics: article ideas from your company profile alone (needs GEMINI_API_KEY)
+uv run python -m app editorial propose --count 10    # ideas → opportunities (status new)
+uv run python -m app editorial propose --dry-run     # see the ideas, save nothing (one call)
+uv run python -m app editorial                       # list editorial topics
 
 # Article drafts (needs GEMINI_API_KEY, except `brief`; nothing is published)
 uv run python -m app articles brief 12               # preview the brief for opportunity 12
@@ -688,6 +694,59 @@ only:
 - **Uncalibrated.** Weights and thresholds are reasoned defaults, not calibrated against
   results. Gemini's confidence is the model's own estimate.
 - **Digits only.** The number check only works on digits; "three times" isn't caught.
+
+## Editorial topics
+
+Competitor monitoring only finds topics your competitors write about. Editorial topics fill
+the rest of the blog: Gemini proposes article ideas from your company profile alone, and
+each accepted idea becomes an ordinary opportunity (key `editorial:<topic>`) that takes the
+same path as every other one: approval, article, validation, article approval, publishing.
+
+```
+company profile + what is already covered (opportunities, articles, your site's posts)
+  → Gemini proposes ideas: topic, title, angle, audience, format, key points
+    (about a third more than asked for: some won't pass the checks)
+  → deterministic checks: excluded topics, strategic fit, near-duplicates of anything
+    covered or of each other, numbers not in your profile
+  → the best ideas by strategic fit → opportunities, status new
+```
+
+- **Scores are never Gemini's.** An idea's score is its strategic fit to your profile × 100,
+  from its topic, keyword and title: on a core topic 70–100, which clears
+  `PIPELINE_MIN_OPPORTUNITY_SCORE` (60); on an adjacent topic 42–60, which waits for a
+  person. Gemini also names the profile topic each idea serves, but the claim counts only when
+  the idea's own words share at least two words with that topic (audience words most of your
+  topics carry, such as "clinics", don't count); it then scores like a partial match (70
+  core, 42 adjacent).
+- **No duplicates.** The ideas are checked against every opportunity (any status, so rejected
+  and expired ones never come back), every article, and your site's posts (read from
+  `PUBLISH_SITE_URL`'s sitemap, politely: robots.txt, rate limits and the SSRF guard apply).
+  If the sitemap can't be read, the run still checks the database and reports it.
+- **No invented facts.** Ideas contain no statistics: sentences with numbers your profile
+  doesn't contain are removed, and a title with one falls back to the topic. The article's
+  research step finds sourced numbers later.
+- **The brief reads them like any opportunity.** The idea is stored as the opportunity's
+  interpretation (title, angle, audience, format, intent), its key points lead the brief's,
+  and there is no competitor evidence, so none is cited.
+- **Owned by the editorial planner.** `opportunities generate` never expires, rescores or
+  re-interprets an editorial opportunity. Unapproved ones expire after the scoring
+  configuration's `expires_after_days` (30); approved ones stay until written.
+- **One Gemini call per run**, recorded like every call (`LLM_DAILY_TOKEN_BUDGET` applies).
+  A failed call fails the run and saves nothing. `--dry-run` shows the ideas without saving
+  any. Every idea, kept or rejected with the reason, is kept in the run's summary
+  (`GET /api/v1/editorial/runs/{id}`).
+
+In the pipeline, the `editorial` stage runs between `opportunities` and `generate` and
+proposes just enough ideas that today's `MAX_EDITORIAL_ARTICLES_PER_DAY` has opportunities to
+write (at most `EDITORIAL_TOPICS_PER_RUN`). Ideas still waiting count: with
+`PIPELINE_APPROVE_OPPORTUNITIES=false` they wait for you, and the stage proposes nothing more
+until they are approved, rejected or expired. `MAX_EDITORIAL_ARTICLES_PER_DAY=0`, the
+default, turns the stage off.
+
+Limitations: ideas come from the model's general knowledge, steered by your profile; there is
+no search-volume data. Duplicate detection matches word stems, so two different wordings of
+the same question can both pass (review before approving). A competitor topic that appears
+later can overlap an editorial one: the competitor engine doesn't check editorial topics.
 
 ## Article drafts
 
@@ -1387,13 +1446,14 @@ The scheduler holds no business logic. Each stage calls the same service a perso
 | `scan` | Phase 2 scans | Every active competitor; one failing is a warning |
 | `analyze` | Phase 3 analysis | Incremental: already analyzed pages cost nothing |
 | `opportunities` | Phase 4 scoring | Zero opportunities is a normal result |
-| `generate` | Phase 5 articles | The top N opportunities within today's allowance |
+| `editorial` | Editorial topics | Tops up the editorial ideas for today's editorial allowance; off by default |
+| `generate` | Phase 5 articles | The top opportunities within today's allowances (one per origin) |
 | `quality` | Phase 6 validation | With its revision loop; `needs_review` is a decision, not an error |
 | `approval` | Phase 7 approvals | Reports where each ready article stands; approves nothing |
 | `publish` | Phase 7 publishing | Only through `PublishingService`; the daily slot is reserved atomically |
 
-Job types: `scan`, `analyze`, `opportunities`, `generate_articles`, `quality_check`, `publish`
-(approval + publish) and `full_pipeline`.
+Job types: `scan`, `analyze`, `opportunities`, `editorial`, `generate_articles`,
+`quality_check`, `publish` (approval + publish) and `full_pipeline`.
 
 ### Turning it on
 
@@ -1417,8 +1477,8 @@ do with `pipeline run --dry-run` first.
 
 - **Cron.** Standard 5 fields (`minute hour day month weekday`) or `@hourly`, `@daily`,
   `@weekly`, per job: `FULL_PIPELINE_SCHEDULE`, `SCAN_SCHEDULE`, `ANALYSIS_SCHEDULE`,
-  `OPPORTUNITY_SCHEDULE`, `ARTICLE_GENERATION_SCHEDULE`, `QUALITY_SCHEDULE`,
-  `PUBLISH_SCHEDULE`. Expressions are parsed, never evaluated; a bad one stops the app at
+  `OPPORTUNITY_SCHEDULE`, `EDITORIAL_SCHEDULE`, `ARTICLE_GENERATION_SCHEDULE`,
+  `QUALITY_SCHEDULE`, `PUBLISH_SCHEDULE`. Expressions are parsed, never evaluated; a bad one stops the app at
   startup.
 - **Time zone.** Schedules run in `SCHEDULER_TIMEZONE` (default `Asia/Kolkata`), DST included.
   Everything is stored in UTC.
@@ -1437,7 +1497,8 @@ midnight job). `0` means none, never unlimited.
 
 | Limit | Counts | Enforced |
 |---|---|---|
-| `MAX_ARTICLES_GENERATED_PER_DAY` (3) | Articles created today, by the pipeline or by hand | Before any article is created: the best N opportunities are selected under a lock. The rest stay eligible for later runs |
+| `MAX_ARTICLES_GENERATED_PER_DAY` (3) | Articles created today from competitor opportunities, by the pipeline or by hand | Before any article is created: the best N opportunities are selected under a lock. The rest stay eligible for later runs |
+| `MAX_EDITORIAL_ARTICLES_PER_DAY` (0) | Articles created today from editorial topics | The same selection, under the same lock, with its own allowance: one origin never uses the other's |
 | `MAX_ARTICLES_PER_DAY` (1) | Successful public posts today. Not drafts, failed, blocked or deferred attempts | Inside Phase 7's publisher, in the transaction that starts the CMS change, under a lock. Two publishers racing for the last slot publish exactly one; the other waits for a later run with nothing sent |
 
 A publication made by hand isn't limited, but uses the day's allowance. Drafts don't use it;
@@ -1613,6 +1674,7 @@ All settings are environment variables (or `.env`); see [`.env.example`](.env.ex
 | `ANALYSIS_TAXONOMY_PROMPT_LIMIT` | `150` | Existing topics shown to the analyzer |
 | `COMPANY_FILE` | `config/company.yaml` | Company profile YAML for `company import` |
 | `SCORING_FILE` | `config/scoring.yaml` | Optional opportunity scoring configuration (weights, thresholds, Gemini candidates); built-in defaults without it |
+| `EDITORIAL_TOPICS_PER_RUN` | `10` | Editorial ideas kept per proposal run (Gemini is asked for about a third more) |
 | `GEMINI_WRITING_MODEL` | `GEMINI_MODEL` | Model for article research, outline, draft and editing |
 | `WRITING_REASONING_EFFORT` / `RESEARCH_REASONING_EFFORT` | `medium` / `low` | Gemini `thinking_level` for writing and for research |
 | `ARTICLE_MAX_TOKENS` | `400000` | Token budget per article, across every step and resume |
@@ -1655,10 +1717,11 @@ All settings are environment variables (or `.env`); see [`.env.example`](.env.ex
 | `PUBLISH_DRAFT_FIRST` | `true` | Going public: a verified draft first |
 | `SCHEDULER_ENABLED` | `false` | The worker fires schedules (manual runs work either way) |
 | `SCHEDULER_TIMEZONE` | `Asia/Kolkata` | Schedules and daily limits use this calendar (IANA name) |
-| `FULL_PIPELINE_SCHEDULE`, `SCAN_SCHEDULE`, `ANALYSIS_SCHEDULE`, `OPPORTUNITY_SCHEDULE`, `ARTICLE_GENERATION_SCHEDULE`, `QUALITY_SCHEDULE`, `PUBLISH_SCHEDULE` | *(empty)* | Cron (`0 6 * * *`) or `@hourly` / `@daily` / `@weekly`; empty: not scheduled |
+| `FULL_PIPELINE_SCHEDULE`, `SCAN_SCHEDULE`, `ANALYSIS_SCHEDULE`, `OPPORTUNITY_SCHEDULE`, `EDITORIAL_SCHEDULE`, `ARTICLE_GENERATION_SCHEDULE`, `QUALITY_SCHEDULE`, `PUBLISH_SCHEDULE` | *(empty)* | Cron (`0 6 * * *`) or `@hourly` / `@daily` / `@weekly`; empty: not scheduled |
 | `SCHEDULER_CATCH_UP_HOURS` / `SCHEDULER_POLL_SECONDS` | `24` / `30` | How far back one catch-up run looks after an outage; how often the worker checks the queue |
 | `AUTOMATED_PUBLISHING_ENABLED` | `false` | The kill switch: false keeps the pipeline away from the CMS |
-| `MAX_ARTICLES_GENERATED_PER_DAY` / `MAX_ARTICLES_PER_DAY` | `3` / `1` | Articles created / public posts per local day (0 = none) |
+| `MAX_ARTICLES_GENERATED_PER_DAY` / `MAX_ARTICLES_PER_DAY` | `3` / `1` | Articles created from competitor opportunities / public posts per local day (0 = none) |
+| `MAX_EDITORIAL_ARTICLES_PER_DAY` | `0` | Articles created from editorial topics per local day, a separate allowance (0 = the editorial stage is off) |
 | `MAX_CONCURRENT_PIPELINES` | `1` | Jobs that can spend Gemini tokens at the same time |
 | `JOB_STALE_AFTER_MINUTES` | `60` | No heartbeat for this long (and no live process): continued from the checkpoint |
 | `JOB_MAX_ATTEMPTS` / `JOB_RETRY_BASE_SECONDS` / `JOB_RETRY_MAX_SECONDS` | `3` / `300` / `3600` | Transient-failure retries with exponential backoff |
@@ -1741,6 +1804,7 @@ app/
     relevance.py               deterministic matching: stems, strategic fit, near-duplicates
     opportunity_signals.py     signals, gaps, score, suggestion, change reasons (no LLM)
     opportunities.py           generation runs: score → store → interpret; status changes
+    editorial.py               editorial topics: ideas from the profile → checked → opportunities
     numbers.py                 drops model sentences whose numbers aren't in the evidence
     articles.py                article runs: checkpoints, resume, budgets, one live article
     article_brief.py           the deterministic brief

@@ -42,6 +42,7 @@ from app.prompts.content_analysis import (
     EntityOut,
     TopicLabelOut,
 )
+from app.prompts.editorial import EditorialIdeaOut, EditorialIdeasOut
 from app.prompts.fact_check import CheckOut, ClaimTypeOut, ClassifyOut, FactCheckOut
 from app.prompts.landscape import FindingOut, LandscapeOut, PositioningOut
 from app.prompts.opportunity import OpportunityInterpretationOut, OpportunityOut
@@ -160,6 +161,10 @@ class FakeLLM:
     revision_mode: str = "fix"
     # The SEO answer: override fields of the default package.
     seo_overrides: dict[str, Any] = field(default_factory=dict)
+    # Editorial topics: the ideas to answer with, in order (the first N asked for), and
+    # whether their text cites numbers that aren't in the company profile.
+    editorial_pool: list[dict[str, Any]] = field(default_factory=lambda: list(EDITORIAL_POOL))
+    editorial_numbers: bool = False
     closed: bool = False
 
     @property
@@ -226,6 +231,8 @@ class FakeLLM:
             data = _consolidation(request.prompt)
         elif schema is OpportunityInterpretationOut:
             data = _opportunities(request.prompt, self.fabricate_numbers, self.omit_topics)
+        elif schema is EditorialIdeasOut:
+            data = _editorial(request.prompt, self.editorial_pool, self.editorial_numbers)
         elif schema is DiscoverOut:
             data, grounding = self._discover()
         elif schema is ReadOut:
@@ -596,6 +603,49 @@ def _consolidation(prompt: str) -> ConsolidationOut:
             )
         )
     return ConsolidationOut(merges=merges)
+
+
+# Ideas for the Phase 5 test company (core topic "AI agents", adjacent "Automation",
+# excluded "Pricing"), in the order the fake proposes them.
+EDITORIAL_POOL: list[dict[str, Any]] = [
+    {"topic": "AI agent handoff", "title": "When an AI Agent Should Hand Off to a Human", "target_audience": "customer support teams"},
+    {"topic": "AI agent pricing", "title": "How AI Agent Pricing Works"},  # excluded: Pricing
+    {"topic": "Support automation playbook", "title": "A Support Automation Playbook for Small Teams", "recommended_format": "listicle"},  # adjacent
+    {"topic": "Evaluating AI agents", "title": "How to Evaluate AI Agents Before You Commit", "recommended_format": "comparison", "search_intent": "commercial"},
+    {"topic": "Houseplant care", "title": "Houseplant Care for Busy Founders"},  # off-topic
+    {"topic": "AI agent onboarding", "title": "An Onboarding Checklist for Your First AI Agent", "recommended_format": "listicle"},
+    {"topic": "AI agent handoff rules", "title": "Rules for When an AI Agent Should Hand Off"},  # twin of the first
+    {"topic": "AI agent escalation metrics", "title": "Which Escalation Metrics Tell You an AI Agent Works"},
+    {"topic": "AI agent knowledge base", "title": "Building the Knowledge Base Your AI Agent Answers From"},
+    {"topic": "AI agent tone of voice", "title": "Giving Your AI Agent a Tone of Voice Customers Trust"},
+    {"topic": "AI agent security review", "title": "A Security Review Checklist for AI Agents"},
+    {"topic": "AI agent rollout plan", "title": "Rolling Out an AI Agent Without Upsetting Customers"},
+    {"topic": "Multilingual AI agents", "title": "Running Multilingual AI Agents for Global Support"},
+    {"topic": "AI agent quality reviews", "title": "Weekly Quality Reviews for AI Agent Conversations"},
+]  # fmt: skip
+
+
+def _editorial(prompt: str, pool: list[dict[str, Any]], numbers: bool) -> EditorialIdeasOut:
+    """The first N ideas of ``pool``, N read from the prompt ("Propose N new article ideas")."""
+    match = re.search(r"Propose (\d+) new article ideas", prompt)
+    assert match is not None, prompt[-300:]
+    ideas = []
+    for item in pool[: int(match.group(1))]:
+        topic = item["topic"]
+        data: dict[str, Any] = {
+            "primary_keyword": topic.lower(), "target_audience": "founders", "recommended_format": "guide", "search_intent": "informational",
+            "recommended_angle": f"A practical look at {topic.lower()} for small support teams.",
+            "why_now": "Teams are deciding how far to trust automation with customers.",
+            "differentiation_strategy": "Concrete examples and decision rules instead of generic advice.",
+            "strategic_rationale": "It shows how Agent desk approaches the problem.",
+            "key_points": [f"What {topic.lower()} involves", "How to start small", "Mistakes to avoid"], "confidence": 0.8,
+            **item,
+        }  # fmt: skip
+        if numbers:
+            data["recommended_angle"] += " Teams that do this cut handling time by 73%."
+            data["key_points"] = [*data["key_points"], "Why 41% of rollouts stall"]
+        ideas.append(EditorialIdeaOut.model_validate(data))
+    return EditorialIdeasOut(ideas=ideas)
 
 
 def _opportunities(prompt: str, fabricate: bool, omit: set[str]) -> OpportunityInterpretationOut:

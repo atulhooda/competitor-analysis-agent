@@ -133,6 +133,7 @@ class LLMPurpose(StrEnum):
     SEO_PACKAGE = "seo_package"
     QUALITY_JUDGE = "quality_judge"
     ARTICLE_REVISION = "article_revision"
+    EDITORIAL_TOPICS = "editorial_topics"  # article ideas from the company profile alone
 
 
 class LLMCallStatus(StrEnum):

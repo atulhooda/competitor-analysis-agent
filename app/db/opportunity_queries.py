@@ -19,6 +19,7 @@ from app.db.models import (
 )
 from app.domain.analysis import TopicRef
 from app.domain.opportunities import (
+    EDITORIAL_KEY_PREFIX,
     OPEN_STATUSES,
     AssessmentHistoryItem,
     AssessmentView,
@@ -31,11 +32,13 @@ from app.domain.opportunities import (
     OpportunityDetail,
     OpportunityEventKind,
     OpportunityEventView,
+    OpportunityOrigin,
     OpportunityStatus,
     OpportunitySummary,
     ScoreChange,
     ScoreComponent,
     Suggestion,
+    opportunity_origin,
 )
 
 MAX_PAGE_SIZE = 200
@@ -78,6 +81,7 @@ def _summary(
         stale=status in OPEN_STATUSES
         and opportunity.expires_at is not None
         and opportunity.expires_at < now,
+        origin=opportunity_origin(opportunity.key),
     )
 
 
@@ -103,11 +107,15 @@ async def list_opportunities(
     competitor: str | None = None,
     created_since: datetime | None = None,
     scored_since: datetime | None = None,
+    origin: OpportunityOrigin | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> list[OpportunitySummary]:
     """Opportunities ranked by score (highest first)."""
     query = _base().where(Opportunity.status.in_([s.value for s in statuses]))
+    if origin is not None:
+        editorial = Opportunity.key.startswith(EDITORIAL_KEY_PREFIX, autoescape=True)
+        query = query.where(editorial if origin is OpportunityOrigin.EDITORIAL else ~editorial)
     if min_score is not None:
         query = query.where(Opportunity.score >= min_score)
     if topic:

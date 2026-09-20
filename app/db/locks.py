@@ -35,6 +35,7 @@ def analysis_lock_key(competitor_id: int) -> int:
 
 LANDSCAPE_LOCK_KEY = (_LANDSCAPE_NAMESPACE << 32) | 1
 OPPORTUNITY_LOCK_KEY = (_OPPORTUNITY_NAMESPACE << 32) | 1
+EDITORIAL_LOCK_KEY = (_OPPORTUNITY_NAMESPACE << 32) | 2  # one editorial proposal run at a time
 
 
 @asynccontextmanager
@@ -66,6 +67,10 @@ def landscape_lock(engine: AsyncEngine) -> AbstractAsyncContextManager[bool]:
 
 def opportunity_lock(engine: AsyncEngine) -> AbstractAsyncContextManager[bool]:
     return try_advisory_lock(engine, OPPORTUNITY_LOCK_KEY)
+
+
+def editorial_lock(engine: AsyncEngine) -> AbstractAsyncContextManager[bool]:
+    return try_advisory_lock(engine, EDITORIAL_LOCK_KEY)
 
 
 def article_lock_key(article_id: int) -> int:

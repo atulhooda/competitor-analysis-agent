@@ -13,6 +13,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.domain.opportunities import OpportunityOrigin
+
 
 class JobType(StrEnum):
     SCAN = "scan"
@@ -22,6 +24,7 @@ class JobType(StrEnum):
     QUALITY_CHECK = "quality_check"
     PUBLISH = "publish"
     FULL_PIPELINE = "full_pipeline"
+    EDITORIAL = "editorial"  # propose editorial topics (article ideas from the profile alone)
 
 
 class JobStatus(StrEnum):
@@ -57,6 +60,7 @@ class Stage(StrEnum):
     SCAN = "scan"
     ANALYZE = "analyze"
     OPPORTUNITIES = "opportunities"
+    EDITORIAL = "editorial"  # top up the editorial topic backlog for today's allowance
     GENERATE = "generate"
     QUALITY = "quality"
     APPROVAL = "approval"
@@ -78,23 +82,25 @@ CHECKPOINTS = {
     "scan": "scan_complete",
     "analyze": "analysis_complete",
     "opportunities": "opportunities_complete",
+    "editorial": "editorial_complete",
     "generate": "generation_complete",
     "quality": "quality_complete",
     "approval": "approval_complete",
     "publish": "publishing_complete",
 }
-PIPELINE_STAGES = (Stage.SCAN, Stage.ANALYZE, Stage.OPPORTUNITIES, Stage.GENERATE, Stage.QUALITY, Stage.APPROVAL, Stage.PUBLISH)  # fmt: skip
+PIPELINE_STAGES = (Stage.SCAN, Stage.ANALYZE, Stage.OPPORTUNITIES, Stage.EDITORIAL, Stage.GENERATE, Stage.QUALITY, Stage.APPROVAL, Stage.PUBLISH)  # fmt: skip
 JOB_STAGES: dict[JobType, tuple[Stage, ...]] = {
     JobType.SCAN: (Stage.SCAN,),
     JobType.ANALYZE: (Stage.ANALYZE,),
     JobType.OPPORTUNITIES: (Stage.OPPORTUNITIES,),
+    JobType.EDITORIAL: (Stage.EDITORIAL,),
     JobType.GENERATE_ARTICLES: (Stage.GENERATE,),
     JobType.QUALITY_CHECK: (Stage.QUALITY,),
     JobType.PUBLISH: (Stage.APPROVAL, Stage.PUBLISH),
     JobType.FULL_PIPELINE: PIPELINE_STAGES,
 }
 # Jobs that can spend Gemini tokens share MAX_CONCURRENT_PIPELINES slots.
-EXPENSIVE_JOBS = frozenset({JobType.ANALYZE, JobType.OPPORTUNITIES, JobType.GENERATE_ARTICLES, JobType.QUALITY_CHECK, JobType.FULL_PIPELINE})  # fmt: skip
+EXPENSIVE_JOBS = frozenset({JobType.ANALYZE, JobType.OPPORTUNITIES, JobType.EDITORIAL, JobType.GENERATE_ARTICLES, JobType.QUALITY_CHECK, JobType.FULL_PIPELINE})  # fmt: skip
 # Lower runs first: continuing interrupted or retried work, then schedules, then manual jobs.
 PRIORITY = {JobTrigger.RETRY: 0, JobTrigger.SCHEDULE: 1, JobTrigger.CATCH_UP: 1, JobTrigger.CLI: 2, JobTrigger.API: 2}  # fmt: skip
 RECOVERY_PRIORITY = 0
@@ -153,9 +159,12 @@ class ScheduleView(BaseModel):
 class DailyCounts(BaseModel):
     date: CalendarDate = Field(description="The calendar day in SCHEDULER_TIMEZONE")
     timezone: str
-    generated: int = Field(description="Articles created today (any trigger)")
+    generated: int = Field(description="Articles created today from competitor opportunities (any trigger)")  # fmt: skip
     generation_limit: int
     generation_remaining: int
+    editorial_generated: int = Field(default=0, description="Articles created today from editorial topics (any trigger)")  # fmt: skip
+    editorial_limit: int = 0
+    editorial_remaining: int = 0
     ready: int = Field(description="Articles validated ready today")
     published: int = Field(description="Successful public publications today (plus unresolved reservations)")  # fmt: skip
     publication_limit: int
@@ -193,6 +202,7 @@ class PlannedOpportunity(BaseModel):
     evidence: int
     selected: bool
     reason: str
+    origin: OpportunityOrigin = OpportunityOrigin.COMPETITORS
 
 
 class PlannedArticle(BaseModel):
@@ -214,6 +224,7 @@ class PipelinePlan(BaseModel):
     competitors: list[dict[str, Any]]
     analysis: list[dict[str, Any]]
     opportunities: list[PlannedOpportunity]
+    editorial_topics_needed: int = Field(default=0, description="Editorial ideas the editorial stage would propose now (capped by EDITORIAL_TOPICS_PER_RUN)")  # fmt: skip
     generation_limit: int
     generation_remaining: int
     validation: list[PlannedArticle]

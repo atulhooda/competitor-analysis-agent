@@ -61,7 +61,7 @@ from app.scheduling.retry import backoff_seconds, classify, retryable
 log = structlog.get_logger(__name__)
 
 # Stable lock numbers (never reuse or reorder).
-_TYPE_LOCK = {JobType.SCAN: 1, JobType.ANALYZE: 2, JobType.OPPORTUNITIES: 3, JobType.GENERATE_ARTICLES: 4, JobType.QUALITY_CHECK: 5, JobType.PUBLISH: 6, JobType.FULL_PIPELINE: 7}  # fmt: skip
+_TYPE_LOCK = {JobType.SCAN: 1, JobType.ANALYZE: 2, JobType.OPPORTUNITIES: 3, JobType.GENERATE_ARTICLES: 4, JobType.QUALITY_CHECK: 5, JobType.PUBLISH: 6, JobType.FULL_PIPELINE: 7, JobType.EDITORIAL: 8}  # fmt: skip
 _ERROR_CHARS = 2_000
 
 

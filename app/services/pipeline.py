@@ -2,7 +2,7 @@
 service. Phase 8 introduces autonomous scheduling and pipeline orchestration. Social media
 automation is intentionally deferred to Phase 9.
 
-    scan → analyze → opportunities → generate → quality → approval → publish
+    scan → analyze → opportunities → editorial → generate → quality → approval → publish
 
 - **Existing services only.** Scans (Phase 2), analysis (3), opportunities (4), articles (5),
   validation with its revision loop (6), approval and publishing (7) keep their own runs,
@@ -13,9 +13,13 @@ automation is intentionally deferred to Phase 9.
   crash, or retried, skips finished stages and items: no Gemini work is repeated.
 - **Failures.** A failed stage stops the job: the next stages depend on it. Inside a stage,
   one competitor or article failing is recorded as a warning and the stage goes on.
-- **Limits.** MAX_ARTICLES_GENERATED_PER_DAY applies before any article is created: the top N
-  opportunities are selected under a lock. MAX_ARTICLES_PER_DAY is enforced by Phase 7's
-  publisher itself, atomically, right before a post goes public.
+- **Limits.** Two generation allowances apply before any article is created, one per
+  opportunity origin: MAX_ARTICLES_GENERATED_PER_DAY (competitor opportunities) and
+  MAX_EDITORIAL_ARTICLES_PER_DAY (editorial topics). The top opportunities of each are
+  selected under one lock. The editorial stage tops up the editorial backlog to today's
+  remaining editorial allowance first (MAX_EDITORIAL_ARTICLES_PER_DAY=0, the default: off).
+  MAX_ARTICLES_PER_DAY is enforced by Phase 7's publisher itself, atomically, right before a
+  post goes public.
 - **Safety.** Only Phase 7's PublishingService talks to the CMS, and only for ready articles
   with a live approval. PUBLISH_AUTO_APPROVE (Phase 7's policy) is the only automatic
   approval. AUTOMATED_PUBLISHING_ENABLED=false, the default, keeps the pipeline away from the
@@ -66,7 +70,7 @@ from app.domain.jobs import (
     Stage,
     StageStatus,
 )
-from app.domain.opportunities import OpportunityStatus
+from app.domain.opportunities import OpportunityOrigin, OpportunityStatus, opportunity_origin
 from app.domain.publishing import ApprovalDecision, PublicationStatus, TargetStatus
 from app.llm import (
     LazyLLM,
@@ -79,7 +83,8 @@ from app.scheduling.schedules import local_day
 from app.services.analysis import AnalysisService
 from app.services.approval_rules import authorization_problem, readiness_problems
 from app.services.articles import ArticleService
-from app.services.daily_limits import daily_counts, generated_on, published_on
+from app.services.daily_limits import daily_counts, generated_on, generation_limit, published_on
+from app.services.editorial import EditorialService
 from app.services.jobs import JobContext, JobResult
 from app.services.llm_usage import tokens_used_since, utc_day_start
 from app.services.opportunities import GenerationOptions, OpportunityService
@@ -116,6 +121,7 @@ class PipelineServices:
     publishing: PublishingService
     cms: LazyCMS
     llm: LazyLLM
+    editorial: EditorialService
 
 
 @dataclass
@@ -178,6 +184,7 @@ class PipelineService:
             Stage.SCAN: self._scan,
             Stage.ANALYZE: self._analyze,
             Stage.OPPORTUNITIES: self._opportunities,
+            Stage.EDITORIAL: self._editorial,
             Stage.GENERATE: self._generate,
             Stage.QUALITY: self._quality,
             Stage.APPROVAL: self._approval,
@@ -378,14 +385,50 @@ class PipelineService:
         status = StageStatus.COMPLETED_WITH_WARNINGS if warnings else StageStatus.COMPLETED
         return StageResult(status, summary, warnings, [outcome.run_id])
 
+    async def _editorial(self, ctx: JobContext) -> StageResult:
+        """Top up the editorial backlog: propose just enough ideas that today's remaining
+        editorial allowance has opportunities to write. A retried stage recounts first, so
+        ideas saved by an earlier attempt aren't proposed twice."""
+        limit = self._settings.max_editorial_articles_per_day
+        if limit == 0:
+            return StageResult(StageStatus.SKIPPED, {"limit": 0}, ["MAX_EDITORIAL_ARTICLES_PER_DAY=0: no editorial topics are proposed"])  # fmt: skip
+        async with self._sessions() as session:
+            today = await daily_counts(session, self._settings, self._now())
+        backlog = await self._s.editorial.backlog()
+        needed = min(max(today.editorial_remaining - backlog, 0), self._settings.editorial_topics_per_run)  # fmt: skip
+        summary: dict[str, Any] = {"limit": limit, "generated_today": today.editorial_generated, "remaining_today": today.editorial_remaining, "backlog_before": backlog, "requested": needed}  # fmt: skip
+        if needed == 0:
+            return StageResult(StageStatus.COMPLETED, {**summary, "created": 0})
+        if spent := await self._budget_spent():
+            return StageResult(StageStatus.SKIPPED_DUE_TO_BUDGET, summary, [spent])
+        if not self._s.llm.configured:
+            return StageResult(StageStatus.SKIPPED, summary, ["GEMINI_API_KEY is not set: editorial topics need Gemini"])  # fmt: skip
+        try:
+            outcome = await self._s.editorial.propose(trigger=self._trigger(ctx), count=needed)
+        except Exception as exc:
+            return _failed(f"{type(exc).__name__}: {exc}", classify(exc))
+        if outcome.status is RunStatus.FAILED:
+            return _failed(outcome.error or "editorial proposal failed", classify_text(outcome.error) or ErrorKind.TRANSIENT, runs=[outcome.run_id])  # fmt: skip
+        s = outcome.summary
+        created = s.created if s else 0
+        summary.update({"proposed": s.proposed if s else 0, "created": created, "rejected": s.rejected if s else {}, "expired": s.expired if s else 0, "opportunities": [i.opportunity_id for i in outcome.created]})  # fmt: skip
+        warnings = [f"created {created} of the {needed} editorial topic(s) needed: the others were duplicates, excluded or off-topic"] if created < needed else []  # fmt: skip
+        if s is not None and s.site_error:
+            warnings.append(f"your site's posts weren't checked: {s.site_error}")
+        status = StageStatus.COMPLETED_WITH_WARNINGS if warnings else StageStatus.COMPLETED
+        return StageResult(status, summary, warnings, [outcome.run_id])
+
+    def _generation_limits(self) -> dict[OpportunityOrigin, int]:
+        return {origin: generation_limit(self._settings, origin) for origin in OpportunityOrigin}
+
     async def _generate(self, ctx: JobContext) -> StageResult:
-        limit = self._settings.max_articles_generated_per_day
+        limits = self._generation_limits()
         progress = self._progress(ctx, Stage.GENERATE)
         if not progress.get("selected"):
-            if limit == 0:
-                return StageResult(StageStatus.SKIPPED, {"limit": 0}, ["MAX_ARTICLES_GENERATED_PER_DAY=0: no article is generated"])  # fmt: skip
+            if not any(limits.values()):
+                return StageResult(StageStatus.SKIPPED, {"limit": 0, "editorial_limit": 0}, ["MAX_ARTICLES_GENERATED_PER_DAY=0 and MAX_EDITORIAL_ARTICLES_PER_DAY=0: no article is generated"])  # fmt: skip
             if spent := await self._budget_spent():
-                return StageResult(StageStatus.SKIPPED_DUE_TO_BUDGET, {"limit": limit}, [spent])
+                return StageResult(StageStatus.SKIPPED_DUE_TO_BUDGET, {"limit": limits[OpportunityOrigin.COMPETITORS], "editorial_limit": limits[OpportunityOrigin.EDITORIAL]}, [spent])  # fmt: skip
             if not self._s.llm.configured:
                 return _failed("GEMINI_API_KEY is not set: article generation needs Gemini", ErrorKind.PERMANENT)  # fmt: skip
             selection = await self._select(ctx, progress)
@@ -420,9 +463,11 @@ class PipelineService:
 
     async def _select(self, ctx: JobContext, progress: dict[str, Any]) -> dict[str, Any] | StageResult:  # fmt: skip
         """Select today's articles and create them, under the generation allowance lock: the
-        allowance can't be exceeded by concurrent jobs. The articles are written afterwards.
-        Every creation is saved first, so a crash never creates an article twice."""
-        limit = self._settings.max_articles_generated_per_day
+        allowances can't be exceeded by concurrent jobs. Each opportunity origin (competitors,
+        editorial topics) has its own allowance; within one, the highest-ranked go first. The
+        articles are written afterwards. Every creation is saved first, so a crash never
+        creates an article twice."""
+        limits = self._generation_limits()
         articles: list[int] = [int(a) for a in progress.get("articles") or []]
         runs: dict[str, int | None] = dict(progress.get("runs") or {})
         warnings: list[str] = list(progress.get("warnings") or [])
@@ -431,13 +476,24 @@ class PipelineService:
                 return _failed("another job is selecting articles (the generation allowance is locked)", ErrorKind.TRANSIENT)  # fmt: skip
             day = local_day(self._now(), self._settings.scheduler_tz)
             async with self._sessions() as session:
-                used = await generated_on(session, day, self._settings)
+                used = {origin: await generated_on(session, day, self._settings, origin=origin) for origin in limits}  # fmt: skip
                 candidates = await opportunity_candidates(session, self._settings)
-            remaining = max(limit - used, 0)
-            selection: dict[str, Any] = {"limit": limit, "generated_today_before": used, "remaining_before": remaining, "eligible": len(candidates), "selected": [], "opportunities_approved": []}  # fmt: skip
-            if remaining == 0 and not articles:
-                return StageResult(StageStatus.SKIPPED, selection, [f"the daily generation limit is reached ({used} of {limit} on {day}, {self._settings.scheduler_timezone})"])  # fmt: skip
-            for candidate in candidates[:remaining]:
+            remaining = {origin: max(limits[origin] - used[origin], 0) for origin in limits}
+            competitors, editorial = OpportunityOrigin.COMPETITORS, OpportunityOrigin.EDITORIAL
+            selection: dict[str, Any] = {
+                "limit": limits[competitors], "generated_today_before": used[competitors], "remaining_before": remaining[competitors],
+                "editorial_limit": limits[editorial], "editorial_generated_today_before": used[editorial], "editorial_remaining_before": remaining[editorial],
+                "eligible": len(candidates), "selected": [], "opportunities_approved": [],
+            }  # fmt: skip
+            if not any(remaining.values()) and not articles:
+                return StageResult(StageStatus.SKIPPED, selection, [f"the daily generation limits are reached ({used[competitors]} of {limits[competitors]} from competitors, {used[editorial]} of {limits[editorial]} editorial on {day}, {self._settings.scheduler_timezone})"])  # fmt: skip
+            chosen = []
+            for candidate in candidates:
+                origin = opportunity_origin(candidate.opportunity.key)
+                if remaining[origin] > 0:
+                    remaining[origin] -= 1
+                    chosen.append(candidate)
+            for candidate in chosen:
                 opportunity = candidate.opportunity
                 try:
                     if opportunity.status != OpportunityStatus.APPROVED.value:
@@ -480,7 +536,7 @@ class PipelineService:
         own = [int(a) for a in (self._progress(ctx, Stage.GENERATE).get("articles") or [])]
         progress = self._progress(ctx, Stage.QUALITY)
         if "articles" not in progress:
-            cap = max(self._settings.max_articles_generated_per_day, len(own))
+            cap = max(sum(self._generation_limits().values()), len(own))
             async with self._sessions() as session:
                 candidates = [a.id for a in await validation_candidates(session, include=own)]
             ordered = [a for a in candidates if a in own] + [a for a in candidates if a not in own]
@@ -649,30 +705,20 @@ class PipelineService:
                 except Exception as exc:
                     analysis.append({"competitor": c.slug, "error": f"{type(exc).__name__}: {exc}"})
         remaining_gen = today.generation_remaining
-        opportunities = [
-            PlannedOpportunity(
-                opportunity_id=c.opportunity.id,
-                title=c.opportunity.title,
-                topic=c.opportunity.topic_label,
-                status=c.opportunity.status,
-                score=c.opportunity.score,
-                strategic_fit=c.strategic_fit,
-                evidence=c.evidence,
-                selected=i < remaining_gen,
-                reason=(
-                    "selected: within today's generation allowance"
-                    + (
-                        ""
-                        if c.opportunity.status == OpportunityStatus.APPROVED.value
-                        else " (the pipeline approves it)"
-                    )
-                )
-                if i < remaining_gen
-                else f"waits: the allowance ({today.generation_limit}/day) is used by higher-ranked opportunities",
-            )
-            for i, c in enumerate(candidates[:50])
-        ]
-        cap = settings.max_articles_generated_per_day
+        gen_slots = {OpportunityOrigin.COMPETITORS: remaining_gen, OpportunityOrigin.EDITORIAL: today.editorial_remaining}  # fmt: skip
+        gen_limits = {OpportunityOrigin.COMPETITORS: today.generation_limit, OpportunityOrigin.EDITORIAL: today.editorial_limit}  # fmt: skip
+        opportunities: list[PlannedOpportunity] = []
+        for oc in candidates[:50]:
+            origin = opportunity_origin(oc.opportunity.key)
+            selected = gen_slots[origin] > 0
+            gen_slots[origin] -= 1 if selected else 0
+            kind = "editorial" if origin is OpportunityOrigin.EDITORIAL else "generation"
+            if selected:
+                reason = f"selected: within today's {kind} allowance" + ("" if oc.opportunity.status == OpportunityStatus.APPROVED.value else " (the pipeline approves it)")  # fmt: skip
+            else:
+                reason = f"waits: the {kind} allowance ({gen_limits[origin]}/day) is used by higher-ranked opportunities"  # fmt: skip
+            opportunities.append(PlannedOpportunity(opportunity_id=oc.opportunity.id, title=oc.opportunity.title, topic=oc.opportunity.topic_label, status=oc.opportunity.status, score=oc.opportunity.score, strategic_fit=oc.strategic_fit, evidence=oc.evidence, selected=selected, reason=reason, origin=origin))  # fmt: skip
+        cap = sum(self._generation_limits().values())
         planned_validation = [PlannedArticle(article_id=a.id, title=a.title, status=a.status, score=a.quality_score, approval=None, action="validate" if i < cap else "waits (per-run cap)") for i, a in enumerate(validation[:50])]  # fmt: skip
         allowance = today.remaining if target is TargetStatus.PUBLISH else settings.max_articles_per_day  # fmt: skip
         publishing: list[PlannedArticle] = []
@@ -699,6 +745,10 @@ class PipelineService:
             notes.append(f"PUBLISH_ALLOW_DIRECT_PUBLISH=false: posts are left as {target.value}s (they don't count toward MAX_ARTICLES_PER_DAY)")  # fmt: skip
         if spent := await self._budget_spent():
             notes.append(f"Gemini stages would be skipped: {spent}")
+        editorial_needed = 0
+        if Stage.EDITORIAL in stages and settings.max_editorial_articles_per_day:
+            backlog = sum(1 for oc in candidates if opportunity_origin(oc.opportunity.key) is OpportunityOrigin.EDITORIAL)  # fmt: skip
+            editorial_needed = min(max(today.editorial_remaining - backlog, 0), settings.editorial_topics_per_run)  # fmt: skip
         return PipelinePlan(
             generated_at=now,
             job_type=job_type,
@@ -708,6 +758,7 @@ class PipelineService:
             else [],
             analysis=analysis,
             opportunities=opportunities if Stage.GENERATE in stages else [],
+            editorial_topics_needed=editorial_needed,
             generation_limit=today.generation_limit,
             generation_remaining=remaining_gen,
             validation=planned_validation if Stage.QUALITY in stages else [],

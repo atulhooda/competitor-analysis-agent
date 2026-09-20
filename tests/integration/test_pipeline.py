@@ -82,8 +82,11 @@ async def count(rig: Rig, model: type, *where: object) -> int:
 async def test_the_pipeline_scans_analyzes_writes_validates_and_publishes_one_article(rig: Rig) -> None:  # fmt: skip
     job = await rig.run()
     assert job.status is JobStatus.COMPLETED, (job.last_error, [(s.stage, s.status, s.warnings) for s in job.stages])  # fmt: skip
-    assert [s.stage.value for s in job.stages] == ["scan", "analyze", "opportunities", "generate", "quality", "approval", "publish"]  # fmt: skip
-    assert all(s.status is StageStatus.COMPLETED for s in job.stages)
+    assert [s.stage.value for s in job.stages] == ["scan", "analyze", "opportunities", "editorial", "generate", "quality", "approval", "publish"]  # fmt: skip
+    stages = {s.stage.value: s for s in job.stages}
+    # Editorial topics are off by default (MAX_EDITORIAL_ARTICLES_PER_DAY=0): no Gemini call.
+    assert stages.pop("editorial").status is StageStatus.SKIPPED
+    assert all(s.status is StageStatus.COMPLETED for s in stages.values())
     assert job.checkpoint == "publishing_complete"
     articles = await rig.articles()
     assert len(articles) == 1
@@ -346,7 +349,7 @@ async def test_a_crashed_job_resumes_from_its_checkpoint_without_duplicate_artic
         await scheduling.jobs.run(view.id)
     crashed_job = await scheduling.jobs.get(view.id)
     assert crashed_job.status is JobStatus.RUNNING  # left behind, as by a dead process
-    assert crashed_job.checkpoint == "opportunities_complete"
+    assert crashed_job.checkpoint == "editorial_complete"  # the stage before generation
     assert await count(rig, Article) == 2  # created and saved in the checkpoint, not written
     assert await scheduling.jobs.recover_stale() == []  # its heartbeat is still fresh
     rig.env.wall.advance(minutes=11)

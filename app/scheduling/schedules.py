@@ -35,6 +35,7 @@ SCHEDULE_SETTINGS: tuple[tuple[str, JobType], ...] = (
     ("scan_schedule", JobType.SCAN),
     ("analysis_schedule", JobType.ANALYZE),
     ("opportunity_schedule", JobType.OPPORTUNITIES),
+    ("editorial_schedule", JobType.EDITORIAL),
     ("article_generation_schedule", JobType.GENERATE_ARTICLES),
     ("quality_schedule", JobType.QUALITY_CHECK),
     ("publish_schedule", JobType.PUBLISH),

@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 from typing import Any, Self
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, or_, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.config import Settings, load_scoring_config
@@ -55,6 +55,7 @@ from app.domain.history import RunStatus, RunTrigger
 from app.domain.opportunities import (
     ALLOWED_TRANSITIONS,
     OPEN_STATUSES,
+    SIGNAL_KEY_PREFIXES,
     EvidenceKind,
     Interpretation,
     InterpretationStatus,
@@ -171,6 +172,24 @@ class _Inputs:
 
 def _digest(data: Any) -> str:
     return hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _signal_owned() -> ColumnElement[bool]:
+    """Opportunities whose key the signal engine owns ("topic:…", "core:…")."""
+    return or_(*(Opportunity.key.startswith(prefix, autoescape=True) for prefix in SIGNAL_KEY_PREFIXES))  # fmt: skip
+
+
+def company_lines(company: CompanyProfile) -> list[str]:
+    """The company profile as the models see it (one ``- label: value`` line per field)."""
+    lines = [f"- name: {company.name}", f"- description: {company.description}"]
+    if company.products:
+        lines.append("- products: " + "; ".join(f"{p.name}" + (f" ({p.description})" if p.description else "") for p in company.products))  # fmt: skip
+    for label, values in (("audiences", company.target_audiences), ("core topics", company.core_topics), ("adjacent topics", company.adjacent_topics), ("differentiators", company.differentiators)):  # fmt: skip
+        if values:
+            lines.append(f"- {label}: {'; '.join(values)}")
+    if company.positioning:
+        lines.append(f"- positioning: {company.positioning}")
+    return [neutralize(line) for line in lines]
 
 
 def _category(reason: str) -> str:
@@ -345,7 +364,9 @@ class OpportunityService:
     ) -> None:
         now = self._now()
         expires = now + timedelta(days=inputs.config.expires_after_days)
-        existing = {o.key: o for o in await session.scalars(select(Opportunity).with_for_update())}
+        # Only the engine's own keys: an editorial opportunity is never expired, rescored or
+        # reopened here (the editorial planner owns it).
+        existing = {o.key: o for o in await session.scalars(select(Opportunity).where(_signal_owned()).with_for_update())}  # fmt: skip
         for candidate in qualified:
             opportunity = existing.get(candidate.key)
             created = opportunity is None
@@ -556,7 +577,12 @@ class OpportunityService:
                     OpportunityAssessment,
                     OpportunityAssessment.id == Opportunity.current_assessment_id,
                 )
-                .where(Opportunity.status.in_(statuses), Opportunity.score >= cfg.min_score)
+                # An editorial opportunity carries its own interpretation (its proposal).
+                .where(
+                    Opportunity.status.in_(statuses),
+                    Opportunity.score >= cfg.min_score,
+                    _signal_owned(),
+                )
                 .order_by(Opportunity.score.desc(), Opportunity.id)
                 .limit(cfg.candidates)
             )
@@ -621,15 +647,7 @@ class OpportunityService:
                 row.interpretation_error = error[:2000]
 
     def _company_block(self, company: CompanyProfile) -> list[str]:
-        lines = [f"- name: {company.name}", f"- description: {company.description}"]
-        if company.products:
-            lines.append("- products: " + "; ".join(f"{p.name}" + (f" ({p.description})" if p.description else "") for p in company.products))  # fmt: skip
-        for label, values in (("audiences", company.target_audiences), ("core topics", company.core_topics), ("adjacent topics", company.adjacent_topics), ("differentiators", company.differentiators)):  # fmt: skip
-            if values:
-                lines.append(f"- {label}: {'; '.join(values)}")
-        if company.positioning:
-            lines.append(f"- positioning: {company.positioning}")
-        return [neutralize(line) for line in lines]
+        return company_lines(company)
 
     async def _interpret_batch(
         self,
@@ -759,4 +777,5 @@ __all__ = [
     "OpportunityNotFoundError",
     "OpportunityRunAlreadyActiveError",
     "OpportunityService",
+    "company_lines",
 ]

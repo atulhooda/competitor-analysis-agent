@@ -237,7 +237,8 @@ def _key_points(
     strong: Sequence[tuple[dict[str, Any], GapType]],
     company: CompanyProfile,
 ) -> list[str]:
-    points: list[str] = []
+    # An editorial topic's own key points (proposed with it) come first.
+    points: list[str] = [str(p) for p in (inputs.signals.get("editorial") or {}).get("key_points") or [] if p]  # fmt: skip
     subtopics = sorted(inputs.signals.get("subtopics") or [], key=lambda s: (-int(s.get("items", 0)), str(s.get("name"))))  # fmt: skip
     thin = {name for g, t in strong if t is GapType.DEPTH for name in g.get("data", {}).get("thin_subtopics", [])}  # fmt: skip
     for sub in subtopics[:4]:

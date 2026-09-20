@@ -21,6 +21,7 @@ from app.domain.opportunities import (
     AssessmentHistoryItem,
     EvidenceView,
     OpportunityDetail,
+    OpportunityOrigin,
     OpportunityStatus,
     OpportunitySummary,
 )
@@ -108,6 +109,9 @@ async def list_opportunities(
     competitor: Annotated[str | None, Query(description="Competitor slug in the evidence")] = None,
     created_since: datetime | None = None,
     scored_since: datetime | None = None,
+    origin: Annotated[
+        OpportunityOrigin | None, Query(description="competitors or editorial (default: both)")
+    ] = None,
     limit: Annotated[int, Query(ge=1, le=opportunity_queries.MAX_PAGE_SIZE)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[OpportunitySummary]:
@@ -121,6 +125,7 @@ async def list_opportunities(
         competitor=competitor,
         created_since=created_since,
         scored_since=scored_since,
+        origin=origin,
         limit=limit,
         offset=offset,
     )

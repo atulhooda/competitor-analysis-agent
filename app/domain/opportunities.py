@@ -40,6 +40,24 @@ ALLOWED_TRANSITIONS: dict[OpportunityStatus, frozenset[OpportunityStatus]] = {
 }
 
 
+class OpportunityOrigin(StrEnum):
+    COMPETITORS = "competitors"  # found in competitor content by the signal engine
+    EDITORIAL = "editorial"  # proposed from your company profile alone (editorial topics)
+
+
+# Key namespaces. Each source reconciles (rescores, expires, interprets) only its own keys:
+# "topic:<topic id>" and "core:<label key>" belong to the competitor signal engine,
+# "editorial:<label key>" to the editorial planner.
+SIGNAL_KEY_PREFIXES = ("topic:", "core:")
+EDITORIAL_KEY_PREFIX = "editorial:"
+
+
+def opportunity_origin(key: str) -> OpportunityOrigin:
+    if key.startswith(EDITORIAL_KEY_PREFIX):
+        return OpportunityOrigin.EDITORIAL
+    return OpportunityOrigin.COMPETITORS
+
+
 class GapType(StrEnum):
     TOPIC = "topic"  # few or no competitors cover it
     AUDIENCE = "audience"  # your audiences are underserved
@@ -257,6 +275,7 @@ class OpportunitySummary(BaseModel):
     last_scored_at: datetime
     expires_at: datetime | None
     stale: bool = Field(description="Open, but not re-confirmed before its expiry date")
+    origin: OpportunityOrigin = Field(default=OpportunityOrigin.COMPETITORS, description="competitors: found in competitor content; editorial: proposed from your company profile")  # fmt: skip
 
 
 class OpportunityEventView(BaseModel):

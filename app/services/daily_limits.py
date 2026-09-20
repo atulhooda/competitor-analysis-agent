@@ -2,8 +2,10 @@
 day in ``SCHEDULER_TIMEZONE``. Counts come from stored timestamps, so the day "resets" at
 local midnight without any counter or midnight job.
 
-- **Generated:** articles created today (by the pipeline or by hand). The pipeline checks the
-  remainder under a lock before it creates any article, so it never generates more.
+- **Generated:** articles created today (by the pipeline or by hand), counted separately per
+  opportunity origin: MAX_ARTICLES_GENERATED_PER_DAY for competitor opportunities and
+  MAX_EDITORIAL_ARTICLES_PER_DAY for editorial topics. The pipeline checks both remainders
+  under one lock before it creates any article, so it never generates more.
 - **Published:** successful public publications today, whoever made them. Drafts, failed,
   blocked, cancelled and queued publications don't count, with one exception: an automated
   publication that reserved today's allowance counts while it is unresolved (queued,
@@ -22,9 +24,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.db.locks import PUBLISH_LIMIT_LOCK_KEY
-from app.db.models import Article, Publication, PublicationAttempt
+from app.db.models import Article, Opportunity, Publication, PublicationAttempt
 from app.domain.articles import ArticleStatus
 from app.domain.jobs import DailyCounts
+from app.domain.opportunities import EDITORIAL_KEY_PREFIX, OpportunityOrigin
 from app.domain.publishing import (
     IN_FLIGHT_PUBLICATION,
     AttemptAction,
@@ -75,16 +78,29 @@ async def reserve_publication_slot(session: AsyncSession, publication: Publicati
     return True, used + 1, day
 
 
-async def generated_on(session: AsyncSession, day: date, settings: Settings) -> int:
+async def generated_on(session: AsyncSession, day: date, settings: Settings, *, origin: OpportunityOrigin | None = None) -> int:  # fmt: skip
+    """Articles created on ``day``; with ``origin``, only those from that kind of opportunity
+    (each origin has its own daily allowance)."""
     start, end = day_bounds(day, settings.scheduler_tz)
-    return int(await session.scalar(select(func.count(Article.id)).where(Article.created_at >= start, Article.created_at < end)) or 0)  # fmt: skip
+    query = select(func.count(Article.id)).where(Article.created_at >= start, Article.created_at < end)  # fmt: skip
+    if origin is not None:
+        editorial = Opportunity.key.startswith(EDITORIAL_KEY_PREFIX, autoescape=True)
+        query = query.join(Opportunity, Opportunity.id == Article.opportunity_id).where(editorial if origin is OpportunityOrigin.EDITORIAL else ~editorial)  # fmt: skip
+    return int(await session.scalar(query) or 0)
+
+
+def generation_limit(settings: Settings, origin: OpportunityOrigin) -> int:
+    if origin is OpportunityOrigin.EDITORIAL:
+        return settings.max_editorial_articles_per_day
+    return settings.max_articles_generated_per_day
 
 
 async def daily_counts(session: AsyncSession, settings: Settings, now: datetime) -> DailyCounts:
     tz = settings.scheduler_tz
     day = local_day(now, tz)
     start, end = day_bounds(day, tz)
-    generated = await generated_on(session, day, settings)
+    generated = await generated_on(session, day, settings, origin=OpportunityOrigin.COMPETITORS)
+    editorial = await generated_on(session, day, settings, origin=OpportunityOrigin.EDITORIAL)
     published = await published_on(session, day, settings)
     ready = int(await session.scalar(select(func.count(Article.id)).where(Article.status == ArticleStatus.READY.value, Article.validated_at >= start, Article.validated_at < end)) or 0)  # fmt: skip
     written = exists().where(PublicationAttempt.publication_id == Publication.id, PublicationAttempt.outcome == AttemptOutcome.SUCCEEDED.value, PublicationAttempt.action.in_(_WRITES), PublicationAttempt.finished_at >= start, PublicationAttempt.finished_at < end)  # fmt: skip
@@ -95,6 +111,9 @@ async def daily_counts(session: AsyncSession, settings: Settings, now: datetime)
         generated=generated,
         generation_limit=settings.max_articles_generated_per_day,
         generation_remaining=max(settings.max_articles_generated_per_day - generated, 0),
+        editorial_generated=editorial,
+        editorial_limit=settings.max_editorial_articles_per_day,
+        editorial_remaining=max(settings.max_editorial_articles_per_day - editorial, 0),
         ready=ready,
         published=published,
         publication_limit=settings.max_articles_per_day,
@@ -103,4 +122,4 @@ async def daily_counts(session: AsyncSession, settings: Settings, now: datetime)
     )
 
 
-__all__ = ["daily_counts", "generated_on", "published_on", "reserve_publication_slot"]
+__all__ = ["daily_counts", "generated_on", "generation_limit", "published_on", "reserve_publication_slot"]  # fmt: skip

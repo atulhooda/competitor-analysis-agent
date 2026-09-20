@@ -12,6 +12,7 @@ from app.db.session import SessionFactory
 from app.services.analysis import AnalysisService
 from app.services.approvals import ApprovalService
 from app.services.articles import ArticleService
+from app.services.editorial import EditorialService
 from app.services.intelligence import IntelligenceService
 from app.services.jobs import JobService
 from app.services.landscape import LandscapeService
@@ -103,6 +104,14 @@ def get_opportunity_service(request: Request) -> OpportunityService:
 
 
 OpportunityServiceDep = Annotated[OpportunityService, Depends(get_opportunity_service)]
+
+
+def get_editorial_service(request: Request) -> EditorialService:
+    service: EditorialService = request.app.state.editorial
+    return service
+
+
+EditorialServiceDep = Annotated[EditorialService, Depends(get_editorial_service)]
 
 
 def get_article_service(request: Request) -> ArticleService:

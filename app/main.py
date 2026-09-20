@@ -16,6 +16,7 @@ from app.api import health
 from app.api.v1 import (
     articles,
     competitors,
+    editorial,
     history,
     intelligence,
     jobs,
@@ -35,6 +36,7 @@ from app.scheduling.runtime import build_scheduling
 from app.services.analysis import AnalysisService
 from app.services.approvals import ApprovalService
 from app.services.articles import ArticleService
+from app.services.editorial import EditorialService
 from app.services.intelligence import IntelligenceService
 from app.services.landscape import LandscapeService
 from app.services.opportunities import OpportunityService
@@ -79,13 +81,14 @@ def create_app(
         app.state.landscapes = LandscapeService(engine, sessions, lazy_llm, settings)
         app.state.topic_admin = TopicAdminService(sessions, lazy_llm, settings)
         app.state.opportunities = OpportunityService(engine, sessions, lazy_llm, settings)
+        app.state.editorial = EditorialService(engine, sessions, lazy_llm, settings, fetcher=active_fetcher)  # fmt: skip
         app.state.articles = ArticleService(engine, sessions, lazy_llm, settings, resolver=resolver)
         app.state.quality = QualityService(engine, sessions, lazy_llm, settings, resolver=resolver)
         lazy_cms = cms or LazyCMS(settings)
         app.state.approvals = ApprovalService(sessions, settings)
         app.state.publishing = PublishingService(engine, sessions, settings, lazy_cms)
         # Phase 8: jobs run the same service instances (the schedule itself is the worker's).
-        services = PipelineServices(scans=app.state.scans, analyses=app.state.analyses, opportunities=app.state.opportunities, articles=app.state.articles, quality=app.state.quality, publishing=app.state.publishing, cms=lazy_cms, llm=lazy_llm)  # fmt: skip
+        services = PipelineServices(scans=app.state.scans, analyses=app.state.analyses, opportunities=app.state.opportunities, articles=app.state.articles, quality=app.state.quality, publishing=app.state.publishing, cms=lazy_cms, llm=lazy_llm, editorial=app.state.editorial)  # fmt: skip
         scheduling = build_scheduling(engine, sessions, settings, services)
         app.state.jobs, app.state.pipeline, app.state.scheduler_state = scheduling.jobs, scheduling.pipeline, scheduling.state  # fmt: skip
         app.state.background_tasks = background
@@ -112,6 +115,7 @@ def create_app(
     app.include_router(history.router)
     app.include_router(intelligence.router)
     app.include_router(opportunities.router)
+    app.include_router(editorial.router)
     app.include_router(articles.router)
     app.include_router(quality.router)
     app.include_router(publishing.router)

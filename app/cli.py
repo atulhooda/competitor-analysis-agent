@@ -3,7 +3,7 @@
 import asyncio
 import json
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
@@ -47,7 +47,7 @@ from app.domain.jobs import (
     SchedulerStatus,
     ScheduleView,
 )
-from app.domain.opportunities import OpportunityStatus
+from app.domain.opportunities import OpportunityOrigin, OpportunityStatus, OpportunitySummary
 from app.domain.publishing import (
     ApprovalChannel,
     ApprovalRecord,
@@ -85,6 +85,7 @@ from app.services.company import (
     list_company_profiles,
     save_company_profile,
 )
+from app.services.editorial import EditorialRunAlreadyActiveError, EditorialService, ProposalOutcome
 from app.services.intelligence import IntelligenceService
 from app.services.jobs import JobConflictError, JobNotFoundError
 from app.services.landscape import LandscapeAlreadyRunningError, LandscapeService
@@ -118,6 +119,7 @@ competitors_cli = typer.Typer(help="Manage monitored competitors (stored in the 
 topics_cli = typer.Typer(help="The topic taxonomy: list, inspect, seed, merge, consolidate.")
 company_cli = typer.Typer(no_args_is_help=True, help="Your company profile (what opportunities are scored against).")  # fmt: skip
 opportunities_cli = typer.Typer(help="Content opportunities: generate, rank, inspect, decide.")
+editorial_cli = typer.Typer(help="Editorial topics: article ideas from your company profile alone (no competitor content).")  # fmt: skip
 articles_cli = typer.Typer(
     help="Article drafts from approved opportunities. Drafts only: nothing is published."
 )
@@ -126,6 +128,7 @@ cli.add_typer(competitors_cli, name="competitors")
 cli.add_typer(topics_cli, name="topics")
 cli.add_typer(company_cli, name="company")
 cli.add_typer(opportunities_cli, name="opportunities")
+cli.add_typer(editorial_cli, name="editorial")
 cli.add_typer(articles_cli, name="articles")
 console = Console()
 err = Console(stderr=True)
@@ -1134,7 +1137,7 @@ def _print_generation(outcome: GenerationOutcome, json_output: bool) -> None:
 def opportunities_main(ctx: typer.Context) -> None:
     """List opportunities when no subcommand is given."""
     if ctx.invoked_subcommand is None:
-        list_opportunities(status=None, min_score=None, topic=None, competitor=None, limit=25, json_output=False)  # fmt: skip
+        list_opportunities(status=None, min_score=None, topic=None, competitor=None, origin=None, limit=25, json_output=False)  # fmt: skip
 
 
 @opportunities_cli.command("generate")
@@ -1164,9 +1167,19 @@ def generate_opportunities(
         raise typer.Exit(code=2) from exc
     _print_generation(outcome, json_output)
     if not json_output and outcome.status != RunStatus.FAILED:
-        list_opportunities(status=None, min_score=None, topic=None, competitor=None, limit=10, json_output=False)  # fmt: skip
+        list_opportunities(status=None, min_score=None, topic=None, competitor=None, origin=None, limit=10, json_output=False)  # fmt: skip
     if outcome.status == RunStatus.FAILED:
         raise typer.Exit(code=1)
+
+
+def _print_opportunities(rows: Sequence[OpportunitySummary], *, empty: str) -> None:
+    table = Table("#", "ID", "Score", "Topic", "Working title", "Gap", "Format", "Audience", "Status")  # fmt: skip
+    for r in rows:
+        fmt = r.recommended_format.value if r.recommended_format else "—"
+        status_text = r.status.value + (" (stale)" if r.stale else "")
+        gap = r.primary_gap.value if r.primary_gap else ("editorial" if r.origin is OpportunityOrigin.EDITORIAL else "—")  # fmt: skip
+        table.add_row(str(r.rank), str(r.id), f"{r.score:.0f}", escape(r.topic_label[:32]), escape(r.title[:52]), gap, fmt, escape((r.target_audience or "—")[:24]), status_text)  # fmt: skip
+    console.print(table if rows else empty)
 
 
 @opportunities_cli.command("list")
@@ -1178,10 +1191,14 @@ def list_opportunities(
     min_score: float | None = typer.Option(None, min=0, max=100),
     topic: str | None = typer.Option(None, help="Topic slug or part of its name."),
     competitor: str | None = typer.Option(None, help="Competitor slug in the evidence."),
+    origin: Annotated[
+        OpportunityOrigin | None,
+        typer.Option(help="competitors or editorial (default: both)."),
+    ] = None,
     limit: int = typer.Option(25, min=1, max=200),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Opportunities ranked by score."""
+    """Opportunities ranked by score (editorial topics show "editorial" as their gap)."""
 
     async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
         async with sessions() as session:
@@ -1192,17 +1209,13 @@ def list_opportunities(
                 min_score=min_score,
                 topic=topic,
                 competitor=competitor,
+                origin=origin,
                 limit=limit,
             )
         if json_output:
             sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
             return
-        table = Table("#", "ID", "Score", "Topic", "Working title", "Gap", "Format", "Audience", "Status")  # fmt: skip
-        for r in rows:
-            fmt = r.recommended_format.value if r.recommended_format else "—"
-            status_text = r.status.value + (" (stale)" if r.stale else "")
-            table.add_row(str(r.rank), str(r.id), f"{r.score:.0f}", r.topic_label[:32], r.title[:52], r.primary_gap.value if r.primary_gap else "—", fmt, (r.target_audience or "—")[:24], status_text)  # fmt: skip
-        console.print(table if rows else "No opportunities: run `opportunities generate` (after `analyze`).")  # fmt: skip
+        _print_opportunities(rows, empty="No opportunities: run `opportunities generate` (after `analyze`) or `editorial propose`.")  # fmt: skip
 
     _run_db(work)
 
@@ -1350,6 +1363,102 @@ def expire_opportunity(opportunity_id: int, note: str | None = typer.Option(None
 def reopen_opportunity(opportunity_id: int, note: str | None = typer.Option(None)) -> None:
     """Reopen an expired opportunity."""
     _set_opportunity_status(opportunity_id, OpportunityStatus.NEW, note)
+
+
+# ── editorial topics: ideas from your company profile ────────────────────────
+
+
+def _print_proposal(outcome: ProposalOutcome, json_output: bool) -> None:
+    s, u = outcome.summary, outcome.usage
+    if json_output:
+        payload = {"run_id": outcome.run_id, "status": outcome.status.value, "error": outcome.error, "summary": s.as_dict() if s else None, "ideas": [i.model_dump(mode="json") for i in outcome.ideas], "usage": u.as_dict() if u else None}  # fmt: skip
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return
+    color = "green" if outcome.status is RunStatus.SUCCEEDED else "red"
+    console.print(f"run {outcome.run_id} [{color}]{outcome.status.value}[/{color}]" + (" [dim](dry run: nothing saved)[/dim]" if s and s.dry_run else ""))  # fmt: skip
+    if s is not None:
+        rejected = ", ".join(f"{k} {v}" for k, v in sorted(s.rejected.items())) or "none"
+        site = f"{s.site_posts} post(s) on your site" if s.site_posts is not None else "your site not read"  # fmt: skip
+        console.print(f"company profile v{s.company_profile_version} · asked Gemini for {s.asked} · got {s.proposed} · kept {len([i for i in outcome.ideas if not i.rejected])} of {s.requested} wanted (rejected: {rejected})")  # fmt: skip
+        console.print(f"checked against {s.covered} covered title(s) ({site}) · created={s.created} expired={s.expired} unverified_sentences_removed={s.unverified_sentences_removed}")  # fmt: skip
+        if s.site_error:
+            err.print(f"[yellow]your site's posts weren't checked: {escape(s.site_error)}[/yellow]")
+    if outcome.ideas:
+        table = Table("ID", "Score", "Topic", "Working title", "Format", "Audience", "Result")
+        for idea in sorted(outcome.ideas, key=lambda i: (i.rejected is not None, -i.score)):
+            result = f"[dim]{escape(idea.rejected)}[/dim]" if idea.rejected else ("[green]created[/green]" if idea.opportunity_id else "[green]kept[/green]")  # fmt: skip
+            table.add_row(str(idea.opportunity_id or "—"), f"{idea.score:.0f}", escape(idea.topic[:32]), escape(idea.title[:52]), idea.recommended_format.value, escape(idea.target_audience[:24]), result)  # fmt: skip
+        console.print(table)
+    if u is not None and u.calls:
+        console.print(f"gemini: {u.calls} call(s), {u.total_tokens:,} tokens")
+    if outcome.error:
+        err.print(f"[red]{escape(outcome.error)}[/red]")
+    elif s is not None and s.created:
+        console.print(f"[dim]Next: review them (`opportunities show <id>`), then `opportunities approve <id>` and `articles generate <id>`; scores of {get_settings().pipeline_min_opportunity_score:.0f}+ are eligible for the pipeline.[/dim]")  # fmt: skip
+
+
+@editorial_cli.callback(invoke_without_command=True)
+def editorial_main(ctx: typer.Context) -> None:
+    """List editorial topics when no subcommand is given."""
+    if ctx.invoked_subcommand is None:
+        list_editorial(status=None, limit=25, json_output=False)
+
+
+@editorial_cli.command("propose")
+def propose_editorial(
+    count: int | None = typer.Option(
+        None, min=1, max=25, help="Ideas to keep (default: EDITORIAL_TOPICS_PER_RUN)."
+    ),
+    dry_run: bool = typer.Option(
+        False, help="Show the ideas without saving them (still one Gemini call)."
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Propose article ideas from your company profile (Gemini), checked against what is
+    already covered; each kept idea becomes an opportunity (status new)."""
+    settings = get_settings()
+
+    async def work(engine: AsyncEngine, sessions: SessionFactory) -> ProposalOutcome:
+        llm = LazyLLM(settings)
+        try:
+            async with PoliteFetcher(settings) as fetcher:
+                service = EditorialService(engine, sessions, llm, settings, fetcher=fetcher)
+                return await service.propose(trigger=RunTrigger.CLI, count=count, dry_run=dry_run)
+        finally:
+            await llm.aclose()
+
+    try:
+        outcome = _run_db(work)
+    except LLMConfigurationError as exc:
+        raise _llm_error(exc) from exc
+    except (NoCompanyProfileError, EditorialRunAlreadyActiveError, ConfigurationError) as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    _print_proposal(outcome, json_output)
+    if outcome.status is RunStatus.FAILED:
+        raise typer.Exit(code=1)
+
+
+@editorial_cli.command("list")
+def list_editorial(
+    status: Annotated[
+        list[OpportunityStatus] | None,
+        typer.Option("--status", help="Repeatable. Default: new, reviewed, approved."),
+    ] = None,
+    limit: int = typer.Option(25, min=1, max=200),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Editorial topics (opportunities proposed from your company profile), by score."""
+
+    async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
+        async with sessions() as session:
+            rows = await opportunity_queries.list_opportunities(session, now=utcnow(), statuses=tuple(status) if status else opportunity_queries.ACTIONABLE_STATUSES, origin=OpportunityOrigin.EDITORIAL, limit=limit)  # fmt: skip
+        if json_output:
+            sys.stdout.write("[" + ",".join(r.model_dump_json() for r in rows) + "]\n")
+            return
+        _print_opportunities(rows, empty="No editorial topics: run `editorial propose`.")
+
+    _run_db(work)
 
 
 # ── articles (Phase 5: drafts only, never published) ─────────────────────────
@@ -2352,11 +2461,14 @@ def _print_plan(plan: PipelinePlan) -> None:
             table.add_row(str(a.get("competitor")), str(a.get("to_analyze", a.get("error", "—"))), str(a.get("carry_forward", "—")), str(a.get("batches", "—")), f"{a.get('estimated_input_tokens', 0):,}")  # fmt: skip
         console.print(table)
     if plan.opportunities:
-        table = Table("Opp.", "Score", "Fit", "Evidence", "Status", "Selected", "Title")
+        table = Table("Opp.", "Origin", "Score", "Fit", "Evidence", "Status", "Selected", "Title")
         for o in plan.opportunities[:15]:
-            table.add_row(str(o.opportunity_id), f"{o.score:.1f}", f"{o.strategic_fit:.2f}" if o.strategic_fit is not None else "—", str(o.evidence), o.status, "[green]yes[/green]" if o.selected else "no", escape(o.title[:60]))  # fmt: skip
+            table.add_row(str(o.opportunity_id), o.origin.value, f"{o.score:.1f}", f"{o.strategic_fit:.2f}" if o.strategic_fit is not None else "—", str(o.evidence), o.status, "[green]yes[/green]" if o.selected else "no", escape(o.title[:60]))  # fmt: skip
         console.print(table)
-    console.print(f"generation: {plan.generation_remaining} of {plan.generation_limit} left today · publishing: {plan.publication_remaining} of {plan.publication_limit} left today")  # fmt: skip
+    t = plan.today
+    console.print(f"generation: {plan.generation_remaining} of {plan.generation_limit} left today (competitors) · {t.editorial_remaining} of {t.editorial_limit} (editorial) · publishing: {plan.publication_remaining} of {plan.publication_limit} left today")  # fmt: skip
+    if plan.editorial_topics_needed:
+        console.print(f"editorial: {plan.editorial_topics_needed} new idea(s) would be proposed (one Gemini call)")  # fmt: skip
     for label, rows in (("validation", plan.validation), ("publishing", plan.publishing)):
         if rows:
             table = Table("Article", "Status", "Score", "Approval", "Action", "Title", title=label)
@@ -2482,7 +2594,7 @@ def schedule_status_cmd(json_output: bool = typer.Option(False, "--json")) -> No
     console.print(f"scheduler: {state} · timezone {s.timezone} · pipelines at once: {s.max_concurrent_pipelines}")  # fmt: skip
     console.print(f"publishing: automated {'[green]on[/green]' if s.automated_publishing else '[dim]off[/dim]'} · auto-approve {'on' if s.auto_approve else 'off'} · target {s.publish_target} · direct publish {'allowed' if s.direct_publish else 'not allowed'}")  # fmt: skip
     t = s.today
-    console.print(f"today {t.date}: generated {t.generated}/{t.generation_limit} (left {t.generation_remaining}) · ready {t.ready} · published {t.published}/{t.publication_limit} (left {t.remaining}) · drafts {t.drafts}")  # fmt: skip
+    console.print(f"today {t.date}: generated {t.generated}/{t.generation_limit} (left {t.generation_remaining}) · editorial {t.editorial_generated}/{t.editorial_limit} (left {t.editorial_remaining}) · ready {t.ready} · published {t.published}/{t.publication_limit} (left {t.remaining}) · drafts {t.drafts}")  # fmt: skip
     if s.llm_tokens_left_today is not None:
         console.print(f"LLM tokens left today (UTC): {s.llm_tokens_left_today:,}")
     console.print("jobs today: " + (", ".join(f"{k} {v}" for k, v in sorted(s.jobs_today.items())) or "none") + (f" · running: {s.running}" if s.running else ""))  # fmt: skip
