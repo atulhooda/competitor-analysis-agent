@@ -1,0 +1,63 @@
+# Opportunity scoring configuration (Phase 4). Optional: without config/scoring.yaml the
+# values below (the built-in defaults) apply. To customize:
+#
+#   cp config/scoring.example.yaml config/scoring.yaml   # gitignored
+#
+# Every assessment stores a fingerprint of this configuration, so a change is visible in
+# an opportunity's history ("scoring configuration changed").
+scoring:
+  # Growth compares the last `window_days` with the `window_days` before (reliable
+  # publication dates only).
+  window_days: 60
+
+  # Maximum points per dimension. Positive weights are rescaled to total 100; saturation
+  # is a penalty subtracted from the total. Final score: 0-100.
+  weights:
+    momentum: 20        # growth + share of competitors growing on the topic
+    strategic_fit: 25   # match with your core/adjacent topics, products, description
+    audience_fit: 15    # your audiences' share of the topic's competitor pages
+    content_gap: 25     # strongest weighted gap (below)
+    recency: 15         # how recently competitors published on it
+    saturation: 15      # penalty: volume, breadth, frequency, format variety
+
+  # How much each gap type counts toward content_gap (0-1).
+  gap_weights:
+    topic: 1.0            # few competitors cover it
+    audience: 1.0         # your audiences are underserved
+    intent: 0.8           # valuable intents (below) are underserved
+    format: 0.8           # valuable formats are missing
+    depth: 0.6            # fragmented or shallow coverage
+    freshness: 0.8        # competitor content is old
+    differentiation: 0.6  # competitors all cover it the same way
+
+  # Which candidates become opportunities.
+  min_topic_items: 2          # competitor pages a topic needs
+  min_strategic_fit: 0.2      # below this, never an opportunity (relevance matters)
+  min_score: 40               # below this, not an opportunity
+  max_opportunities: 25
+  topic_gap_min_corpus_items: 20  # analyzed pages before "no competitor covers your core topic" counts
+
+  # Signal parameters.
+  recency_half_life_days: 30
+  fresh_days: 90              # median competitor page age where the freshness gap starts
+  stale_days: 365             # ...and where it is maximal
+  saturation_reference_items: 30
+  saturation_reference_per_week: 1.0
+  saturation_relief: 0.5      # how much weak coverage offsets saturation
+  valuable_intents: [commercial, comparison]
+  valuable_formats: [tutorial, guide, comparison, case_study]  # your company preferred_formats win
+  expected_share: 0.2         # an intent/format below this share is underserved
+  audience_fit_share: 0.15    # your audience in this share of pages = full audience fit
+  audience_served_share: 0.5  # ...in this share = no audience gap
+  min_items_for_gaps: 4       # gaps from fewer pages are scaled down
+
+  # Lifecycle.
+  expires_after_days: 30      # not re-confirmed by a generation run in this time: stale
+  min_score_change: 1.0       # smaller score drift doesn't create a new assessment
+
+  # Gemini interpretation (angle, format, audience, rationale): top candidates only.
+  interpretation:
+    enabled: true
+    candidates: 10
+    min_score: 50
+    batch_size: 4

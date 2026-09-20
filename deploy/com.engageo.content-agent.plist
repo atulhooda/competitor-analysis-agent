@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The scheduling worker as a macOS service: it starts at login, restarts if it
+  crashes, and runs the schedules in .env (FULL_PIPELINE_SCHEDULE and friends).
+  It runs only while this Mac is awake and logged in; an always-on server is the
+  next step if the blog must not miss a day.
+
+  It runs from ~/coding/engageo-content-agent-live, a git worktree pinned to a
+  commit, so editing the development checkout can never break a nightly run.
+  To move the live checkout to newer code:
+    git -C ~/coding/engageo-content-agent-live fetch origin
+    git -C ~/coding/engageo-content-agent-live checkout <commit>
+    launchctl kickstart -k gui/$(id -u)/com.engageo.content-agent
+
+  Install:
+    cp deploy/com.engageo.content-agent.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.engageo.content-agent.plist
+
+  Watch / stop:
+    tail -f ~/Library/Logs/engageo-content-agent.log
+    launchctl unload -w ~/Library/LaunchAgents/com.engageo.content-agent.plist
+
+  The worker reads .env itself: nothing secret belongs in this file.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.engageo.content-agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/atulhooda/.local/bin/uv</string>
+        <string>run</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>app</string>
+        <string>worker</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/atulhooda/coding/engageo-content-agent-live</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/atulhooda/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/atulhooda/Library/Logs/engageo-content-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/atulhooda/Library/Logs/engageo-content-agent.log</string>
+</dict>
+</plist>

@@ -1,0 +1,73 @@
+[project]
+name = "competitor-analysis-agent"
+version = "0.1.0"
+description = "Competitor intelligence and content generation agent"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.20",
+    "apscheduler>=3.11,<4",
+    "defusedxml>=0.7.1",
+    "fastapi>=0.141",
+    "feedparser>=6.0.14",
+    "google-genai>=2.23",
+    "httpx>=0.28.1",
+    "protego>=0.6.2",
+    "psycopg[binary]>=3.3.5",
+    "pydantic>=2.13",
+    "pydantic-settings>=2.15",
+    "pyyaml>=6.0.3",
+    "rich>=13.9",
+    "sqlalchemy[asyncio]>=2.0.52",
+    "structlog>=26.1",
+    "trafilatura>=2.2",
+    "typer>=0.27",
+    "uvicorn[standard]>=0.52",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3",
+    "pytest>=9.1",
+    "pytest-asyncio>=1.4",
+    "respx>=0.23",
+    "ruff>=0.16",
+    "types-pyyaml>=6.0",
+]
+
+[tool.uv]
+# This is a service, not a library: run it from the repository root.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra -m 'not live and not llm_live and not cms_live'"
+markers = [
+    "live: hits real third-party websites; opt in with `pytest -m live`",
+    "llm_live: calls the real Gemini API (costs a little); opt in with `pytest -m llm_live`",
+    "cms_live: writes a test draft to a real WordPress site (never publishes); opt in with `LIVE_WORDPRESS=1 pytest -m cms_live`",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "ASYNC", "S", "RUF", "PT"]
+# Line length is enforced by `ruff format`; don't double-report long strings/comments.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S311"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["feedparser.*", "protego.*", "trafilatura.*", "defusedxml.*", "apscheduler.*"]
+ignore_missing_imports = true

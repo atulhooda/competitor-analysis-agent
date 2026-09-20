@@ -1,0 +1,1014 @@
+# Migration Plan — Competitor Intelligence & Content Agent
+
+**Status:** Approved · **Date:** 2026-09-13 · **Main repo:** `atulhooda/competitor-analysis-agent`
+
+**Revision history**
+- r1 (2026-09-13): initial analysis and plan.
+- r2 (2026-09-13): **the primary LLM provider changed from Anthropic to Google Gemini**, at the owner's request. Gemini is the only LLM provider; no other provider is introduced unless the owner explicitly asks. Phase 1 stays deterministic (no LLM calls) and only establishes the provider-agnostic LLM interface and Gemini configuration.
+- r3 (2026-09-13): Phase 1 approved. Phase 2 (persisted history) implemented; see the implementation notes under §12, Phase 2.
+- r4 (2026-09-13): Phase 2 approved. Phase 3 (AI competitor intelligence, the first Gemini calls) implemented; see the implementation notes under §12, Phase 3.
+- r5 (2026-09-14): Phase 3 approved. Phase 4 (content opportunities) implemented; see the implementation notes under §12, Phase 4. Relevance is now deterministic rather than an LLM judgment (§8.3); Gemini only interprets the top candidates.
+- r6 (2026-09-14): Phase 4 approved. Phase 5 (article drafts) implemented; see the implementation notes under §12, Phase 5. LangGraph was evaluated and **not** adopted: a plain checkpoint table gives the same resumability for this linear pipeline, without a new dependency (§8.4). Drafts only; nothing is published.
+- r8 (2026-09-15): Phase 6 approved. Phase 7 (approval and CMS publishing, WordPress first) implemented; see the implementation notes under §12, Phase 7. It differs from §8.5–8.6 in three ways:
+  - approvals are records tied to an exact version and quality report, not an article state;
+  - HTML is built from the structured article with escaping (no Markdown conversion or sanitizer needed);
+  - no SEO mu-plugin is assumed.
+
+  Phase 7 publishes only approved, ready article versions and defaults to WordPress drafts. Scheduling is not included.
+- r10 (2026-09-16): Phase 8 approved. **The publishing target is the website's own GitHub repository**, not WordPress: the owner's site (engageoagency.com) is Next.js on Vercel with one `src/content/blog/<slug>.mdx` per post and no CMS. A GitHub publishing adapter was added behind Phase 7's target-neutral interface (branch → MDX file → pull request → Vercel preview verified → squash merge → production deployment → live URL verified); see the implementation notes under §12, Phase 8, "The GitHub publishing adapter". The WordPress adapter is no longer the intended architecture; it stays in the tree, selectable only by `CMS_PROVIDER=wordpress`, until it is removed.
+- r11 (2026-09-19): **Editorial topics**, at the owner's request (three articles a day from competitor monitoring, ten from the agent's own proposals): Gemini proposes article ideas from the company profile alone; deterministic checks score and filter them; each kept idea is an ordinary opportunity (key `editorial:<topic>`) on the existing article, validation, approval and publishing path. A new pipeline stage (`editorial`, before `generate`), a separate daily allowance (`MAX_EDITORIAL_ARTICLES_PER_DAY`, 0 by default), migration 0008 (one LLM-call purpose, one job type). See the implementation notes under §12, Phase 8, "Editorial topics".
+- r9 (2026-09-15): Phase 7 approved. Phase 8 (scheduling, the autonomous pipeline and daily limits) implemented; see the implementation notes under §12, Phase 8. Phase 8 introduces autonomous scheduling and pipeline orchestration. Social media automation is intentionally deferred to Phase 9. It differs from §8.6–8.7 in four ways:
+  - executions are recorded as `jobs` (with stage checkpoints), not only as `runs`; the Phase 2–7 services keep their own runs;
+  - the schedule settings are `FULL_PIPELINE_SCHEDULE`, `SCAN_SCHEDULE`, … in `SCHEDULER_TIMEZONE` (default Asia/Kolkata), not `SCHEDULE_*_CRON` in UTC;
+  - the daily publishing limit is reserved inside Phase 7's publisher (`publications.limit_day`), not tracked as a `go_live_date` counter;
+  - the API may run a job it creates (in the background); it never fires schedules, and jobs are claimed atomically, so nothing runs twice.
+- r7 (2026-09-14): Phase 5 approved. Phase 6 (article validation: fact-checking, originality, SEO package, metrics, Gemini judge, combined score and gates, bounded revisions) implemented on the Phase 5 checkpoint system; see the implementation notes under §12, Phase 6. LangGraph still isn't needed: the bounded loop is a few lines over the same checkpoints. Phase 6 validates and prepares articles but does not publish them.
+
+The three source repositories were cloned to a temporary scratch directory for analysis only. They are not vendored, submoduled, or left beside the project.
+
+---
+
+## 0. Summary
+
+| Decision | Choice |
+|---|---|
+| **Base repository** | **Repository 3 — `Str1nX03/Competitor-Research` (MIT)**. It is used as an *architectural seed*: package layout, settings pattern, LangGraph node conventions and prompt separation. It is not a feature base. Expect well over 90% of the final code to be new. |
+| **Import (with attribution)** | Repository 1 — `gokborayilmaz/competitor-analysis-agent` (MIT). Competitor-profile schemas, and the "research each competitor in isolation → synthesize only from structured evidence" pattern. |
+| **Reference only (no code)** | Repository 2 — `ShreyashSoni/agentic_blog_generator`. It has **no license**, so none of its code or prompt text can be copied. Its blog-pipeline *ideas* will be re-implemented independently. |
+| **Stack** | Python 3.12 · FastAPI · PostgreSQL 16 · SQLAlchemy 2 + Alembic · compliant crawler (httpx + trafilatura) · **Google Gemini** via the official `google-genai` SDK (Interactions API), behind a provider-agnostic `app/llm` interface · LangGraph (content-generation workflow only) · APScheduler worker process |
+| **Deliberately not used** | Redis, Celery, Kafka, microservices, ChromaDB, a vector DB in the MVP, any LLM provider other than Gemini (no OpenAI, no Anthropic), LangChain model wrappers, Tavily, Firecrawl, Upsonic, Flask |
+| **Build order** | 10 vertical phases. Phase 1 is compliant competitor-website monitoring, with no database and no LLM. |
+
+---
+
+## 1. Repository analysis
+
+### 1.1 Side-by-side
+
+| Aspect | R1 · competitor-analysis-agent | R2 · agentic_blog_generator | R3 · Competitor-Research |
+|---|---|---|---|
+| Purpose | One-shot competitor snapshot report | Topic → blog post; WordPress publishing; social-post drafts | Idea/company → competitor discovery report |
+| Size / history | ~360 LOC Python, 4 commits | ~6.2k LOC Python + ~1.3k LOC tests, 66 commits | ~550 LOC Python + ~1.3k LOC HTML/CSS/JS, 49 commits |
+| Architecture | Single script, two phases | Flat packages (`agents/`, `services/`, `workflows/`, `memory/`, `prompts/`) plus 4 CLI entry scripts | `src/` package (`agents/`, `prompts/`, `config.py`, `utils.py`) + Flask app |
+| Frameworks | Upsonic, Firecrawl SDK, Anthropic | LangGraph, LangChain (Anthropic + OpenAI), Tavily, ChromaDB, tenacity, requests | LangGraph, LangChain-Groq, langchain-tavily, Flask, flask-sock, xhtml2pdf, pydantic-settings |
+| Agent architecture | A tool-using research agent per competitor (isolated context), then a tool-less synthesis agent. Pydantic structured output. | Linear 6-node graph: planner → research → outline → writer → editor → SEO | Two tiny graphs (researcher: 2 nodes; reporter: 1 node) chained inside a web handler |
+| Backend / API | None (CLI) | None (CLIs only) | Flask routes + WebSocket, report list/get/delete, PDF endpoint. The README says FastAPI; that is stale. |
+| Database | None (writes `report.json` / `.md`) | None (Markdown files on disk) | SQLite, one `reports` table, raw `sqlite3` |
+| Vector DB | None | ChromaDB. The per-topic collection is deleted and recreated every run; default embeddings. | None |
+| LLM integration | Upsonic `Agent(model="claude-sonnet-4-6")` | `get_llm()` factory (OpenAI or Anthropic via LangChain); sends an internal SSO bearer token | `ChatGroq` (`openai/gpt-oss-20b`), 700 max tokens |
+| Web research | Firecrawl search (3 results) | Tavily "advanced" search (7 results), each LLM-summarized | Tavily, 1–2 results per query, 5 fixed questions per competitor |
+| Scraping / crawling | Firecrawl scrape of the **homepage only** (map/crawl disabled) | None | None |
+| Scheduling | None | None | None |
+| Publishing | None | WordPress REST via Application Passwords (separate CLI over `.md` files) | PDF download |
+| Error handling | None | `try/except` everywhere with **silent fabricated fallback content** | `CustomException(e, sys)` around every call; no retries or timeouts |
+| Configuration | Python constants | `.env` + CLI flags; hard-requires a corporate SSO `TOKEN` | pydantic-settings + `.env` (good) |
+| Testing | None | 60 tests, all for an approval module the workflow never calls. **57 pass / 3 fail.** | None (0-byte stubs, later deleted) |
+| Observability | `print()` | stdlib `logging` | `print()`; LangSmith settings declared but never used |
+| Code quality | Readable but **does not run** (broken import) | Docstrings and types; dead code, duplicated helpers, `sys.exit` inside library code | Small; contradictory prompts; README/code drift |
+| Extensibility | Low (Upsonic lock-in, single file) | Medium (swappable node functions) | Medium (clear package seams) |
+| License | **MIT** © 2024 Upsonic Teknoloji A.Ş. (file `LICENCE`) | **None** | **MIT** © 2026 Dravin Kumar Sharma |
+
+### 1.2 Verified defects (each checked in code, git history, or by running)
+
+**R1**
+- Won't run: `main.py` does `from schemas import …`, but the file is named `shemas.py`.
+- The README describes `map_website` discovery, but the code sets `enable_map=False`.
+- Shallow and point-in-time: one homepage scrape and two searches per competitor. No history, no diffing.
+
+**R2**
+- **No license** (see §3).
+- **Coupled to corporate-internal auth.** `utils/env_utils.py` shells out to `/usr/local/bin/appleconnect` with a hardcoded OAuth client ID. `validate_environment()` exits if `TOKEN` is missing, and the LLM factory sends `Authorization: Bearer $TOKEN`. `.env.example` references an internal gateway ("floodgate"), and the project depends on `apple-certifi`.
+- **Silent fabricated fallbacks.** When Tavily or the LLM fails, "research" becomes lines like *"{topic} is an important subject in modern technology and business"*, the writer emits template filler sections, and SEO falls back to generic metadata. In an auto-publish system this would publish filler.
+- **The WordPress publisher can create duplicate posts.** `create_post()` is wrapped in a tenacity `@retry` on any `RequestException`. A read-timeout that happens *after* WordPress created the post therefore re-POSTs it.
+- The Markdown body is sent to WordPress unconverted. The `markdown` package is declared but never imported. There is also no SEO-plugin meta, no `future` (scheduled) status, and no slug pre-check. Auth errors get re-wrapped as generic publish errors.
+- **The human-approval service is dead code.** It isn't wired into the graph. It's based on CLI `input()`, **auto-approves on timeout**, and the timeout can't fire while `input()` blocks (the failing test `test_timeout_calculation` confirms this). It also installs process-wide SIGINT/SIGTERM handlers that call `sys.exit`.
+- LangGraph misuse:
+  - Nodes mutate and return the whole state.
+  - A ChromaDB client object lives in graph state, which isn't serializable, so checkpointing is impossible.
+  - The "parallel writers" are a sequential loop.
+- Thin RAG: research is truncated to 1,000 chars before summarizing and 500 chars per retrieved doc, and the collection is wiped every run.
+- Prompts are loaded by CWD-relative path.
+- Dependency drift between `pyproject.toml` and `requirements.txt` (e.g. `langchain-anthropic` 1.3.4 vs 1.4.0). `langgraph` and `PyYAML` are only installed transitively. `pytest` and `ipykernel` are listed as runtime deps. Requires Python ≥ 3.13.
+
+**R3**
+- The README describes FastAPI, `uvicorn main:app`, an "Assistant Agent" and a `tests/` directory. Git history shows the backend was switched to Flask on 2026-07-16 and the assistant agent deleted; the tests were always empty files.
+- The competitor-extraction prompt asks for JSON, then for a comma-separated list. The output is parsed with `split(',')` and not stripped. "Find as many competitors as possible" leads to unbounded N × 5 sequential searches.
+- It asks for revenue, profit and market share from single search snippets, which invites hallucinated figures.
+- The pipeline blocks inside the WebSocket handler. PDF temp files are never deleted. There is no auth on DELETE. LLM output, derived from web content, is rendered via `marked.parse` → `innerHTML` without sanitization (XSS).
+- The LangSmith settings are declared, but nothing reads them or loads `.env` into the process environment.
+
+---
+
+## 2. Scores (1 = absent/unusable, 10 = production-grade)
+
+| # | Criterion | R1 | R2 | R3 |
+|---|---|:-:|:-:|:-:|
+| 1 | Competitor research | 5 | 1 | 4 |
+| 2 | Web crawling | 3 | 1 | 1 |
+| 3 | Web research | 5 | 5 | 4 |
+| 4 | Social/content monitoring | 1 | 2¹ | 1 |
+| 5 | Agent architecture | 5 | 6 | 3 |
+| 6 | LangGraph implementation | 1² | 5 | 4 |
+| 7 | RAG | 1 | 4 | 1 |
+| 8 | Blog generation | 1 | 6 | 1 |
+| 9 | SEO | 1 | 5 | 1 |
+| 10 | CMS publishing | 1 | 4 | 1 |
+| 11 | FastAPI/backend | 1 | 1 | 3³ |
+| 12 | Database architecture | 1 | 2 | 2 |
+| 13 | Scheduling | 1 | 1 | 1 |
+| 14 | Production readiness | 1 | 2 | 2 |
+| 15 | Extensibility | 3 | 5 | 4 |
+| 16 | Code quality | 4 | 4 | 3 |
+| 17 | Ease of modification | 6 | 5 | 7 |
+| | **Total (/170)** | **41** | **59** | **43** |
+
+¹ R2 generates social posts *from* blogs; it doesn't monitor anything. ² R1 uses Upsonic, not LangGraph. ³ Flask, not FastAPI.
+
+None of the three is production-grade. R2 scores highest, but it can't legally serve as a base (§3, §4).
+
+---
+
+## 3. License assessment
+
+*This is an engineering assessment, not legal advice. Confirm with counsel if the product's IP position is material, e.g. for fundraising diligence.*
+
+| Repo | License found | Commercial/proprietary use? | Conditions | Verdict |
+|---|---|---|---|---|
+| R1 | MIT (`LICENCE`), © 2024 Upsonic Teknoloji A.Ş. | Yes | Keep the copyright and permission notice with copied or substantial portions | ✅ Code may be copied/adapted with attribution |
+| R3 | MIT (`LICENSE`), © 2026 Dravin Kumar Sharma | Yes | Same | ✅ Code may be copied/adapted with attribution |
+| R2 | **None.** No license file anywhere in the 66-commit history. The README shows an "MIT" badge that links to a `LICENSE` file that doesn't exist, and GitHub reports no license. | **No** | Default copyright applies (all rights reserved). GitHub's terms only allow viewing and forking on GitHub. A badge is not a grant. | ❌ **Do not copy code or prompt text** |
+
+There is a second concern with R2. Its code references corporate-internal tooling (see §1.2), which suggests it may have been written in an employer context. So even a license added later by the repo author might not settle who owns the copyright.
+
+**Consequences**
+- R1 and R3 material that we adapt gets a header comment (`Adapted from <repo> (MIT, © <holder>)`). Both notices go into `THIRD_PARTY_NOTICES.md`.
+- For R2, we take only non-copyrightable ideas: the stage decomposition, and the kinds of SEO checks. The WordPress integration will be written from the public WordPress REST API documentation. No R2 files, functions or prompt text will be pasted, paraphrased line-by-line, or used as a template. Its hardcoded client ID and internal URLs will not be propagated anywhere.
+- New dependencies were checked for licenses (§9). All are MIT, BSD, Apache-2.0 or PSF, except `psycopg` (LGPL-3.0). Using LGPL unmodified as a dependency is compatible with proprietary and SaaS use.
+
+---
+
+## 4. Base repository decision
+
+### Use Repository 3 as the base.
+
+**Why R3**
+1. **Legally usable** (MIT).
+2. **Closest shape to the target.**
+   - A real package with separated `agents/`, `prompts/`, config and utilities.
+   - A web backend with persistence and a report-history API.
+   - Its LangGraph nodes return **partial state updates** (idiomatic, and checkpoint-friendly). R2's don't.
+   - Typed per-agent state, and pydantic-settings configuration.
+3. **Its stack is our stack** — LangGraph, pydantic-settings, LangSmith-compatible tracing — without the parts we're dropping (Groq, Flask).
+4. **Same domain as Phases 1–4** (competitor research).
+
+**What "base" means in practice.** R3 contributes conventions and a handful of adapted modules: the settings pattern, prompt/agent separation, and LangGraph node style. Its Flask app, SQLite storage, Groq client, discovery agent and frontend are all replaced. We copy the few patterns we keep, with attribution. We do **not** merge R3's git history into your repo.
+
+**Why not R2 (despite the highest score).** It has no license and provenance concerns. It is also coupled to corporate-internal auth, and its publisher and fallback behaviour are unsafe. Even with a license, most of it would be rewritten.
+
+**Why not R1.** It's a ~360-line script that doesn't run, is built on Upsonic (which would become a second agent framework next to LangGraph), and has no server, persistence or package structure. Its best asset, the schemas plus the grounded-synthesis pattern, is imported instead.
+
+---
+
+## 5. Component disposition
+
+### 5.1 Repository 3 (base, MIT)
+
+| R3 file / module | Disposition | Target |
+|---|---|---|
+| `src/config.py` — `Settings(BaseSettings)` + cached `get_settings()` | **Reuse pattern, adapted.** New fields, `SecretStr` for secrets, grouped settings, `.env` loading. | `app/config.py` (Phase 1) |
+| `src/prompts/*.py` — prompts kept out of agent code | **Reuse pattern.** Prompts become versioned files. The prompt text itself is rewritten. | `app/prompts/` (Phase 3+) |
+| `src/agents/*.py` — class per agent, typed `TypedDict` state, nodes return partial dicts, `START`/`END` | **Reuse conventions** for the LangGraph workflow; the code is rewritten | `app/workflows/` (Phase 5) |
+| `app.py` report history (list/get/delete) | **Concept kept**, becoming run history plus an audit trail | `app/api/v1/runs.py` (Phase 2) |
+| `app.py` Markdown → HTML (`markdown` with `tables`, `fenced_code`) | **Concept kept.** Reimplemented with `markdown-it-py` + `nh3` sanitization for CMS output. | `app/publishers/render.py` (Phase 7) |
+| `app.py` Flask routes, flask-sock WebSocket, raw `sqlite3` | **Rewritten** as FastAPI routers and SQLAlchemy/PostgreSQL; progress is exposed through run status | `app/main.py`, `app/api/` |
+| `src/utils.py` `get_llm()` (Groq) | **Factory shape kept; implementation replaced.** `get_llm()` returns an `LLMProvider` interface whose only implementation is `GeminiProvider`. Nothing outside `app/llm/gemini.py` imports the Gemini SDK. | `app/llm/` (interface and config in Phase 1; first calls in Phase 3) |
+| `src/utils.py` `web_search()` (Tavily) | **Removed.** Gemini's Google Search grounding handles blog research; our own fetcher handles monitoring. | — |
+| `src/exception.py` `CustomException(e, sys)` | **Removed** (it hides error types) and replaced by a typed error taxonomy | `app/core/errors.py` |
+| `src/agents/researcher_agent.py` (discovers competitors from an idea) | **Removed from the MVP.** "Suggest competitors" stays in the backlog. | — |
+| `src/agents/reporter_agent.py` (free-form Markdown report) | **Replaced** by structured change summaries and digests | `app/services/analysis.py` (Phase 3) |
+| `templates/`, `static/` (landing page, dashboard, `marked.js`) | **Removed** (XSS, and not needed until Phase 10) | — |
+| `Procfile`, `reports.db`, `research.ipynb`, `.env_example` | **Removed** / replaced by `.env.example` | — |
+
+### 5.2 Repository 1 (import, MIT)
+
+| R1 file / module | Disposition | Target |
+|---|---|---|
+| `shemas.py`: `CompetitorProfile`, `CompetitiveAnalysisReport` | **Import, adapted.** Add evidence URLs, observed-at timestamps, confidence, and structured pricing tiers. | `app/domain/competitor_profile.py` (Phase 3) |
+| `main.py` pattern: each competitor researched in its own context, then synthesis from structured profiles only ("do not add information not present") | **Reuse pattern** in the analysis services | `app/services/profiles.py` (Phase 3) |
+| `config.py` `INDUSTRY`, `FOCUS_AREAS` | **Concept** folded into the company profile | `config/company_profile.yaml` (Phase 4) |
+| Upsonic `Agent`/`Task`, `FirecrawlTools` | **Removed.** No second agent framework; our compliant crawler replaces Firecrawl. | — |
+| Terminal/Markdown report printing, `report.json`, `example_report.md` | **Removed.** Output goes through the API (and later the dashboard). | — |
+
+### 5.3 Repository 2 (reference only, no code or text copied)
+
+| Idea observed | Independent implementation in the new system |
+|---|---|
+| Stage decomposition: plan → research → outline → write → edit → SEO | LangGraph workflow that adds fact-checking, an originality check, a quality gate and a bounded revision loop (Phase 5–6) |
+| Per-section retrieval of research context | Drafting over stored research documents. Each claim is tagged with a source ID (and Gemini grounding metadata for web sources), so claims are traceable. |
+| Prompts kept outside code | `app/prompts/` with version IDs recorded on every output |
+| SEO checks (meta title/description length, slug rules, keyword density, FAQ) | `app/services/seo.py` (deterministic checks) plus one LLM call for copy |
+| WordPress REST + Application Passwords + get-or-create taxonomy | `app/publishers/wordpress.py`, written from the WP REST docs: async, idempotent, SEO meta, scheduling |
+| Plan/outline approval in the CLI | Replaced by an `ApprovalPolicy` on the **final article** (DB state machine) |
+| Social-post drafts from a blog | Backlog (a distribution feature, not monitoring) |
+
+### 5.4 Functionality removed
+Flask UI and landing page; PDF export; WebSocket streaming; idea-driven competitor discovery (deferred); Upsonic/Firecrawl agentic scraping; ChromaDB; OpenAI and Groq providers; CLI approval prompts; the file-based Markdown → publish pipeline; social-post generation (deferred); the standalone editing CLI.
+
+### 5.5 Functionality added (none exists in any source repo)
+- Robots-compliant crawler with sitemap and RSS discovery
+- Versioned content history and change detection
+- Four strictly separated data layers
+- Topic taxonomy and deterministic trend metrics
+- Configurable opportunity scoring
+- Fact-check, originality and quality gates
+- CMS abstraction and an idempotent WordPress publisher with SEO meta and scheduling
+- Application-level daily publishing limit
+- Approval-policy extension point
+- Scheduler worker with overlap locks
+- Audit trail and structured logs
+- API authentication
+- Social platform adapters
+- Dashboard
+
+---
+
+## 6. Target architecture
+
+### 6.1 Principles
+1. **Deterministic core, LLM at the edges.** Crawling, diffing, trend math, scoring, limits and publishing are plain Python and SQL. The LLM is used only where judgment or language generation adds value.
+2. **The four data layers are never mixed:** raw → normalized → analysis → recommendation (§7). Every analysis or recommendation row records *how* it was produced: run, model, and prompt version.
+3. **No silent fabrication.** A failed step fails loudly and is recorded. Nothing ever substitutes placeholder content.
+4. **Side effects are isolated.** Only `PublishingService` talks to a CMS, and no LLM sits on that path.
+5. **Everything is auditable:** which agent or tool ran, on what sources, why a topic was chosen, and what the gate decided.
+
+### 6.2 Layers
+```
+            ┌──────────────────────── API (FastAPI) ─── CLI (Typer) ─── Scheduler worker (APScheduler) ──┐
+            │                         thin: auth, validation, DTOs → call services                        │
+            ├──────────────────────── Application services (orchestration) ────────────────────────────────┤
+            │ monitoring · change_detection · analysis · trends · opportunities · generation · approval ·   │
+            │ publishing (daily limit + idempotency) · runs/audit                                          │
+            ├──────────── Agents / Workflows (LLM) ─────────────┬───────── Integrations (no LLM) ───────────┤
+            │ content analyzer · change summarizer · relevance   │ crawling: fetcher, robots, sitemaps,     │
+            │ judge · LangGraph blog workflow (plan, research,   │ feeds, extract, classify                  │
+            │ outline, draft, edit, fact-check, SEO, judge)      │ publishers: WordPress (CMSPublisher)      │
+            │                                                    │ social: YouTube, Instagram, X adapters    │
+            ├────────────────────────────── Data layer (SQLAlchemy 2 / PostgreSQL 16) ───────────────────────┤
+            │ repositories per layer: config · raw · normalized · analysis · recommendation · ops           │
+            └──── External: competitor sites · Gemini API (+ Google Search grounding) · WordPress · social APIs ┘
+```
+
+### 6.3 Directory structure
+```
+competitor-analysis-agent/
+├── pyproject.toml · uv.lock · .python-version · .env.example · .gitignore
+├── README.md · MIGRATION_PLAN.md · THIRD_PARTY_NOTICES.md
+├── docker-compose.yml              # Phase 2: postgres (pgvector/pgvector:pg16 image)
+├── alembic.ini · migrations/       # Phase 2
+├── config/                         # user data (real files gitignored; *.example.yaml committed)
+│   ├── competitors.example.yaml
+│   ├── company_profile.example.yaml    # Phase 4
+│   └── scoring.example.yaml            # Phase 4
+├── deploy/wordpress/               # Phase 7: optional mu-plugin exposing SEO/meta fields to REST
+├── app/
+│   ├── main.py                     # FastAPI app factory + lifespan
+│   ├── __main__.py · cli.py        # `python -m app …` (Typer)
+│   ├── config.py                   # Settings (pydantic-settings) + YAML loaders/validation
+│   ├── core/                       # logging (structlog), errors, http client factory, retry policies, time/tz
+│   ├── domain/                     # shared Pydantic types & enums (ContentType, ChangeType, CompetitorProfile…)
+│   ├── api/                        # deps (auth, db session), v1 routers, request/response schemas
+│   ├── db/                         # engine/session, repositories; models/ grouped by data layer
+│   ├── crawling/                   # fetcher, robots, ratelimit, sitemaps, feeds, extract, classify
+│   ├── services/                   # application services (see 6.2)
+│   ├── llm/                        # LLMProvider interface, get_llm() factory, Gemini provider (only google-genai importer); later: prompt registry, usage/cost
+│   ├── agents/                     # the few LLM-reasoning components (+ their tool definitions)
+│   ├── workflows/                  # LangGraph blog_generation graph + state
+│   ├── prompts/                    # versioned prompt files
+│   ├── publishers/                 # base.py (CMSPublisher), wordpress.py, render.py (md→html, sanitize)
+│   ├── social/                     # Phase 9: SocialSource protocol + platform adapters
+│   └── scheduler/                  # worker, job registry, advisory locks
+└── tests/  unit/ · integration/ · fixtures/ (html, sitemaps, feeds, wp responses) · conftest.py
+```
+Differences from your suggested layout:
+- There is no separate `tools/` package. The only tool-using agent is the blog researcher, so its tools live beside it.
+- `models/` and `database/` are merged into `db/`.
+- `crawling/` and `social/` are integrations, kept separate from services.
+
+### 6.4 Agents vs services (your proposed list, resolved)
+
+| Proposed | Resolution | Why |
+|---|---|---|
+| Competitor Monitoring Agent | **Service** (`crawling/` + `services/monitoring.py`) | Discovery, fetching and diffing are deterministic. An LLM adds cost and nondeterminism. |
+| Research Agent | **Merged** into the Blog Research step | Only generation needs open-ended research |
+| Content Analysis Agent | **LLM function** (single structured call per item, batched) | Classification and extraction, not autonomy |
+| Trend Detection Agent | **Service** (SQL/Python) + an optional LLM narrative | Growth and saturation are arithmetic |
+| Opportunity Agent | **Service** (weighted scoring) + one LLM relevance/angle judgment | Scores must be explainable and configurable |
+| Blog Research Agent | **Agent** (Gemini with Google Search grounding / URL context + internal-corpus tool) | Deciding what to look up benefits from reasoning |
+| Blog Writer / Editor | **LangGraph nodes** | Generation |
+| Fact Checker | **LangGraph node** (claims ↔ cited sources) | Verification needs reading comprehension |
+| SEO Agent | **Mostly service** (length, slug, headings, links, density) + one LLM copy call | Most SEO rules are mechanical |
+| Quality evaluation | **Service checks + LLM judge** node | A hybrid gate |
+| Publishing Agent | **Service. No LLM.** | Side effects must be deterministic and idempotent |
+
+---
+
+## 7. Data architecture (PostgreSQL 16)
+
+### 7.1 Tables by layer
+
+**Config**
+- `competitors`: `id`, `slug` (unique), `name`, `website_url`, `is_self` (your own site, for coverage and internal links), `active`
+- `sources`: `id`, `competitor_id`, `kind` (`website` · `rss` · `sitemap` · `page_watch` · `youtube` · `instagram` · `x` · `import`), `url_or_handle`, `settings` JSONB (include/exclude patterns, limits), `status` (`active` · `blocked` · `paused`), `etag`, `last_modified`, `last_checked_at`
+
+**1. Raw (as collected, append-only)**
+- `fetches`: every HTTP attempt — `url`, `status`, headers, `elapsed_ms`, `bytes`, `error`, `robots_decision`, `run_id`
+- `raw_documents`: `url`, `content_hash`, `body` (TOAST-compressed), `content_type`, `fetched_at`. Stored only when the hash is new. A retention policy is configurable. Access goes through a `RawStore` interface, so it can move to object storage later.
+
+**2. Normalized (facts extracted from sources)**
+- `content_items`: `competitor_id`, `canonical_url` (unique per competitor), `content_type` (`blog_post` · `landing_page` · `pricing` · `case_study` · `resource` · `product` · `changelog` · `press` · `docs` · `other`), `first_seen_at`, `last_seen_at`, `removed_at`, `published_at`, `current_version_id`
+- `content_versions`: `content_item_id`, `version_no`, `raw_document_id`, `title`, `description`, `author`, `published_at`, `modified_at`, `language`, `text_md`, `headings` JSONB, `categories[]`, `tags[]`, `page_meta` JSONB (OpenGraph/JSON-LD), `word_count`, `text_hash`, `extractor_version`
+- `change_events`: `content_item_id`, `from_version_id`, `to_version_id`, `change_type` (`new` · `updated` · `removed` · `pricing_changed`), `diff_stats` JSONB, `detected_at`. Detected deterministically.
+- `social_posts` / `social_post_metrics` (Phase 9): `platform`, `external_id` (unique per platform), `posted_at`, `post_type` (image, video, reel, carousel, text, short), `caption`, `hashtags[]`, `url`; metrics as a time series
+
+**3. Analysis (interpretations and derived metrics; each row has `run_id`, `method` = `llm`|`deterministic`, `model`, `prompt_version`)**
+- `content_analyses`: per version — summary, primary topic, format (how-to, listicle, case study, comparison, opinion, news…), funnel stage, target audience, keywords[], positioning claims[], entities
+- `topics` (canonical taxonomy; `merged_into_id` for human merges) and `content_topics` (version ↔ topic, confidence, is_primary)
+- `competitor_profiles`: versioned positioning, pricing and audience snapshots (adapted R1 schema), with evidence URLs
+- `change_summaries`: an LLM explanation and significance score for a `change_event` (e.g. pricing or messaging shifts)
+- `trend_snapshots`: topic × competitor × period — item count, share of voice, growth, competitor coverage (deterministic)
+
+**4. Recommendation (outputs and actions)**
+- `content_opportunities`: `topic_id`, `factors` JSONB, `weights_version`, `score`, `rationale`, `suggested_angle`, `evidence` (version IDs), `status` (`new` · `selected` · `dismissed` · `generated`)
+- `generated_articles`: `opportunity_id`, `status` (`drafting` · `needs_review` · `awaiting_approval` · `approved` · `rejected` · `scheduled` · `published` · `failed`), `title`, `slug` (unique), `meta_title`, `meta_description`, `keywords[]`, `category`, `tags[]`, `body_md`, `faq`, `internal_links`, `external_references`, `cta`, `featured_image_suggestion`, `quality_report`, `fact_check_report`, `originality`, `workflow_thread_id`, `approved_by`/`approved_at`
+- `publications`: `article_id`, `target`, `idempotency_key` (unique), `mode` (`draft` · `publish` · `schedule`), `status` (`in_progress` · `succeeded` · `failed` · `unknown`), `go_live_date` (local date used for the daily limit), `scheduled_for`, `remote_id`, `remote_url`, `attempts`, `last_error`
+
+**Ops**
+- `runs`: `kind`, `trigger` (`schedule` · `api` · `cli`), `status` (`running` · `succeeded` · `partial` · `failed`), params, stats, timings
+- `run_events`: per step or tool call — component, event, data (URLs, factor scores, gate results, token usage and cost), level. This is the audit trail.
+
+### 7.2 Storage decisions
+- **PostgreSQL only.** One database for relational data, raw documents, workflow checkpoints (LangGraph Postgres saver) and job locks (advisory locks). No Redis.
+- **pgvector is deferred.** The MVP doesn't need vector search:
+  - topics are canonicalized by the LLM against the existing taxonomy (cached prompt);
+  - originality uses n-gram shingling, which is better than embeddings for detecting copying;
+  - "RAG" for generation means SQL selection of topic-tagged competitor content, Postgres full-text search, and research documents placed directly in context.
+
+  We still run the `pgvector/pgvector:pg16` image, so adding it later is one migration plus an `Embedder` module, not an infrastructure change. Revisit at Phase 3/4 with real data. If embeddings are needed, Gemini's embedding models (e.g. `gemini-embedding-001`) keep this on the single provider.
+
+---
+
+## 8. Cross-cutting design
+
+### 8.1 Compliant crawling rules (Phase 1)
+- **Honest identity:** a configurable bot User-Agent with a contact URL. No browser spoofing, no proxy rotation, no stealth/headless evasion.
+- **robots.txt:** fetched and cached per host (24 h TTL). Disallow and `Crawl-delay` are honored. If robots.txt returns 4xx, crawling is allowed. If it returns 5xx or is unreachable, crawling is paused for that host (conservative).
+- **Politeness:**
+  - one in-flight request per host;
+  - a minimum delay per host (default 3 s, or the robots `Crawl-delay` if larger), plus a global concurrency cap;
+  - conditional GET (`If-None-Match` / `If-Modified-Since`).
+- **Retries:** only on 408/429/5xx/timeouts, honoring `Retry-After` (capped), with exponential backoff and jitter, at most 3 attempts. Other 4xx responses are never retried.
+- **Stop conditions:** a 401/403 or a detected CAPTCHA/challenge marks the source `blocked` and stops it. Nothing is ever bypassed.
+- **Safety limits:**
+  - maximum response size, and a content-type allowlist;
+  - limited, same-site redirects;
+  - SSRF guard (http/https only; private, loopback and link-local IPs blocked);
+  - XML parsed with `defusedxml`.
+- **Discovery order:**
+  1. RSS/Atom (configured, autodiscovered from `<link rel="alternate">`, or common paths)
+  2. sitemaps (from robots `Sitemap:` lines or common paths; indexes and `.gz` supported)
+  3. explicitly tracked pages (pricing, homepage, product pages)
+
+  Candidates are filtered by date and include/exclude patterns, with a cap per run.
+- **Extraction:** trafilatura (main text as Markdown, title, author, date, categories, tags), plus OpenGraph and JSON-LD (`datePublished`, `@type`). "Thin" pages (likely JS-rendered) are flagged. A headless-render adapter is added **only** if a real competitor needs one.
+- **Classification:** deterministic, from URL patterns, JSON-LD type and feed membership (Phase 1). LLM refinement of format and topics comes in Phase 3.
+- **Terms of Service:** reviewing each competitor site's ToS remains the operator's responsibility. This is documented in the README.
+
+### 8.2 LLM usage policy (interface in Phase 1; first calls in Phase 3)
+- **One provider: Google Gemini**, via the official **`google-genai`** SDK. No OpenAI, Anthropic or other provider is added unless you explicitly ask for one. LangChain chat wrappers are not used; LangGraph orchestrates plain Python functions that call our interface.
+- **Provider-agnostic interface.** Agents and services depend only on `app/llm` (`LLMProvider`, `LLMRequest`, `LLMResponse`, `StructuredResponse`, typed errors), obtained through `get_llm()`.
+  - `app/llm/gemini.py` is the **only** module that imports the Gemini SDK, and it is imported lazily, so Phase 1 code paths never load it.
+  - Adding another provider later means adding one module; callers don't change.
+- **API surface: the Gemini Interactions API** (`client.aio.interactions.create`). Google made it GA in June 2026 and recommends it for new projects; new models and tools launch there. `generateContent` is legacy (still supported) and is not used.
+- **Model:** `GEMINI_MODEL`, defaulting to `gemini-3.8-flash` (the latest stable model, and the one used in Google's quickstart). Every request can override the model, so later phases can send bulk work to a cheaper model such as `gemini-3.5-flash-lite` purely through configuration. Whether to do that is your decision, once quality is measured.
+- **Reasoning depth:** set per route via `reasoning_effort` → Gemini `thinking_level` (`minimal` · `low` · `medium` · `high`). Low for bulk classification; high for writing, fact-checking and judging.
+- **Structured outputs:** `response_format` with a JSON Schema generated from the Pydantic model, and the result validated with Pydantic. Responses are never parsed by stripping code fences.
+- **Stateless calls:** `store=false` on every request. We keep our own history in Postgres and don't rely on server-side conversation state.
+- **Retries and timeouts:**
+  - The SDK retries 429 and 5xx responses itself, honoring `Retry-After`. This is configured through `HttpRetryOptions` (`LLM_MAX_RETRIES`) and `HttpOptions.timeout` (`LLM_TIMEOUT_SECONDS`).
+  - There is no second retry layer.
+  - SDK errors are mapped to our typed errors (auth, rate limit, unavailable, invalid request, bad response).
+- **Research and grounding (Phase 5):** Gemini's **Google Search grounding** and **URL context** tools. Sources are persisted, and each drafted claim is tagged with a source ID so the fact-checker can verify it.
+- **Cost levers (Phase 3):** only new or changed versions are analyzed; token budgets apply per run; usage (input, output, thought and cached tokens) is logged to `run_events`. Cheaper service tiers or batch processing can be used for bulk analysis if the volume justifies it.
+- **Data terms:** use a billing-enabled (paid-tier) API key in production. At the time of writing, Google's terms allow content sent on the unpaid tier to be used to improve Google's products; check the current terms.
+- **Untrusted input:** competitor pages and search results are treated as data. They are delimited in prompts. Agents that read them have no side-effecting tools.
+
+### 8.3 Opportunity scoring (Phase 4)
+Factors, each 0–100 and stored per opportunity with its evidence:
+
+| Factor | Source | Direction |
+|---|---|---|
+| Competitor activity | Competitor items on the topic in the window (log-scaled, normalized) | + |
+| Growth | Recent window vs prior window (smoothed) | + |
+| Business relevance | LLM rubric judgment against `company_profile.yaml` (products, ICP, positioning), with rationale | + |
+| Audience relevance | LLM rubric judgment against the ICP | + |
+| Novelty | How recently the topic emerged across competitors | + |
+| Search opportunity | Optional keyword-data provider. If null, the factor is dropped and the weights renormalize. | + |
+| Existing company coverage | Your own published items on the topic (your site is crawled as `is_self`) | − |
+| Saturation | Share of competitors covering the topic × volume | − |
+
+`score = Σ wᵢ·f′ᵢ / Σ wᵢ`, where `f′ = f` for positive factors and `100 − f` for negative ones.
+- Weights live in versioned `config/scoring.yaml`, and every score records its `weights_version`.
+- Hard filters: excluded topics, and topics already generated or queued within N days.
+
+This design is what lets the system answer "why was this topic selected?"
+
+### 8.4 Blog generation workflow (Phase 5–6, LangGraph)
+```
+START → plan (topic analysis, search intent, angle vs competitor coverage)
+      → research (Gemini Google Search grounding / URL context + internal competitor corpus; sources persisted)
+      → outline (H1/H2/H3, FAQ candidates, internal-link targets from your site)
+      → draft (claims tagged with source IDs) → edit (voice/tone from company profile)
+      → fact_check (unsupported claims flagged)
+      → seo_package (title, slug, meta, keywords, headings check, FAQ, links, CTA, category/tags, image suggestion)
+      → quality_gate (deterministic checks + LLM judge + originality vs competitor corpus and your own site)
+          ├─ pass → persist → ApprovalPolicy
+          ├─ fixable & attempts < MAX_REVISIONS → revise → fact_check …
+          └─ otherwise → persist as needs_review
+```
+- The Postgres checkpointer lets a failed run resume from its last completed node.
+- Revision loops are bounded.
+- Originality is measured as n-gram containment against each related competitor article, with thresholds for overlap and the longest verbatim run.
+
+### 8.5 Human approval (the extension point)
+Generation ends at the quality gate. At that point `ApprovalService.submit(article)` asks one `ApprovalPolicy`:
+- `AUTO_PUBLISH=true` → `AutoApprovalPolicy`. Approves **only** if every hard check passed and the judge score clears its threshold. Otherwise the article goes to `needs_review`.
+- `AUTO_PUBLISH=false` → `ManualApprovalPolicy`. The article moves to `awaiting_approval`, and a human acts through `POST /articles/{id}/approve|reject` (later, the dashboard).
+
+Publishing only ever consumes `approved` articles, and re-checks that status itself. Approvals can take days, so they are a durable DB state transition, not a paused LangGraph thread. That keeps the approval logic out of the workflow.
+
+### 8.6 Publishing, idempotency and the daily limit (Phase 7–8)
+- **`CMSPublisher` protocol:** `find_by_slug`, `create`, `update`, `get`, `ensure_terms`, `healthcheck`.
+  - `WordPressPublisher` is the first implementation.
+  - `PublishingService` is the only caller. It is CMS-agnostic, so adding a CMS means adding an implementation.
+- **WordPress specifics:**
+  - Application Password over HTTPS, for a dedicated least-privilege user.
+  - Markdown → HTML via markdown-it-py, then **sanitized with `nh3`**, so injected web content can't become stored XSS on your site.
+  - Status mapping: `draft`, `publish`, or `future` + `date_gmt` for scheduled posts.
+  - Categories and tags are fetched or created.
+  - The slug is pre-checked.
+  - SEO meta goes through a configurable adapter (`none` / Yoast / Rank Math). This needs a tiny mu-plugin that exposes those meta keys to REST; it ships in `deploy/wordpress/`.
+- **Idempotency:**
+  1. A `publications` row is written first, with a unique `idempotency_key`, status `in_progress`.
+  2. The CMS call is made.
+  3. Outcomes:
+     - success → `succeeded`;
+     - definite 4xx → `failed`;
+     - **ambiguous** (timeout or connection loss after sending) → `unknown`.
+
+  A POST is **never retried blindly**. An `unknown` row is reconciled by looking the post up by slug, and by our article ID stored in post meta when the mu-plugin is installed. Only GETs and updates to a known post ID are retried automatically.
+- **Daily limit (`MAX_BLOGS_PER_DAY`), enforced inside `PublishingService`:**
+  - A single transaction takes `pg_advisory_xact_lock(target, go_live_date)`.
+  - It counts that day's `publish`/`schedule` publications with status `in_progress|succeeded|unknown`, then refuses with `DailyLimitReached` once the count reaches the cap.
+  - Drafts don't count. Scheduled posts count toward the day they go live, in `PUBLISH_TIMEZONE`.
+  - A concurrency test proves that exactly N publications succeed.
+  - Approved articles that exceed the cap stay queued for the next day's capacity.
+
+### 8.7 Scheduling (Phase 8)
+- A separate `python -m app worker` process runs APScheduler 3 with cron triggers, all from env. The API process never runs jobs, so multiple uvicorn workers can't duplicate them.
+- Every job takes a Postgres advisory lock: if the lock is already held, the run is skipped. Every run is recorded in `runs`.
+- Any job can also be run manually via the CLI or API.
+```
+SCHEDULE_TIMEZONE=UTC
+SCHEDULE_SCAN_CRON="0 */6 * * *"          # check competitors
+SCHEDULE_ANALYZE_CRON="30 */6 * * *"      # analyze new/changed content (batch)
+SCHEDULE_TRENDS_CRON="0 2 * * *"          # trends
+SCHEDULE_OPPORTUNITIES_CRON="0 6 * * *"   # morning opportunities
+SCHEDULE_GENERATE_CRON="0 7 * * *"        # generate BLOGS_TO_GENERATE_PER_DAY
+SCHEDULE_PUBLISH_CRON="0 * * * *"         # drain approved queue within the daily limit
+BLOGS_TO_GENERATE_PER_DAY=2
+MAX_BLOGS_PER_DAY=2
+PUBLISH_TIMEZONE=UTC
+AUTO_PUBLISH=false
+```
+An empty cron value disables that job.
+
+### 8.8 Observability
+- `runs` and `run_events`, always on and queryable through the API, record:
+  - which agent or step ran, and which tools it called (with arguments summarized);
+  - which competitor and URLs were involved;
+  - the topic factor scores and rationale;
+  - gate results and publication outcomes;
+  - LLM tokens and cost.
+- structlog JSON logs carry bound context (`run_id`, `job`, `competitor`, `source`, `article_id`), and secrets are redacted.
+- **LangSmith is optional.** If `LANGSMITH_TRACING=true` and a key is set, calls through the `app/llm` interface and LangGraph runs are traced. Otherwise it's a no-op, and the app runs fully without it.
+
+### 8.9 Error handling
+- Error taxonomy: `TransientError` (timeouts, 429, 5xx, connection), `PermanentError` (4xx, validation, robots-disallowed, blocked) and `AmbiguousOutcomeError` (a non-idempotent write with an unknown result).
+- Retries (bounded, `Retry-After`-aware) apply **only** to idempotent operations. The crawler uses an explicit retry loop; LLM calls use the Gemini SDK's built-in retries. Structured output is validated, with one repair attempt (Phase 3); after that the item fails. There is never a placeholder.
+- Per-item isolation: one failing competitor, source or page marks the run `partial` instead of aborting it.
+- Duplicates are prevented by unique constraints (competitor + canonical URL, version hash, article slug, publication idempotency key) and by deduplicating opportunities against coverage and the queue.
+- After repeated 403s or challenge pages, a host is marked `blocked` until someone resets it manually.
+
+### 8.10 Security
+- Secrets come only from the environment (`SecretStr`). `.env.example` is committed; `.env` is gitignored. Nothing secret appears in code or logs.
+- An `X-API-Key` header is required on `/api/v1/*`, which covers approve and publish.
+- Security controls referenced elsewhere in this plan: SSRF guard (§8.1); sanitized CMS HTML (§8.6); untrusted content kept away from side-effecting tools (§8.2); HTTPS-only WordPress with a least-privilege account (§8.6).
+- `uv.lock` is committed.
+
+### 8.11 Social monitoring feasibility (Phase 9, official/permitted routes only)
+
+| Platform | Route | Feasible? |
+|---|---|---|
+| YouTube | YouTube Data API v3 (API key, daily quota) + public channel RSS | ✅ Videos/Shorts, titles, descriptions, tags, publish time, view/like/comment counts |
+| Instagram | Graph API **Business Discovery**. Requires your own IG Business/Creator account linked to a Facebook Page, plus a Meta app. | ✅ For competitor Business/Creator accounts: captions, media type, timestamps, like/comment counts, permalinks |
+| X / Twitter | Official X API, paid access tier | ⚠️ Works; the cost depends on current X pricing |
+| LinkedIn | Official APIs only expose pages you administer; scraping violates LinkedIn's terms | ❌ Via API. Use manual/CSV import, or a licensed data provider after vendor and legal due diligence. |
+| TikTok | Research API is restricted to approved researchers | ❌ For a commercial MVP |
+| Podcasts, newsletters, changelogs, press pages | RSS / sitemaps (reuses the website pipeline) | ✅ |
+
+---
+
+## 9. Dependencies
+
+### 9.1 Final set (versions current on PyPI as of 2026-09-13; exact pins go in `uv.lock`)
+
+| Package | Version | License | Phase | Purpose |
+|---|---|---|---|---|
+| fastapi / uvicorn[standard] | 0.141 / 0.52 | MIT / BSD-3 | 1 | API server |
+| pydantic / pydantic-settings | 2.13 / 2.15 | MIT | 1 | Validation, settings |
+| httpx | 0.28 | BSD-3 | 1 | Async HTTP (crawler, WordPress, social APIs) |
+| trafilatura | 2.2 | Apache-2.0 | 1 | Main-content and metadata extraction |
+| protego | 0.6 | BSD-3 | 1 | robots.txt (wildcards, crawl-delay) |
+| feedparser | 6.0 | BSD-2 | 1 | RSS/Atom |
+| defusedxml | 0.7 | PSF | 1 | Safe sitemap XML parsing |
+| pyyaml | 6.0 | MIT | 1 | Competitor / company / scoring config |
+| structlog | 26.1 | MIT/Apache | 1 | Structured logs |
+| typer | 0.27 | MIT | 1 | CLI |
+| sqlalchemy / alembic | 2.0 / 1.20 | MIT | 2 | ORM, migrations |
+| psycopg[binary,pool] | 3.3 | LGPL-3.0 | 2 | Postgres driver, sync and async; shared with the LangGraph checkpointer |
+| google-genai | 2.23 | Apache-2.0 | 1 (interface only; first calls in Phase 3) | The single LLM provider: the official Gemini SDK, Interactions API |
+| langgraph / langgraph-checkpoint-postgres | 1.2 / 3.1 | MIT | 5 | Content workflow + resumable checkpoints |
+| langsmith *(optional extra)* | latest | MIT | 5 | Tracing when enabled |
+| markdown-it-py / nh3 | 4.2 / 0.3 | MIT | 7 | Markdown → HTML, sanitization |
+| apscheduler | 3.11 | MIT | 8 | Cron scheduling in the worker process |
+| **dev:** pytest, pytest-asyncio, respx, ruff, mypy | 9.1, 1.4, 0.23, 0.16, 2.3 | MIT/Apache/BSD | 1 | Tests, HTTP mocking, lint, types |
+
+**Conditional (added only on a demonstrated need):** `pgvector` + an embedding model; a headless renderer for JS-only competitor sites. Social APIs are called over `httpx`, so no platform SDKs are needed.
+
+### 9.2 Dropped from the source repos
+`upsonic`, `firecrawl-py` (R1) · `chromadb`, `openai`, `langchain-openai`, `langchain-community`, `langchain-anthropic`, `tavily-python`, `tiktoken`, `tokenizers`, `requests`, `markdown`, `ipykernel`, `apple-certifi`, `python-dotenv` (R2) · `langchain_groq`, `langchain_tavily`, `flask`, `flask-sock`, `gunicorn`, `xhtml2pdf`, `websockets`, `jinja2`* (R3).
+\* Jinja2 may return in Phase 10 if the dashboard is server-rendered.
+
+### 9.3 Conflicts and resolutions
+
+| Conflict | Resolution |
+|---|---|
+| Three agent stacks (Upsonic; LangGraph + LangChain wrappers ×2) | LangGraph for the one workflow that needs it; every model call goes through `app/llm` → Gemini |
+| Four LLM providers (Anthropic, OpenAI, Groq, Upsonic multi-provider) | Google Gemini only (`google-genai`); the legacy `google-generativeai` package is not used (PyPI marks it Inactive) |
+| Two web frameworks (Flask in R3's code, FastAPI in R3's README) | FastAPI |
+| Two storage engines (SQLite, ChromaDB) plus files on disk | PostgreSQL only |
+| Three research/scrape vendors (Firecrawl; Tavily via two different packages) | Our own compliant crawler for monitoring; Gemini Google Search grounding for research |
+| Sync `requests` vs async code | httpx everywhere |
+| Python ≥ 3.13 (R2) vs 3.10 (R3) | 3.12 baseline; every chosen dependency supports 3.12–3.13 |
+| R2 pin drift and undeclared direct deps; R3 unpinned | A single `pyproject.toml` + committed `uv.lock`; no source-repo lockfiles reused |
+
+---
+
+## 10. Change summary
+
+### 10.1 Architecture changes
+- **Before:** a one-shot script (R1); CLI-driven file pipelines (R2); a Flask app running agents inside a request handler (R3).
+- **After:** a layered service (API / CLI / worker → services → agents & integrations → data). Long-running work happens in the worker process, and every run is recorded and auditable.
+
+### 10.2 Database changes
+- **Before:** R1 wrote a JSON file; R2 used ChromaDB plus Markdown files; R3 used a SQLite `reports` table (the committed DB is empty).
+- **After:** the PostgreSQL schema in §7, managed with Alembic. There is no data to migrate.
+
+### 10.3 API changes
+R3's Flask routes (`/`, `/product`, `/ws/research`, `/api/reports*`, `/download-pdf`) are removed. New REST API under `/api/v1` (API-key protected):
+
+| Phase | Endpoints |
+|---|---|
+| 1 | `GET /health` · `GET /api/v1/competitors` · `POST /api/v1/competitors/{slug}/scan` |
+| 2 | competitors & sources CRUD · `POST /scans` → `run_id` · `GET /runs/{id}` (+ events) · `GET /content?competitor=&type=&since=` · `GET /content/{id}/versions` · `GET /changes?since=` |
+| 3 | `GET /content/{id}/analysis` · `GET /topics` · `GET /trends` · `GET /competitors/{id}/profile` |
+| 4 | `POST /opportunities/refresh` · `GET /opportunities` · `PATCH /opportunities/{id}` |
+| 5–6 | `POST /articles` (from an opportunity) · `GET /articles` · `GET /articles/{id}` |
+| 7 | `POST /articles/{id}/approve` · `POST /articles/{id}/reject` · `POST /articles/{id}/publish` · `GET /publications` |
+| 8 | `GET /schedule` · `GET /limits` |
+| 9 | `/social/accounts` · `/social/posts` |
+
+### 10.4 Agent changes
+| Source agent | Becomes |
+|---|---|
+| R1 research agent (Upsonic + Firecrawl tools) | The deterministic crawler (Phase 1–2), plus structured profile extraction (Phase 3) |
+| R1 analysis agent | Grounded synthesis from structured, evidence-linked profiles (Phase 3) |
+| R3 ResearcherAgent (competitor discovery) | Dropped (backlog: "suggest competitors") |
+| R3 ReporterAgent | Structured change summaries and digests (Phase 3) |
+| R2 planner / research / outline / writer / editor / SEO (ideas only) | Independently implemented LangGraph nodes, with fact-check, originality and quality-gate nodes added (Phase 5–6) |
+| R2 approval service | `ApprovalPolicy` on final articles (Phase 7) |
+
+---
+
+## 11. Testing strategy
+- **Unit tests** (no network, no DB) cover the pure logic:
+  - robots rules and crawl-delay (fake clock), fetcher retry/Retry-After/size limits/SSRF guard;
+  - sitemap indexes, `.gz` and XXE payloads; RSS and Atom parsing and autodiscovery;
+  - extraction on fixture HTML; classification tables; change detection;
+  - scoring math; daily-limit logic; approval policies; SEO validators; HTML sanitization; publisher request building.
+- **HTTP contract tests** (`respx`):
+  - WordPress create, update, taxonomy and scheduling;
+  - **timeout-after-create → no second POST, reconciliation by slug**.
+- **Integration tests** (real Postgres via `docker compose`, which tests skip if it's unavailable):
+  - migrations up/down, repositories, idempotent upserts;
+  - the **concurrent daily-limit test** (N+1 parallel publishes → exactly N succeed);
+  - advisory-lock job overlap.
+- **LLM code** runs behind the `app/llm` interface.
+  - Unit tests mock the Gemini API at the HTTP level with `respx`, so the real SDK's request building and error mapping are exercised without any network call or API key. An autouse guard blocks real sockets.
+  - A small opt-in eval set (`pytest -m llm_eval`, which costs money) guards prompt changes from Phase 3.
+- **Phase 1 isolation:** a test asserts that the crawler, the monitoring service, the API and the CLI run with `GEMINI_API_KEY` empty and never import the Gemini SDK.
+- **Workflow tests** run the LangGraph graph with fake nodes: routing, the bounded revision loop, failure and resume.
+- **API tests** use an httpx `AsyncClient` against the app factory.
+- **Live smoke tests** (`pytest -m live`, opt-in) run against real, robots-permitting sites.
+- **CI:** a GitHub Actions workflow (ruff + mypy + pytest) on every push. Your remote is GitHub.
+
+---
+
+## 12. Phased delivery plan
+
+At every phase: run the tests → run the app → verify against real inputs → fix → update docs → commit, then wait for your approval before starting the next phase.
+
+### Phase 1 — Competitor website monitoring (no DB, no LLM)
+**Scope**
+- Project skeleton: uv/pyproject, ruff, mypy, pytest, CI, `.env.example`, `.gitignore`, README, `THIRD_PARTY_NOTICES.md`.
+- `app/config.py` settings, and competitors loaded from a validated `config/competitors.yaml`.
+- `app/crawling/`: polite fetcher, robots, per-host rate limiting, sitemap and feed discovery, extraction, page classification.
+- `app/services/monitoring.py`: `scan_competitor(slug, since, limit) → ScanResult`. The result includes items with URL, type, title, date, author, categories, tags, word count and discovery source, plus the pages robots skipped and any errors.
+- CLI: `python -m app scan <slug> --since 7d --limit 20`.
+- API: `GET /health`, `GET /api/v1/competitors`, `POST /api/v1/competitors/{slug}/scan`.
+- **LLM groundwork, with no calls:** the `app/llm` interface (`LLMProvider`, request and response types, typed errors), a lazily imported `GeminiProvider` on the Interactions API, the `get_llm()` factory, and the `GEMINI_API_KEY` / `GEMINI_MODEL` settings. Crawling, sitemaps, RSS, robots, extraction, URL normalization and classification stay deterministic and never touch this module.
+
+**Acceptance criteria**
+- `pytest` is green with no network, covering: robots disallow and crawl-delay, 429 + `Retry-After`, sitemap index and `.gz`, RSS/Atom, extraction fixtures, classification, and the SSRF guard.
+- A real scan of your competitors lists their recent posts, pricing and landing pages.
+- The API returns the same result as the CLI.
+- The logs show robots decisions and per-host pacing.
+- Everything above works with `GEMINI_API_KEY` empty. The Gemini provider's unit tests pass with a mocked API.
+
+### Phase 2 — Persist competitor content
+- Postgres via docker compose; SQLAlchemy models for the config, raw, normalized and ops layers; Alembic.
+- Competitors are seeded from YAML.
+- Versioning with text hashes, and change events (`new` / `updated` / `removed` / `pricing_changed`).
+- Run history, and the query API ("what did X publish this week?").
+
+**Implemented (2026-09-13). What was built, and where it differs from §7:**
+- **Stack.**
+  - PostgreSQL 16, SQLAlchemy 2 (async) with psycopg 3, and Alembic.
+  - A single migration, `0001`, that is verified against the models and reversible (both are tested).
+  - `docker-compose.yml` runs the `pgvector/pgvector:pg16` image bound to `127.0.0.1:5433` with passwordless local access, so there are no credentials in the repo.
+- **Tables.**
+  - `competitors`, `runs`, `run_events`, `raw_documents`, `content_items`, `content_versions`, `change_events`.
+  - Status and type values are guarded by CHECK constraints rather than Postgres ENUM types, so adding a value later is a simple migration.
+- **Deferred from §7:**
+  - A `sources` table: competitor options are stored as validated JSON on `competitors`. Revisit in Phase 9, when social accounts need per-source state.
+  - A per-attempt `fetches` table: skipped URLs and errors go to `run_events`, and raw HTML is stored per captured version. Neither table had a consumer yet.
+- **Incremental scans.**
+  - Every in-scope discovered URL is persisted.
+  - A captured page is re-fetched only when a feed or sitemap date is newer than the last fetch, via conditional GET, or from a small revisit budget of stale pages.
+  - New content keeps first priority.
+- **Change semantics.**
+  - Change types are `new`, `updated` (with an `is_minor` flag from a word-level diff), `pricing_changed`, `removed` (only on 404/410, never on absence from a sitemap) and `restored`.
+  - Redirect and canonical aliases get status `duplicate`.
+  - A competitor's first scan is a **baseline**: it is recorded without `new` events.
+- **Date rule** (unchanged from Phase 1 and enforced in storage).
+  - `published_at` comes only from reliable sources and records its source. A less trusted source never overwrites a more trusted one.
+  - `first_seen_at` and `sitemap_lastmod` are never used as publication dates.
+- **Concurrency.**
+  - One scan per competitor, enforced by a Postgres advisory lock.
+  - A run abandoned by a crashed process is detected (its lock is free) and marked failed.
+  - No database transaction is held open during the crawl.
+- **API change.** `POST /api/v1/competitors/{slug}/scan` (Phase 1) became `POST /api/v1/competitors/{slug}/scans`: a background run with a pollable run ID, or `?wait=true` to run synchronously.
+
+### Phase 3 — Competitor analysis
+- First Gemini calls through `app/llm`: structured outputs, per-route model and reasoning effort, usage tracking, and cost controls.
+- Per-item content analysis (topics, format, audience, keywords).
+- Topic taxonomy.
+- Versioned competitor profiles (R1 schema) and summaries of pricing/messaging changes.
+- Deterministic trend snapshots (frequency, topic growth, formats, strategy shift).
+
+**Implemented (2026-09-13). What was built, and where it differs from §7:**
+- **Pipeline** (`app/services/analysis.py`), one run per competitor, advisory-locked:
+  1. select pages whose current version lacks an analysis for the current prompt version (prioritized: homepage, pricing, product/landing, then editorial newest first; capped per run);
+  2. reuse the analysis for minor edits (the Phase 2 word-diff rule), with no call;
+  3. build deterministic digests: page facts plus text condensed extractively to a budget;
+  4. batch by count and size, then make one Gemini structured-output call per batch;
+  5. validate, normalize topics, and persist each batch in its own transaction;
+  6. summarize significant changes, and refresh the profile if its evidence changed.
+
+  Failures split batches, retry missing pages once, and leave the rest pending. Outages and budget stops keep what was saved.
+- **Gemini usage.**
+  - Only `app/llm/gemini.py` imports the SDK.
+  - Nested Pydantic schemas are inlined (`$ref`/`$defs` removed), and constraints are emitted as standard `minimum`/`maximum`.
+  - Output types are lenient: odd values are normalized rather than failing a batch.
+  - `LLMResponseError` carries billed usage.
+  - Per-route models and reasoning: analysis `low`, synthesis `medium`.
+  - Budgets are checked before every call: per run and per UTC day.
+- **Tables (migration `0002`).**
+  - Analysis layer: `topics`, `topic_aliases`, `content_analyses`, `content_analysis_topics`, `change_summaries`, `competitor_profiles`, `landscape_reports`.
+  - Ops layer: `llm_calls`.
+- **Differences from §7:**
+  - Usage is recorded in a dedicated `llm_calls` ledger, not `run_events`: the daily budget needs efficient sums.
+  - `content_topics` is named `content_analysis_topics` and links to the analysis, which records its content version, prompt version and model.
+  - The taxonomy has two levels (topics → subtopics). Every spelling becomes a scoped alias, so resolution is deterministic. Merges re-point links and aliases and keep the source as `merged`.
+  - **`trend_snapshots` is not a table.** Metrics are computed on request from the latest analyses, which is always consistent. Each landscape report stores the exact metrics snapshot its narrative was grounded on. Phase 4 can persist snapshots if scoring needs them.
+  - Profiles store the validated `CompetitorProfile` (adapted R1 schema) as JSON. Every statement cites evidence (the competitor's own pages or summarized changes), and uncited statements are dropped. Content-strategy facts are deterministic.
+  - Change summaries are keyed on the version transition (`to_version_id`), so an `updated` event and a `pricing_changed` event for the same edit share one summary.
+  - pgvector is still not needed: normalization is key + alias + taxonomy-in-prompt + reviewed merges.
+- **Date rule.** Trends compare windows on reliable publication dates only. Competitors whose captured, dated history doesn't reach the previous window are reported as `insufficient_history` rather than rising: scans capture newest first.
+- **Run bookkeeping fix (also applies to scans).** A queued run less than 5 minutes old is treated as starting, not abandoned. Before, a second request could fail a queued run whose task hadn't yet taken its lock.
+- **Live verification with Gemini** (PostHog and Plausible, 43 pages, `gemini-3.8-flash`, ~214k tokens total, 0 failed calls). It led to prompt version 2 of all five prompts:
+  - Profiles and landscape briefings filled only their first few fields when fields were optional in the schema. Every property is now marked required in the schema sent to Gemini (validation stays lenient), and the prompts say to fill every field the evidence supports. Afterwards all profile fields were filled with cited evidence (0 dropped), and every landscape section was present (0 dropped findings).
+  - One batch returned 1 of 6 documents (recovered by the retry). The prompt now lists the expected document ids; on the re-run every batch returned every document.
+  - Taxonomy reuse held: the re-run created 1 new topic across 43 pages. Consolidation proposed exactly the two true duplicates ("Data warehousing" → "Data warehouse", "Software development" → "Software engineering").
+  - Dry-run token estimates were within about 5% of actual usage.
+- **Scope kept out:** opportunity scoring and recommendations (Phase 4); any generation or publishing.
+
+### Phase 4 — Opportunity detection
+- Company profile; your own site crawled as `is_self`.
+- Computation of each factor; configurable weights; LLM relevance judgment and angle.
+- Ranked, explainable opportunities.
+
+**Implemented (2026-09-14). What was built, and where it differs from §7 and §8.3:**
+- **Pipeline** (`app/services/opportunities.py`), one run at a time (advisory lock `72_004`), recorded as a `runs` row of kind `opportunities`:
+  1. load the latest analysis per page, the taxonomy with aliases, competitor profiles, the latest company profile version and the scoring config;
+  2. `OpportunitySignalEngine` (`app/services/opportunity_signals.py`, no LLM) scores one candidate per canonical top-level topic, plus core company topics no competitor covers;
+  3. qualify, deduplicate (near-duplicate topics via shared word stems) and cap;
+  4. persist in one transaction: one opportunity per topic, a new immutable assessment only when the score or its basis changed, evidence rows, events, expiry and reopening;
+  5. Gemini interprets the top candidates (angle, why now, format, audience, differentiation, rationale). Interpretations are reused while what the model sees is unchanged, and numbers are checked against the evidence.
+
+  The API starts runs in the background (`202` plus a run to poll, or `?wait=true`); the CLI runs them synchronously. A run is `partial` when interpretation stopped or failed. Scores are always saved.
+- **Scoring** (differs from §8.3):
+  - **Dimensions.** Five positive dimensions (momentum, strategic fit, audience fit, content gap, recency) are each 0–1 times a weight, rescaled to total 100. Saturation is subtracted as a penalty. The breakdown always adds up to the 0–100 score.
+  - **Weights and thresholds** live in the optional `config/scoring.yaml`. Every assessment stores the config's fingerprint instead of a `weights_version`.
+  - **Relevance is deterministic, not an LLM rubric.** Stem matching against the company profile's core, adjacent and excluded topics, subtopics, description and products, plus competitor-page keyword support. So the score never depends on model output, and the same inputs always give the same score. Gemini's role moved to interpretation.
+  - **"Novelty" and "competitor activity"** are expressed as momentum (smoothed window-over-window growth plus the share of competitors growing) and recency (half-life decay).
+  - **Seven gap types are stored separately:** topic, audience, intent, format, depth, freshness and differentiation. Low coverage alone doesn't qualify a topic: a minimum strategic fit and a minimum page count apply.
+  - **Saturation** combines volume, breadth, frequency and format variety, relieved when the existing coverage is stale, shallow, fragmented, or misses your audience or valuable intents.
+  - **Not implemented:**
+    - "Search opportunity": no keyword-data provider is configured.
+    - "Existing company coverage": the `is_self` crawl isn't built. An opportunity you already covered can be marked `used` or `rejected`. Planned for later together with internal links.
+- **Company profile.**
+  - `config/company.yaml` (gitignored; the example holds only placeholders) is imported with `company import` or `PUT /api/v1/company-profile`.
+  - It is stored as versioned rows in `company_profiles`. A version is created only when the profile changes, and every assessment references the version it was scored with. No industry is hardcoded.
+- **Tables (migration `0003`).**
+  - `company_profiles`, `opportunities`, `opportunity_assessments`, `opportunity_evidence` and `opportunity_events`.
+  - The `llm_calls` purpose check gained `opportunity_interpretation`.
+- **Differences from §7.1 `content_opportunities`:**
+  - It is split into an opportunity (identity, status, current score), immutable assessments (score history with change explanations), evidence rows (per assessment: metrics, trend, competitor pages with analysis and version ids, competitor profiles, gaps, company profile, related topics) and an event timeline.
+  - Statuses are `new` · `reviewed` · `approved` · `rejected` · `used` · `expired` (planned: `new` · `selected` · `dismissed` · `generated`), with validated transitions.
+  - Expiry is automatic for open opportunities that no longer qualify. They reopen if they qualify again.
+- **Idempotency.**
+  - Opportunities are keyed by canonical topic.
+  - A re-run with unchanged inputs writes no assessment and makes no Gemini call.
+  - The assessment basis is the scoring fingerprint, the company profile fingerprint, the window and the analysis ids.
+  - A new assessment explains its change per dimension (with the driving signals) and per basis change (profile, config, window, pages added or dropped).
+- **Gemini** (`app/prompts/opportunity.py`, `opportunity/1`, synthesis route).
+  - **What is sent.** Only the top `interpretation.candidates` above `interpretation.min_score`, in batches. Each prompt carries the evidence: the breakdown, signals, gaps, the deterministic suggestion and the cited competitor pages.
+  - **What is kept.**
+    - Sentences with numbers that aren't in the evidence are removed, and a title with an invented statistic falls back to the topic name.
+    - Cited ids are mapped to evidence rows; unknown ids are dropped.
+  - **Failure handling.** Unusable output is retried in halves. Outages, missing keys and budget stops mark interpretations `skipped` and never touch scores.
+- **API change.** Instead of `POST /opportunities/refresh` (§10.3), the API has:
+  - `POST /opportunities/generate`;
+  - `GET /opportunities`, `GET /opportunities/{id}`, `…/evidence`, `…/history`;
+  - `PATCH /opportunities/{id}` (status);
+  - `GET`/`PUT /company-profile` and `GET /company-profile/versions`.
+- **Live verification with Gemini.** PostHog and Plausible analyses (43 pages) scored against a hypothetical demo profile, not committed.
+  - **Result.** 24 candidates gave 5 opportunities (rejected: 2 excluded, 15 low strategic fit, 2 too few pages).
+  - **Cost.** 1 Gemini call of about 7.5–8k tokens per run, and 0 fabricated numbers removed.
+  - **Idempotency held.** A re-run with nothing new made 0 assessments and 0 calls.
+  - **Fixes it prompted:**
+    - Every suggestion was "tutorial". The suggestion now names the valuable or preferred format competitors use least, which diversified the formats.
+    - A forced re-score read "no material change". Change reasons now include basis changes and "recalculated on request".
+  - **Fixes from review:**
+    - Titles weren't number-checked. A title may now quote only evidence numbers, a small list count or a year.
+    - A profile change to non-scoring fields left the old version on the assessment. Every version now gets an assessment, and Gemini is called again only if the text it sees changed.
+- **Scope kept out:** blog writing, SEO, CMS/WordPress, publishing, social publishing, content calendars and social monitoring (Phases 5–10).
+
+### Phase 5 — Blog generation
+- The LangGraph workflow (plan → research → outline → draft → edit) with the Postgres checkpointer.
+- Research sources persisted; claims tagged with source IDs (Gemini grounding metadata for web sources).
+
+**Implemented (2026-09-14). What was built, and where it differs from §7.1 and §8.4:**
+- **Pipeline** (`app/services/articles.py`, one run per article at a time, advisory lock `72_005` per article, recorded in `runs` with kind `article` and a new `runs.article_id`):
+  1. **brief** (`article_brief.py`): deterministic, built when the article is created, and previewable (`articles brief`, `GET /opportunities/{id}/brief`). No Gemini;
+  2. **research** (`research.py`): discover → screen → read, described below;
+  3. **outline**, **draft** and **edit** (`article_writing.py`): one structured Gemini call each, with no tools, then deterministic post-checks (`article_content.py`);
+  4. the completion gate: deterministic baseline checks, then `completed`.
+
+  The API runs generation in the background (`202` plus the article; `?wait=true` to run synchronously); the CLI runs it synchronously. Only `approved` opportunities are written, and a run stops if its opportunity stops being approved.
+- **LangGraph, evaluated and not adopted.** The pipeline is linear with no branching or loops in Phase 5. A table of step executions (`article_steps`) with input fingerprints provides the same checkpoint/resume semantics and idempotency as the LangGraph Postgres checkpointer. It needs no new dependency or extra checkpoint tables, and it's queryable (`GET /articles/{id}/steps`). Revisit if Phase 6's bounded revision loop needs graph routing.
+- **Research, which differs from the plan's "grounding metadata" approach.** Live probes of the Interactions API (google-genai 2.23) showed three things:
+  - Search results carry no URLs, only a search-suggestions widget.
+  - Text answers cite only `vertexaisearch.cloud.google.com` redirect links, titled with a bare domain.
+  - Structured output with search carries no citation annotations at all.
+
+  So model-written URLs can't be trusted, and search metadata can't verify them. Instead:
+  1. **discover** (Google Search grounding, structured): research questions and candidate URLs; the queries actually run are recorded from the tool steps;
+  2. **screen** (deterministic): public http(s) URLs only, via the Phase 1 SSRF guard with DNS resolution; no credentials or odd ports; deduplicated; typed (your site and competitors' by domain); most authoritative first; capped;
+  3. **read** (URL context, structured): Gemini retrieves the pages. The tool reports a status per URL, redirects are matched to their requests, and only retrieved pages with facts become sources. A made-up URL therefore never reaches the article. This process fetches no page itself.
+
+  Limits: questions, sources, URL-context calls, research tokens and a minimum number of sources (`ARTICLE_RESEARCH_*`).
+- **Tables (migration `0004`).**
+  - **`articles`**: links to the opportunity, assessment and company profile version (all `RESTRICT`); status and current step; the brief; pointers to the current research step and outline/draft/final versions; slug (unique); tokens used; failure details.
+  - **`article_steps`**: the checkpoint log (fingerprint, prompt version, model, output and its hash, calls, tokens, status, error).
+  - **`article_versions`**: immutable outline, draft and final versions, with issues and editor notes.
+  - **`article_sources`**: retrieved pages with facts, excerpts, type, attribution flag and retrieval metadata.
+  - **`article_citations`**: claim → source per version, with foreign keys.
+  - A partial unique index allows one live (in progress or completed) article per opportunity. The `llm_calls` purposes gained `article_research`, `article_outline`, `article_draft` and `article_edit`.
+- **Differences from §7.1 `generated_articles`.**
+  - Split into the tables above. Statuses are `queued` · `researching` · `outlining` · `drafting` · `editing` · `completed` · `failed` · `cancelled`.
+  - The review, approval, scheduling and publication states (`needs_review`, `awaiting_approval`, `scheduled`, `published`) and SEO fields (meta, keywords, FAQ, internal links, image suggestion) belong to Phases 6–7 and aren't created.
+  - The opportunity's status is left `approved`; Phase 7 marks it `used` when the article is published.
+- **Idempotency and prompt versions.**
+  - Each step's fingerprint covers its upstream outputs, its prompt version, the model and the relevant settings. A run reuses any succeeded execution with the same fingerprint.
+  - So a resume continues from the first missing or outdated step, and a finished article is never regenerated by mistake.
+  - A new editorial prompt re-runs only the edit. A new outline prompt re-runs the outline, and then the draft and edit only if the outline changed.
+  - A crashed run is detected by its free lock and marked interrupted.
+- **Token budget.** `ARTICLE_MAX_TOKENS` per article, across runs, is enforced by `BudgetedLLM` (which gained a `token_limit`) before every call. Research has its own cap. When the budget runs out, the step fails safely and finished steps are kept; resuming needs a higher budget.
+- **Content.** Structured JSON (sections → paragraphs, lists, subheadings) with inline `[S#]` citation labels:
+  - labels without a stored source are removed and recorded;
+  - sentences with numbers not in the research or the brief are flagged;
+  - the editor's removed, qualified and flagged claims are stored as issues.
+- **Live verification.**
+  - **Opt-in test** (`pytest -m llm_live tests/live/test_live_article.py`): completed in 89 s and 40k tokens, with 2 sources and 34 citations.
+  - **Real run** (dev database, "Data privacy" opportunity from the PostHog/Plausible analyses, default settings): completed in 6 calls and 46.7k tokens. It ran 6 Google queries, retrieved 4 authoritative candidates (EDPB, CNIL, European Parliament, arXiv), kept 3 with facts, and wrote a 1,877-word comparison with 28 citations. The editor qualified an invented "40–60%" range and an unsupported technical claim, and fixed a mis-cited source.
+  - **Idempotency held:** repeating the run made no call.
+- **Scope kept out:** SEO optimization, fact-checking, originality and quality scoring (Phase 6); CMS publishing, scheduling and social posting (Phases 7–9).
+
+### Phase 6 — SEO and quality checks
+- SEO packaging (all the blog output fields you listed), fact-check, originality, LLM judge, the bounded revision loop, and the quality report.
+
+**Implemented (2026-09-14). What was built, and where it differs from §7.1 and §8.4:**
+- **Pipeline** (`app/services/quality.py`), on Phase 5's job system: the same per-article advisory lock (one run per article, generation and validation alike), `runs` with kind `article_quality`, and `article_steps` checkpoints (which gained `version_id`).
+  - Per version, six checkpointed steps: **fact_check** → **originality** → **seo** → **metrics** → **judge** → **decision**.
+  - Then the loop: while the best version fails a gate and fewer than `QUALITY_MAX_REVISIONS` automatic revisions were made from the edited version, **revision** of the best version, then full revalidation of the result.
+  - The best version (passing first, then score, then earliest) becomes the recommended version, and the article ends `ready` or `needs_review`, never `completed`. New statuses `validating` and `revising` are shown while it runs.
+  - Only `completed` articles (or `ready` / `needs_review`, to validate again) enter; one failed at a Phase 6 step resumes by validating again.
+  - A new Phase 5 edit clears the validation.
+- **Deterministic vs Gemini.**
+  - **Code:** evidence verification (the quote must be in the stored notes), uncited-claim extraction, claim ratios and citation coverage, originality (8-word BLAKE2b shingles with common-phrase filtering, containment per passage), SEO candidates and link targets, SEO checks, structure/length/Flesch readability metrics, the weighted score, the eight gates, issue order and best-version choice.
+  - **Gemini:** verdicts against the stored notes; re-reads of the source page with URL context, after the SSRF guard; which uncited sentences need a source; the SEO package's choices and wording; the 8-dimension rubric (1-5 with reasons, mapped to 0-1 in code); revisions.
+  - Every prompt is versioned and fences untrusted text.
+- **Fact-check verdict rules.** A verdict that isn't grounded doesn't count. Support needs a verified quote from the stored notes, or a successful URL-context re-read with a quote. What stays unsettled is `unsupported`. Verdicts are cached per (claim hash, source) for the same prompt version and model, and only model-decided verdicts are reused.
+- **Revision loop.**
+  - Revisions are `article_versions` rows of kind `revision`, with the parent, reason, issues addressed, changes, model, prompt version and tokens.
+  - A revision failing the completion checks, or identical to a version already validated, is an attempt with no new version.
+  - The attempt number is in the revision fingerprint, so a retry is a new attempt, while re-running the same validation replays it without calls.
+  - A budget exhausted mid-loop stops revising; the validated versions decide.
+- **Idempotency boundaries.**
+  - Downstream fingerprints include upstream **output** hashes, not prompt versions.
+  - The judge's inputs exclude the SEO metrics, so a new SEO prompt redoes the SEO step, plus the metrics and decision only if the package changed. A new judge prompt redoes only the judge and the decision.
+  - Weights and gate limits redo only the decision, and the decision is per version.
+- **Tables (migration `0005`).**
+  - **`article_claim_checks`:** one row per (claim, cited source) verdict and per uncited factual claim. Holds the evidence and whether it was verified, confidence, re-read flag, claim type and signals, `reused_from_id`, model, prompt version and time. Never overwritten.
+  - **`article_originality_flags`:** flagged passages, with the page (content item), overlap text and similarity.
+  - **`article_quality_reports`:** each version's score, breakdown, gates, pass/fail, issues and policy fingerprint, linked to the five step executions it came from.
+  - **`articles`** gained `recommended_version_id`, `quality_report_id`, `quality_score`, `revision_count`, `quality_tokens_used` and `validated_at`.
+  - **`article_versions`** gained `parent_version_id`, `reason`, `issues_addressed` and `tokens`.
+  - CHECK constraints now cover the Phase 6 statuses, steps, the `revision` kind and five new `llm_calls` purposes.
+  - The downgrade maps Phase 6 states back to `completed` and removes the Phase 6 rows.
+- **Differences from §7.1 / §8.4.**
+  - The SEO package and the quality report are stored as step outputs and report rows rather than columns on `generated_articles`.
+  - `needs_review` is the Phase 6 outcome. The approval states (`awaiting_approval`, `scheduled`, `published`) remain Phase 7.
+  - Originality compares against every stored page of the monitored sites, with common phrasing filtered by document frequency, rather than "related" articles only.
+  - Your own site's pages are included when it's monitored, recognized by the company website's domain.
+- **Budgets.** `QUALITY_MAX_TOKENS` per article, within `ARTICLE_MAX_TOKENS`, `LLM_MAX_TOKENS_PER_RUN` and the daily budget, is checked before every call. Claims are batched (`FACT_CHECK_BATCH_SIZE`), and unusable batches are split. Re-reads are capped per version.
+- **Live verification.**
+  - **Opt-in test** (`pytest -m llm_live tests/live/test_live_quality.py`, fake-written article, real Gemini): `ready` in 8 calls and 21.9k tokens. The edited version failed the unsupported-claims gate; one revision grounded every claim (score 87.8).
+  - **Real run** (dev database, the 1,877-word Phase 5 article with 3 sources and 28 citations): 15 calls and 60.2k tokens.
+    - The edited version scored 80.7 and failed two gates: 4 of 28 cited claims were unsupported (14% > 10%), and 6 uncited factual claims needed sources.
+    - One revision scored 90.8 with every gate passing (29 of 30 claims supported, 3 uncited), and became the recommended version (`ready`).
+    - SEO chose "cookieless tracking" (a competitor subtopic), with 3 external links to the stored sources.
+  - **Idempotency held:** validating again reused all 12 steps with no call.
+- **Scope kept out:** CMS publishing, approval policy, scheduling, social posting (Phases 7–10). Nothing is published.
+
+### Phase 7 — CMS publishing
+- `CMSPublisher`, `WordPressPublisher` (draft/publish/schedule, taxonomy, slug, SEO meta via mu-plugin), idempotency and reconciliation.
+- `ApprovalPolicy` and the approve/reject API.
+
+**Implemented (2026-09-15). What was built, and where it differs from §8.5–8.6:**
+- **Layers.** `PublishingService` (approval, preflight, idempotency, lifecycle) → `CMSPublisher` protocol (`app/cms/base.py`, CMS-neutral: string post ids, neutral statuses, terms by name) → `WordPressPublisher` (mapping and publishing semantics) → `WordPressClient` (HTTP, Application Password auth, bounded retries, error mapping, read-only mode). Only `app/cms/wordpress/` knows WordPress's API, fields, ids and statuses.
+- **Approval (`article_approvals`), a record rather than an article state.**
+  - A decision (`approved` / `rejected`) on one exact **version and quality report**, with the approver, method (`manual` / `auto`), channel (API, CLI, policy), note and time.
+  - A partial unique index keeps one live decision per article.
+  - Decisions are never deleted or edited. A later decision, a new recommended version or report (Phase 6 `_finalize`), a new Phase 5 edit, or cancellation sets `invalidated_at` and the reason, once.
+  - Only `ready` articles can be decided; `needs_review` has no override.
+  - Auto-approval (`PUBLISH_AUTO_APPROVE`, off by default) runs at publish time, applies the same checks, and never overrides a rejection.
+  - §8.5's `awaiting_approval` state isn't needed: `pending` is derived (ready, with no live decision for the current version and report).
+- **Rendering, which differs from §8.6's Markdown → HTML + nh3.**
+  - The article is structured text, so `article_render.py` builds HTML tag by tag and escapes every piece of text. A model can't inject markup, so there's nothing to sanitize and no new dependency.
+  - Citations become numbered references to a Sources section listing only this version's cited sources.
+  - Only Phase 6-validated links to allowed targets (stored company pages, the article's stored sources) are placed; unplaced internal links go under "Related reading".
+  - The FAQ is included. No image is invented.
+- **SEO mapping, which differs from §8.6.** Title, slug, excerpt (the meta description), category and tags (resolved by name, never by model ids) and the author. No SEO plugin or mu-plugin is assumed; the meta title and description stay in the publication record.
+- **Terms.** A missing category **blocks** publishing unless `WORDPRESS_CREATE_MISSING_TERMS`. Missing tags are left out with a warning.
+- **Idempotency and reconciliation.**
+  - **`publications`:** one row per (article, version, CMS, site), with a unique SHA-256 idempotency key, the post id (saved as soon as known), status, target, what was mapped, the last preflight and `superseded_by`.
+  - **`publication_attempts`:** every change and its outcome (`succeeded` / `failed` / `unknown`).
+  - **The marker, which differs from §8.6's post meta.** Each post starts with an opaque random marker in an HTML comment, so no mu-plugin is needed. A post without it is never updated.
+  - **Lost responses.** A creation whose answer was lost (a timeout, a malformed 2xx, a 5xx) is reconciled by slug, then by marker search, before any retry, and the post is adopted if found. If the lookup fails, the run stops. Reads and updates of a known post are retried by the client (bounded, backoff, `Retry-After`); creations never are.
+- **Draft first.** Drafts by default. Making a post public needs `PUBLISH_ALLOW_DIRECT_PUBLISH`. `PUBLISH_DRAFT_FIRST` writes and verifies a draft before going public. A public post is never set back to draft.
+- **Version safety.** A new recommended version is never pushed automatically. It needs its own approval and an explicit publish, and then updates the same post (the lineage is the article's earlier publication on the site, plus the marker). Earlier publications stay as history.
+- **The opportunity** becomes `used` only after a verified public post.
+- **Runs.** `runs.kind = article_publish`. Publishing shares the article's advisory lock and run slot with generation and validation, so a concurrent request returns the in-progress publication. The API queues in the background (`202`, `{"publication_id", "status": "queued"}`).
+- **Migration `0006`:** three new tables with foreign keys, CHECKs, indexes and the partial unique index. No existing rows change; the downgrade drops only these tables.
+- **Security.**
+  - Credentials come from settings only (the password is a `SecretStr`) and never appear in logs, the database, API responses or error messages.
+  - `WORDPRESS_BASE_URL` must be https (http only for loopback) without credentials, and redirects are never followed.
+  - Dry runs use a client that refuses any change.
+- **Verification.** The fake WordPress (`tests/fakewordpress.py`) injects `401`, `403`, `400`, `429`, `5xx`, timeouts, lost responses, malformed answers and redirects. The opt-in live test (`LIVE_WORDPRESS=1 pytest -m cms_live`) writes, updates and trashes one draft on a real site.
+- **Scope kept out.** Scheduling, daily limits and cadence (Phase 8); social publishing (Phase 9).
+
+### Phase 8 — Scheduling and daily limits
+- Worker process, env-configured cron, advisory locks, the generate-N job, the publish-queue job, and the transactional daily limit, with its concurrency test.
+
+**Implemented (2026-09-15).** Phase 8 introduces autonomous scheduling and pipeline orchestration. Social media automation is intentionally deferred to Phase 9. What was built, and where it differs from §8.6–8.7:
+- **Layers (no business logic in the scheduler).** APScheduler worker (`app/scheduling/worker.py`) → `JobService` (`app/services/jobs.py`: queue, claim, locks, heartbeat, retries, recovery) → `PipelineService` (`app/services/pipeline.py`: the stages) → the existing Phase 2–7 services, unchanged except for one hook in Phase 7's publisher (the daily reservation).
+- **The pipeline.** `scan → analyze → opportunities → generate → quality → approval → publish`. Job types `scan`, `analyze`, `opportunities`, `generate_articles`, `quality_check`, `publish` (approval + publish) and `full_pipeline`.
+  - A failed stage stops the job; inside a stage, one competitor or article failing is a warning. Zero opportunities is a success.
+  - Stage results are saved on the job when a stage ends (`scan_complete` … `publishing_complete`), and per-item progress while it runs. A continued job (after a crash or a retry) skips finished stages and items: no Gemini work is repeated, and no article is created twice.
+  - The report (per stage, plus today's counts) is kept in `jobs.details`.
+- **Jobs (`jobs`).** Type, status (`queued`, `running`, `completed`, `completed_with_warnings`, `failed`, `cancelled`, `skipped`), trigger (`schedule`, `catch_up`, `cli`, `api`, `retry`), priority, scheduled occurrence and its unique dedupe key, `run_after`, attempts, heartbeat, last error and its kind (`transient`, `permanent`, `budget`, `interrupted`), parent (a manual retry), cancel flag, worker, details (params, stages, checkpoint, progress, report; no secret). `scheduler_state` is the persisted pause switch (one row).
+- **Locking.** A job is claimed with one conditional UPDATE, then takes a session-level advisory lock for its job type (a second job of that type is **skipped**) and, if it can spend Gemini tokens, one of `MAX_CONCURRENT_PIPELINES` slots. Claiming before locking means only the process that owns a job ever decides to skip it (a race found and fixed during testing).
+- **Crash recovery.** A heartbeat every ~30 s. A running job with no heartbeat for `JOB_STALE_AFTER_MINUTES` **and** a free job-type lock is requeued on the same row (`interrupted`) and continues from its checkpoint; after `JOB_MAX_ATTEMPTS` it fails. A shutdown (SIGINT/SIGTERM) requeues running jobs without using an attempt.
+- **Retries.** Transient failures (network, a dropped database connection, Gemini unavailable or rate limited, CMS 429/5xx) requeue the job with exponential backoff (`JOB_RETRY_BASE_SECONDS`, doubling, capped at `JOB_RETRY_MAX_SECONDS`). Configuration, credential, invalid-request and quality-gate failures are never retried; a spent token budget ends as `skipped_due_to_budget` / `completed_with_warnings`. Classification is by exception type (outcomes name theirs); a Gemini credential failure found in a stage's `llm_calls` stops the stage at once. The clients keep their own short retries; the job level is one delayed requeue, never a loop.
+- **Schedules.** Standard 5-field cron or `@hourly` / `@daily` / `@weekly`, parsed (never evaluated) by APScheduler's `CronTrigger` in `SCHEDULER_TIMEZONE` (DST-aware); UTC internally. `max_instances=1`, `coalesce=True`. A unique dedupe key per occurrence (`type@YYYY-MM-DDTHH:MMZ`) means two workers, or a restart, can't enqueue it twice. After an outage, one catch-up job for the latest missed occurrence within `SCHEDULER_CATCH_UP_HOURS`, only for a schedule that ran before; older queued occurrences are superseded, never replayed.
+- **Switches.** `SCHEDULER_ENABLED` (off by default) and a runtime pause (`schedule pause`; occurrences recorded as skipped); manual runs work either way. `AUTOMATED_PUBLISHING_ENABLED` (off by default) is a separate kill switch that keeps the pipeline away from the CMS entirely.
+- **Daily limits (calendar day in `SCHEDULER_TIMEZONE`, computed from timestamps; no midnight job).**
+  - `MAX_ARTICLES_GENERATED_PER_DAY` (default 3): articles created today, any trigger. The pipeline selects the top N opportunities under a lock *before* creating anything; the rest stay eligible.
+  - `MAX_ARTICLES_PER_DAY` (default 1): successful public publications today. Drafts, failed, blocked and deferred publications don't count; an automated publication's reservation counts while it is in flight or failed with an unknown outcome.
+  - **Atomic.** Phase 7's `PublishingService` reserves the slot (`publications.limit_day`) in the transaction that marks the publication as submitting, under a transaction-level advisory lock, right before the CMS is changed. Two publishers racing for the last slot publish exactly one; the other is deferred (`cancelled`, "left for a later run") without any CMS call. Manual publications aren't limited but use the day's allowance.
+  - `0` means none, never unlimited.
+- **Selection (never random).** Opportunities by score, then evidence count, then strategic fit, then id: approved ones, plus (with `PIPELINE_APPROVE_OPPORTUNITIES`, recorded as actor `pipeline`) new or reviewed ones scoring at least `PIPELINE_MIN_OPPORTUNITY_SCORE`. An opportunity with an article in any state is never selected again. Publishing candidates: ready articles of approved (not used) opportunities, never published on the site, by the same order and then quality score.
+- **Approval and publishing safety.** The pipeline never approves an article. `PUBLISH_AUTO_APPROVE` (Phase 7's policy, off by default) is the only automatic approval, applied inside Phase 7's `request()`; without it the pipeline stops before publishing and reports the articles awaiting approval. Only Phase 7's `PublishingService` talks to the CMS (preflight, idempotency key, marker reconciliation, draft first, `PUBLISH_ALLOW_DIRECT_PUBLISH`); only `ready` articles are sent. Without direct publishing the pipeline leaves drafts. Two consecutive publishing failures stop the stage.
+- **Budgets.** `LLM_DAILY_TOKEN_BUDGET` is checked before each Gemini stage and item; the per-run and per-article budgets stay in the services.
+- **Planning mode.** `pipeline run --dry-run` / `POST /pipeline/run {"dry_run": true}`: what would run now (competitors, local analysis estimates, the ranked opportunities and which fit today's allowance, validations, publications and why each would or wouldn't be sent). No site is fetched, **no Gemini call is made**, nothing is written to the CMS and no allowance is used (a `dry_run` job row records the plan).
+- **CLI.** `jobs list|show|retry|cancel`, `schedule status|list|run <job>|pause|resume`, `pipeline run [--dry-run] [--job]`, `worker`.
+- **API.** `GET /api/v1/jobs`, `GET /api/v1/jobs/{id}`, `POST /api/v1/jobs/{id}/retry` (`202`), `POST /api/v1/jobs/{id}/cancel`, `GET /api/v1/schedule`, `GET /api/v1/schedule/status`, `POST /api/v1/schedule/pause|resume`, `POST /api/v1/pipeline/run` (`202`, runs in the background; `200` with the plan for a dry run). All behind `X-API-Key`; `/health` shows the two switches.
+- **Observability.** Structured events for every job and stage (`job.enqueued`, `job.started`, `job.skipped`, `job.retry_scheduled`, `job.finished`, `job.recovered_stale`, `job.superseded`, `pipeline.stage_started|finished|reused`, `publishing.deferred_daily_limit`, `worker.*`), without secrets. `schedule status` is the dashboard: switches, today's generated / ready / published with the remaining allowances, today's jobs by status, running jobs, next runs, warnings. No metrics backend exists, so none was added.
+- **Migration `0007`:** `jobs` (CHECKs, unique dedupe key, indexes), `scheduler_state` (a single-row CHECK) and the nullable `publications.limit_day` (indexed). No existing row changes; the downgrade drops only what it adds. `alembic check` is clean.
+- **Dependency.** APScheduler 3.11 (MIT), as planned in §9.
+- **Scope kept out.** Social media (Phase 9): no Instagram, LinkedIn, X, Facebook, TikTok or YouTube API. No new CMS, LLM provider, analysis or generation capability.
+
+**The GitHub publishing adapter (2026-09-16).** After Phase 8's approval the owner said WordPress is not their platform. The live site was inspected (Next.js 14 App Router on Vercel, `next-mdx-remote`, `gray-matter`, posts in `src/content/blog/*.mdx`, seven live posts, no CMS or content API) and its repository (`siddharthpathania/engageo-website`) read for the exact contract. What was built, behind the same interface:
+- **Architecture.** `PublishingService → PublishingAdapter → GitHubPublishingAdapter → GitHub API → the site's repository` (`app/cms/github/`). The core has no GitHub logic; `LazyCMS` picks the adapter from `CMS_PROVIDER` (default `github`). Two shared gate settings were renamed to neutral names: `PUBLISH_DEFAULT_STATUS`, `PUBLISH_ALLOW_DIRECT_PUBLISH`.
+- **Rendering.** `article_markdown.py` renders the same structure as the HTML renderer as MDX-safe Markdown (escaping for JSX, ESM, Markdown blocks and autolinks; inline source links); `app/cms/github/mdx.py` composes the site's file: the discovered frontmatter contract, the site's slug rules, a fixed content-format → category mapping (Playbook / Industry Data / Comparison only), 3–6 lowercase tags, `draft: false`, the configured author, one `<BlogCTA />`, the byline, and `agentPublication`/`agentSource` for ownership. The file is validated before it is written.
+- **Flow.** Draft = branch `blog/<slug>` + commit `Add blog post: <title>` + pull request + a successful Vercel preview deployment (read through GitHub's deployments API) that serves the post. Publish = preview verified → squash merge → production deployment succeeded → live URL serves the page (200, title, canonical, published metadata). Every step is "ensure": branch, file, pull request and merge are looked up before being made, so lost answers and crashes reconcile rather than duplicate. External ids: `pr:<n>`, `main:<slug>` (and `branch:<name>` for reads).
+- **Safety.** Deployment Protection on previews stops the run (nothing bypassed). A failed production build is never reported as published; merged-but-unverified stays an unknown outcome. The daily limit, the kill switch, article approval and `PUBLISH_ALLOW_DIRECT_PUBLISH` are unchanged and were re-tested through the adapter. The token goes to `api.github.com` only.
+- **Tests.** A fake GitHub API + fake Vercel + fake site (`tests/fakegithub.py`); 39 adapter/client tests, 44 contract tests, 19 database-backed flows (drafts, idempotency, lost answers at each step, merge recovery, protected previews, deployment failures, foreign slugs, dry runs, secrets, the Phase 8 pipeline end to end, kill switch, approval boundary, limits, concurrent publishers). No real GitHub call is made in tests.
+- **WordPress.** Not deleted yet: `app/cms/wordpress/` (439 lines), its three test files (608 lines), six `wordpress_*` settings, one `LazyCMS` branch, two `wordpress_create_missing_terms` reads in the publishing service, the `cms_live` pytest marker, and documentation. No schema depends on it (`publications.cms`/`site` are plain text). Removal is a contained follow-up once the real GitHub test passes.
+
+**Editorial topics (2026-09-19).** The owner wants ten articles a day beyond what competitors drive. Built on the existing path rather than beside it:
+- **Source.** `app/services/editorial.py` asks Gemini (one call, `editorial/1`) for about a third more ideas than needed, from the company profile and an "already covered" list (every opportunity in any status, every article, the site's posts from its sitemap, read with the polite fetcher). The list is data in delimiters that can't be closed from inside it.
+- **Deterministic checks.** Exclusions (topic, keyword and title), strategic fit ≥ the scoring minimum (from topic, keyword and title; plus the profile topic Gemini says the idea serves, counted only when the idea's own words share two non-qualifier words with it, as a partial match: `editorial/2`, after the first real run showed long-tail topics failing stem containment), near-duplicates (word stems) of anything covered or of each other, numbers not in the profile removed (a numeric title falls back to the topic), formats limited to guide/listicle/comparison/research/tutorial/article, the audience mapped to the profile's wording. The score is strategic fit × 100, never the model's.
+- **Storage.** Each kept idea is an `opportunities` row (`editorial:<label key>`, no topic), one assessment carrying the idea as its interpretation (status ok) and the signal skeleton every reader expects, one `company_profile` evidence row, a `created` event by actor `editorial`. The brief needed one change: an idea's key points lead its key points. No table changed.
+- **Ownership.** Key namespaces are owned by one source each: the signal engine reconciles (expires, rescores, reopens) and interprets only `topic:`/`core:` keys; the editorial planner expires its own unapproved ideas after `expires_after_days`.
+- **Pipeline.** The `editorial` stage tops the backlog up to today's remaining editorial allowance (ideas awaiting a person count, so nothing piles up). Selection gives each origin its own allowance under the existing lock. `DailyCounts` and the plan report both; the validation cap is the sum.
+- **Tests.** 12 unit tests of the checks and prompt, 11 database-backed flows (the brief, an article end to end, duplicates of opportunities/articles/site posts, ownership against competitor runs, expiry, dry runs, Gemini failures, the run lock), 4 pipeline tests (off by default, no pile-up, per-origin allowances, planning mode), CLI and API tests. The fake Gemini answers from a fixed idea pool; no real call is made in tests.
+
+### Phase 9 — Social monitoring
+- `SocialSource` adapters for YouTube (API + RSS), Instagram (Business Discovery) and X (if you provide paid API access), plus CSV import for LinkedIn.
+- Social posts feed into the same analysis and trend layers.
+
+### Phase 10 — Dashboard
+- Server-rendered (FastAPI + Jinja2 + HTMX) unless you prefer an SPA: competitor timeline, changes, trends, opportunities, and the article review/approve queue.
+
+---
+
+## 13. Consolidation procedure
+1. Create branch `feat/phase-1-website-monitoring` from `main`. Its first commit is this `MIGRATION_PLAN.md`.
+2. Scaffold the new project structure. No source repository is added as a submodule, subtree or dependency.
+3. Copy the few adopted patterns from R3 (settings, prompt/agent separation, LangGraph node conventions), adapted with header attribution, as each phase needs them.
+4. Import R1's profile schemas and grounded-synthesis pattern in Phase 3, adapted with header attribution.
+5. Implement all R2-inspired capabilities independently (§3). No R2 files are opened during implementation beyond the analysis already done.
+6. Create `THIRD_PARTY_NOTICES.md` with the R1 and R3 MIT notices.
+7. Delete the temporary clones after approval. The final repository depends only on PyPI packages and external APIs.
+
+---
+
+## 14. Inputs needed from you
+1. **Approval** of the base choice, the architecture and this plan.
+2. **2–5 competitor URLs and your own site URL.** These are needed to verify Phase 1 against real sites; your site is later used for coverage and internal links. Pricing, product or other pages you want tracked explicitly are also useful.
+3. *(Phase 3, not blocking):* a billing-enabled `GEMINI_API_KEY`. Phase 1 doesn't need one. Say so if you'd rather run bulk analysis on a cheaper Gemini model (e.g. Flash-Lite) from day one.
+4. *(Phase 7, not blocking):* your WordPress version, SEO plugin (Yoast, Rank Math or none), and whether you can install a small mu-plugin.
+
+---
+
+## Appendix — what was verified, and how
+- All source files in the three repos were read in full.
+- Git histories were inspected: R2 has no license file in its entire history; R3's FastAPI → Flask switch and assistant-agent deletion are both in its history.
+- R2's test suite was run in an isolated environment: **57 passed, 3 failed**. All tests target the approval module; there are no tests for the agents, the workflow, SEO or WordPress.
+- R2 was grep-verified: the approval service has no callers outside tests; `markdown` is never imported; there is no checkpointer or interrupt usage.
+- R3's committed `reports.db` contains only its schema. R3 never loads `.env` or reads its LangSmith settings.
+- Current PyPI versions and license metadata were checked for every proposed dependency.
