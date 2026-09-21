@@ -1210,7 +1210,7 @@ files. The adapter ([app/cms/github/](app/cms/github/)) publishes the way a pers
 | Idempotency | The branch, the file, the pull request and the merge are each looked up before they are made. A lost answer, a crash after the branch, after the commit or after the pull request, a lost pull request number or a merge that timed out all reconcile against `main`, the `blog/*` branches, open pull requests and the marker in the frontmatter |
 | Protection | If Vercel's Deployment Protection blocks the preview, the run stops with a clear error and nothing is merged: nothing is bypassed |
 | Token | `GITHUB_TOKEN`, a fine-grained personal access token for that one repository with *Contents* and *Pull requests* read/write, sent to `api.github.com` only. The site and its previews are fetched without credentials |
-| Cover image | With `PUBLISH_COVER_IMAGES=true`: one Gemini-generated illustration per post, committed to the same branch as `public/blog/covers/<slug>.png` and named in the frontmatter (`coverImage`, plus `coverWidth`/`coverHeight`). See [Cover images](#cover-images) |
+| Cover image | With `PUBLISH_COVER_IMAGES=true`: one picture per post — a Gemini illustration or a Pexels stock photo (`COVER_IMAGE_SOURCE`) — committed to the same branch as `public/blog/covers/<slug>.<ext>` and named in the frontmatter (`coverImage`, plus `coverWidth`/`coverHeight`). See [Cover images](#cover-images) |
 
 `articles publish <id> --dry-run` shows the exact MDX file, branch and pull request title
 without touching GitHub.
@@ -1218,24 +1218,46 @@ without touching GitHub.
 ### Cover images
 
 Off by default (`PUBLISH_COVER_IMAGES=false`): with it off, nothing here runs and a post is
-published exactly as it was before. With it on, each published post gets one cover picture.
+published exactly as it was before. With it on, each published post gets one cover picture,
+from one of two sources (`COVER_IMAGE_SOURCE`).
+
+| | Common to both sources |
+|---|---|
+| Where it goes | `public/blog/covers/<slug>.<ext>` on the post's own branch, committed before the `.mdx` file, so the pull request and its preview deployment show the post with its cover |
+| Frontmatter | `coverImage: '/blog/covers/<slug>.<ext>'` between `tags` and `draft`, with `coverWidth` / `coverHeight` as unquoted numbers read from the picture's own header (the site renders the detail header at the picture's natural aspect ratio; cards crop to 1200×630) |
+| File types | `png`, `jpeg` or `webp` only, between 100 bytes and 8 MB. Anything else is refused and never committed |
+| Obtained once | One `article_covers` row per (article, version), unique in the database. A retry after a lost answer, a second publication of the same version and a follow-up pull request all reuse it: the image model is called, or Pexels searched, exactly once per version |
+| Committed once | The adapter looks the file up on the branch first, like the branch, the post and the pull request, and asks for the bytes only when it is missing |
+| Provenance | Each row records its source (`gemini` \| `pexels`), and for a photo its id, page, photographer and their page. The publication's details carry the same, and the pull request repeats the credit line |
+| Failure | Never fatal. No key, a budget stop, a refusal, an unusable answer or no usable photo is a warning on the publication, and the post is published without a cover |
+| Dry runs | Make nothing: `--dry-run` shows the file as it stands, without a cover |
+
+**`COVER_IMAGE_SOURCE=gemini` (the default): a generated illustration**
 
 | | |
 |---|---|
 | What | One editorial illustration per article version, drawn by `GEMINI_IMAGE_MODEL` from the article's title, primary keyword, audience and your company profile's positioning and tone |
 | The prompt | [app/prompts/cover_image.py](app/prompts/cover_image.py), versioned like every other prompt. Its hard rules: **no text, letters, numbers, logos or watermarks** (models render text badly, and the site prints the title over the cover anyway), no identifiable people, nothing that could pass as a real photo of a real clinic, patient or medical record, nothing clinical and nothing that claims a result. The article's own words are **untrusted data** inside a delimited block, never instructions |
 | Alt text | Deterministic, from the article's keyword — it describes the illustration and claims nothing |
-| Where it goes | `public/blog/covers/<slug>.png` on the post's own branch, committed before the `.mdx` file, so the pull request and its preview deployment show the post with its cover |
-| Frontmatter | `coverImage: '/blog/covers/<slug>.png'` between `tags` and `draft`, with `coverWidth` / `coverHeight` as unquoted numbers (the site renders the detail header at the picture's natural aspect ratio; cards crop to 1200×630) |
-| Generated once | One `article_covers` row per (article, version), unique in the database. A retry after a lost answer, a second publication of the same version and a follow-up pull request all reuse it: the image model is called exactly once per version |
-| Committed once | The adapter looks the file up on the branch first, like the branch, the post and the pull request, and asks for the bytes only when it is missing |
 | Cost | One image call per published version, in the same `llm_calls` ledger (purpose `cover_image`) and the same `LLM_DAILY_TOKEN_BUDGET` as every text call |
-| Failure | Never fatal. No key, a budget stop, a refusal or an unusable answer is a warning on the publication, and the post is published without a cover |
-| Dry runs | Generate nothing: `--dry-run` shows the file as it stands, without a cover |
+
+**`COVER_IMAGE_SOURCE=pexels`: a stock photo** ([app/images/pexels.py](app/images/pexels.py))
+
+| | |
+|---|---|
+| What | One [Pexels](https://www.pexels.com/) photo per article version. **No model is called**: `PEXELS_API_KEY` is the only new requirement, and free |
+| Choosing it | 2–4 searches built by fixed rules from the article's primary keyword, who it is for and the brief's content format, tried in order: keyword + audience, keyword alone, keyword + the subject its format suggests, then a plain business scene. The article's words become *search words* (ASCII, lowercased, stop-words dropped) and are sent as a query parameter — never as an instruction to anything |
+| Which photo | `orientation=landscape`, at least 1200px wide, wider than it is tall, and of those the one whose aspect ratio is closest to 16:9 (ties go to the lower photo id, so the choice is deterministic). The **sized variant** (`large2x`, else `landscape`, else `large`) is downloaded, never the multi-megapixel original |
+| Never twice | The photo's id is stored, and any photo an earlier cover used is skipped (an index on `article_covers (source, source_id)`). A search with no usable photo falls through to the next query; if none of them has one, the post is published without a cover |
+| Two hosts | The key goes to `api.pexels.com` in the `Authorization` header and nowhere else; the picture is fetched from `images.pexels.com` with **no credential**. Redirects are never followed, and a link to any other host is refused before a request is made. Timeouts and bounded retries follow `CMS_REQUEST_TIMEOUT` / `CMS_MAX_RETRIES` |
+| Alt text | Deterministic, from the article's keyword, and says the picture is a stock photograph |
+| Attribution | The Pexels licence doesn't require it. The photographer, their page and the photo's page are recorded on the row and in the publication's details, and the pull request gets a `Cover photo: <photographer> on Pexels — <url>` line. **Nothing is written into the frontmatter**: the site's `BlogFrontmatter` (`src/lib/blog.ts`) has no credit field, so a visible credit on the page would need a new field there *and* in the post template — a change to the website repository, which this agent never makes |
 
 The picture's bytes live in `article_covers` only. They never enter a rendered document, a
 CMS payload, a publication's details, a run summary or a log line — the publication records
-the cover's name, type, size, alt text and SHA-256.
+the cover's name, type, size, alt text, SHA-256 and provenance. `PEXELS_API_KEY` is held as
+a secret: it is never logged, never put in an error message, never stored and never part of
+a payload.
 
 The API queues publishing in the background (`202`, `{"publication_id": ..., "status":
 "queued"}`); the CLI runs it straight away. One run per article at a time: publishing shares
@@ -1669,7 +1691,7 @@ topics = await llm.generate_structured(LLMRequest(prompt="..."), TopicList)  # a
 | 4 · Content opportunities | **Yes, top candidates only:** title, angle, why now, format, audience, rationale. Signals, relevance, gaps, scores and ranking are deterministic; works without a key. |
 | 5 · Article drafts | **Yes:** research (Google Search grounding and URL context), outline, draft, editorial pass. The brief, URL screening, citation checks and completion checks are deterministic. Nothing is published. |
 | 6 · Article validation | **Yes:** claim verdicts (with URL context re-reads), uncited-claim classification, SEO wording, the quality rubric, revisions. Evidence checks, originality, metrics, the score, gates and version selection are deterministic. Nothing is published. |
-| 7 · Publishing (current) | **Only the cover picture** (`PUBLISH_COVER_IMAGES`, off by default): an image model draws it, from a prompt the article can only supply data to. Approval, rendering, preflight, the CMS calls and reconciliation are deterministic. |
+| 7 · Publishing (current) | **Only the cover picture** (`PUBLISH_COVER_IMAGES`, off by default): an image model draws it, from a prompt the article can only supply data to — and not even that with `COVER_IMAGE_SOURCE=pexels`, where the photo is chosen by fixed rules. Approval, rendering, preflight, the CMS calls and reconciliation are deterministic. |
 | 8–10 · Scheduling, social, dashboard | Publishing decides nothing with an LLM; only a post's cover illustration is generated |
 
 ## Configuration reference
@@ -1730,7 +1752,9 @@ All settings are environment variables (or `.env`); see [`.env.example`](.env.ex
 | `PUBLISH_AUTHOR_NAME` / `_ROLE` / `_INITIALS` / `_LINKEDIN` | `Engageo Team` / `AI Content` / `EN` / *(empty)* | The byline of agent-written posts (configuration, never model output) |
 | `PUBLISH_CTA_TITLE` / `_BODY` / `_LABEL` / `_HREF` | see `.env.example` | The one call-to-action block every post ends with |
 | `PUBLISH_BYLINE` | see `.env.example` | The closing italic byline paragraph |
-| `PUBLISH_COVER_IMAGES` | `false` | Generate one cover illustration per published post, commit it to the post's branch and name it in the frontmatter |
+| `PUBLISH_COVER_IMAGES` | `false` | Give each published post one cover picture, commit it to the post's branch and name it in the frontmatter |
+| `COVER_IMAGE_SOURCE` | `gemini` | Where that picture comes from: `gemini` (an illustration from `GEMINI_IMAGE_MODEL`) or `pexels` (a stock photo, no model call) |
+| `PEXELS_API_KEY` | *(empty)* | Only for `COVER_IMAGE_SOURCE=pexels`: a free key from [pexels.com/api](https://www.pexels.com/api/), sent to `api.pexels.com` only (secret; never logged or stored). Empty: covers are skipped with a warning |
 | `COVER_IMAGE_DIR` / `COVER_IMAGE_URL_PREFIX` | `public/blog/covers` / `/blog/covers` | Where the picture is committed in the site's repository, and the path `coverImage` points at |
 | `CMS_REQUEST_TIMEOUT` / `CMS_MAX_RETRIES` | `30` / `2` | Seconds per CMS request; retries of transient failures only |
 | `WORDPRESS_BASE_URL` | *(empty)* | Your site (https; http only for localhost; no credentials in it) |

@@ -7,7 +7,6 @@ Phase 1) never loads it.
 
 import base64
 import binascii
-import struct
 from typing import Any
 
 import httpx
@@ -15,6 +14,7 @@ from google import genai
 from google.genai import types as genai_types
 from pydantic import BaseModel, ValidationError
 
+from app.images.dimensions import dimensions
 from app.llm.base import (
     Citation,
     Grounding,
@@ -125,7 +125,7 @@ class GeminiProvider:
             detail = f": it answered with text ({text[:200]!r})" if text else _errors(interaction)
             raise LLMResponseError(f"Gemini returned no image (status {status!r}){detail}", usage=usage)  # fmt: skip
         data, mime = found
-        width, height = _dimensions(data)
+        width, height = dimensions(data)
         return ImageResponse(
             data=data,
             mime_type=mime,
@@ -354,33 +354,6 @@ def _decoded(raw: Any) -> bytes:
         except (binascii.Error, ValueError):
             continue
     return b""
-
-
-def _dimensions(data: bytes) -> tuple[int | None, int | None]:
-    """Native pixel size read from the image's own header (PNG, JPEG, WebP). The site
-    renders the cover at its natural aspect ratio when both are known."""
-    if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
-        width, height = struct.unpack(">II", data[16:24])
-        return int(width), int(height)
-    if data[:2] == b"\xff\xd8":
-        offset = 2
-        while offset + 9 < len(data):
-            if data[offset] != 0xFF:
-                break
-            marker, length = data[offset + 1], int.from_bytes(data[offset + 2 : offset + 4], "big")
-            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
-                height, width = struct.unpack(">HH", data[offset + 5 : offset + 9])
-                return int(width), int(height)
-            offset += 2 + length
-    if data[:4] == b"RIFF" and data[8:15] == b"WEBPVP8":
-        if data[12:16] == b"VP8X":
-            width = int.from_bytes(data[24:27], "little") + 1
-            height = int.from_bytes(data[27:30], "little") + 1
-            return width, height
-        if data[12:16] == b"VP8 " and data[23:26] == b"\x9d\x01\x2a":
-            width, height = struct.unpack("<HH", data[26:30])
-            return width & 0x3FFF, height & 0x3FFF
-    return None, None
 
 
 def _errors(interaction: Any) -> str:

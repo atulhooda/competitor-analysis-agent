@@ -84,6 +84,18 @@ def originality_summary(report: OriginalityReport) -> str:
     return "\n".join(lines)
 
 
+MODEL_OUTPUT_LIMIT = 65_536  # Gemini 3.x flash; the request is refused above it
+
+
+def revision_output_tokens(target_words: int, words: int) -> int:
+    """Room for a revision: it returns the whole article again, so the budget comes from the
+    article in hand rather than the target length, with headroom for the JSON envelope, the
+    list of changes and the model's own reasoning. Too little and the answer is cut off
+    mid-article and thrown away (three retries, three wasted calls, the article stuck)."""
+    draft_room = article_draft.max_output_tokens(max(target_words, words))
+    return min(draft_room + 2_000 + max(target_words, words), MODEL_OUTPUT_LIMIT)
+
+
 async def judge(llm: BudgetedLLM, *, brief: ArticleBrief, research: ResearchResult, content: ArticleContent, fact_check: FactCheckReport, originality: OriginalityReport, metrics: dict[str, Any], config: JudgeConfig, target_words: int) -> JudgeReport:  # fmt: skip
     request = LLMRequest(
         prompt=quality_judge.render(
@@ -156,7 +168,7 @@ async def revise(llm: BudgetedLLM, *, brief: ArticleBrief, research: ResearchRes
         ),
         system=revision.SYSTEM,
         model=config.model,
-        max_output_tokens=article_draft.max_output_tokens(config.target_words),
+        max_output_tokens=revision_output_tokens(config.target_words, word_count(content)),
         reasoning_effort=config.reasoning_effort,
     )
     response = await llm.structured(request, revision.RevisionOut, purpose=LLMPurpose.ARTICLE_REVISION, prompt_version=revision.VERSION)  # fmt: skip

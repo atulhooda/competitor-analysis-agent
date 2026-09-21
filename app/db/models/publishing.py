@@ -9,9 +9,11 @@
   lifecycle status and what was mapped (never credentials).
 - ``PublicationAttempt``: every CMS change attempted for a publication and its outcome
   (succeeded, failed, or unknown and reconciled before any retry).
-- ``ArticleCover``: the generated cover picture of one article version (at most one, by a
-  unique constraint), with the prompt, prompt version and model that made it. Generated
-  once and reused by every retry and every later publication of that version.
+- ``ArticleCover``: the cover picture of one article version (at most one, by a unique
+  constraint), with where it came from: the prompt, prompt version and model that drew it,
+  or the stock photo's id, page and photographer. Obtained once and reused by every retry
+  and every later publication of that version; the (source, source id) index is how a
+  photo an earlier post already used is skipped.
 """
 
 from datetime import date, datetime
@@ -38,6 +40,7 @@ from app.domain.publishing import (
     ApprovalMethod,
     AttemptAction,
     AttemptOutcome,
+    CoverImageSource,
     PublicationStatus,
     TargetStatus,
 )
@@ -129,7 +132,11 @@ class PublicationAttempt(Base):
 
 class ArticleCover(Base):
     __tablename__ = "article_covers"
-    __table_args__ = (UniqueConstraint("article_id", "version_id"),)
+    __table_args__ = (
+        one_of("source", CoverImageSource),
+        UniqueConstraint("article_id", "version_id"),
+        Index("ix_article_covers_source_source_id", "source", "source_id"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     article_id: Mapped[int] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"))
@@ -143,7 +150,15 @@ class ArticleCover(Base):
     byte_size: Mapped[int]
     sha256: Mapped[str] = mapped_column(String(64))
     alt: Mapped[str] = mapped_column(Text)
+    # What produced the picture: the image prompt, or the search query that found the photo.
     prompt: Mapped[str] = mapped_column(Text)
     prompt_version: Mapped[str] = mapped_column(String(64))
-    model: Mapped[str] = mapped_column(String(100))
+    model: Mapped[str | None] = mapped_column(String(100))  # none for a photographer's work
+    # Provenance (CoverImageSource). A stock photo is never reused by a later post, which
+    # is what source_id is looked up for.
+    source: Mapped[str] = mapped_column(String(16), default=CoverImageSource.GEMINI.value, server_default=text("'gemini'"))  # fmt: skip
+    source_id: Mapped[str | None] = mapped_column(String(64))
+    source_url: Mapped[str | None] = mapped_column(Text)
+    photographer: Mapped[str | None] = mapped_column(Text)
+    photographer_url: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)

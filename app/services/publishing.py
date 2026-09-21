@@ -183,9 +183,10 @@ class PublishingService:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         covers: CoverService | None = None,
     ) -> None:
-        """``covers`` (PUBLISH_COVER_IMAGES) gives each published version one generated cover
-        picture. It is consulted only once a run is about to change the target, so blocked
-        publications, dry runs and no-op republishes never make an image."""
+        """``covers`` (PUBLISH_COVER_IMAGES) gives each published version one cover picture,
+        from the configured source (COVER_IMAGE_SOURCE). It is consulted only once a run is
+        about to change the target, so blocked publications, dry runs and no-op republishes
+        never generate an image or search for a photo."""
         self._engine = engine
         self._sessions = sessions
         self._settings = settings
@@ -368,14 +369,14 @@ class PublishingService:
         return await self._finish(run_id, publication_id, RunStatus.SUCCEEDED, plan, None, status=_FINAL[target], action=plan.report.action, warnings=plan.warnings + warnings)  # fmt: skip
 
     async def _with_cover(self, doc: RenderedDocument, run_id: int, warnings: list[str]) -> RenderedDocument:  # fmt: skip
-        """The document plus the metadata of this version's cover picture, generated once
+        """The document plus the metadata of this version's cover picture, obtained once
         and stored. Without a cover service, or when a cover can't be had, the document is
         returned untouched, a warning is recorded and the post is published without one."""
         if self._covers is None or not self._covers.enabled:
             return doc
         cover = await self._covers.cover(doc, run_id=run_id)
         if cover is None:
-            warnings.append("no cover image could be generated: the post is published without one")
+            warnings.append("no cover image was available: the post is published without one")
             return doc
         return doc.model_copy(update={"cover": cover})
 

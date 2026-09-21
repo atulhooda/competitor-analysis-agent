@@ -91,6 +91,13 @@ class AttemptOutcome(StrEnum):
     UNKNOWN = "unknown"  # no answer (timeout, lost response): reconciled before any retry
 
 
+class CoverImageSource(StrEnum):
+    """Where a post's cover picture came from (``COVER_IMAGE_SOURCE``)."""
+
+    GEMINI = "gemini"  # an illustration drawn by the image model, from our own prompt
+    PEXELS = "pexels"  # a Pexels stock photo, chosen by fixed rules and credited
+
+
 # ── Rendering ────────────────────────────────────────────────────────────────
 
 
@@ -123,6 +130,12 @@ class RenderedCover(BaseModel):
     width: int | None = None
     height: int | None = None
     sha256: str
+    # Provenance. A generated illustration has none; a stock photo names its photographer
+    # and its page at the source, which the pull request repeats.
+    source: str = Field(default=CoverImageSource.GEMINI.value, description="gemini | pexels")
+    credit: str | None = Field(default=None, description="The photographer, when the source names one")  # fmt: skip
+    credit_url: str | None = None
+    source_url: str | None = Field(default=None, description="The picture's page at the source")
 
 
 class RenderedDocument(BaseModel):

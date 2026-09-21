@@ -35,7 +35,12 @@ from urllib.parse import urlsplit
 
 import yaml
 
-from app.domain.publishing import RenderedDocument, RenderedLink
+from app.domain.publishing import (
+    CoverImageSource,
+    RenderedCover,
+    RenderedDocument,
+    RenderedLink,
+)
 from app.services.article_markdown import link_text, link_url
 
 CATEGORIES: tuple[str, ...] = ("Industry Data", "Comparison", "Playbook", "Product", "Announcements", "Research Paper")  # fmt: skip
@@ -60,6 +65,9 @@ RELATED_HEADING = "Related reading"
 # The site's own order; coverImage sits between tags and draft, as its existing posts do.
 FRONTMATTER_ORDER = ("title", "description", "publishedAt", "updatedAt", "author", "authorRole", "authorInitials", "authorLinkedin", "category", "tags", "coverImage", "coverWidth", "coverHeight", "draft", "agentPublication", "agentSource")  # fmt: skip
 COVER_KEYS = ("coverImage", "coverWidth", "coverHeight")
+# How a cover's source is named in the pull request. The site reads no credit field, so
+# this is the only place a reviewer sees where the picture came from.
+COVER_SOURCE_NAMES = {CoverImageSource.PEXELS.value: "Pexels"}
 DEFAULT_COVER_DIR = "public/blog/covers"
 DEFAULT_COVER_URL_PREFIX = "/blog/covers"
 # Site paths that may carry a query (the site's own CTA targets).
@@ -405,6 +413,22 @@ def _without_components(body: str, allowed: Collection[str]) -> tuple[str, int]:
     return stripped, count
 
 
+def cover_credit(cover: RenderedCover | None) -> str:
+    """The cover's provenance for the reviewer: who took the picture and where it came
+    from. A generated illustration has no credit line; Pexels asks for none but gets one
+    anyway. The photographer's name is someone else's text, so it is flattened to one
+    plain line and the links are only the ones the source itself gave us."""
+    if cover is None or cover.source == CoverImageSource.GEMINI.value:
+        return ""
+    who = " ".join(re.sub(r"[\[\]()`|]+", " ", cover.credit or "").split())[:100]
+    where = COVER_SOURCE_NAMES.get(cover.source, cover.source)
+    if not who:
+        return f"- Cover photo: {where}" + (f" — {cover.source_url}" if cover.source_url else "")
+    name = f"[{who}]({cover.credit_url})" if cover.credit_url else who
+    photo = f" — {cover.source_url}" if cover.source_url else ""
+    return f"- Cover photo: {name} on {where}{photo}"
+
+
 def pr_body(document: RenderedDocument, mdx: MDXDocument, *, generated_at: datetime) -> str:
     """The pull request description: what the article is and where it came from. Never a
     credential; only what the document itself carries."""
@@ -424,6 +448,9 @@ def pr_body(document: RenderedDocument, mdx: MDXDocument, *, generated_at: datet
     lines += [f"  - [{s.title}]({s.url})" for s in sources[:20]]
     if len(sources) > 20:
         lines.append(f"  - … and {len(sources) - 20} more")
+    credit = cover_credit(document.cover)
+    if credit:
+        lines.append(credit)
     lines += [
         f"- Generated: {generated_at.strftime('%Y-%m-%d %H:%M UTC')}",
         "",
@@ -443,12 +470,14 @@ __all__ = [
     "CATEGORIES",
     "CATEGORY_BY_FORMAT",
     "COVER_KEYS",
+    "COVER_SOURCE_NAMES",
     "DEFAULT_CATEGORY",
     "DEFAULT_COVER_DIR",
     "DEFAULT_COVER_URL_PREFIX",
     "MDXDocument",
     "SiteConfig",
     "compose",
+    "cover_credit",
     "cover_extension",
     "cta_block",
     "filter_internal_links",

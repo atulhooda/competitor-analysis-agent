@@ -228,10 +228,14 @@ class Settings(BaseSettings):
     publish_cta_label: str = "Book a demo"
     publish_cta_href: str = "/contact?intent=demo"
     publish_byline: str = "The Engageo Team builds AI missed-call recovery and WhatsApp automation for Indian clinics and hospitals. This article was researched and written with AI assistance and checked against its sources before publication."  # fmt: skip
-    # Cover images (off by default): one Gemini-generated picture per published post,
-    # committed to the site's repository on the post's own branch and named in its
-    # frontmatter. A failure to generate one never stops publishing.
+    # Cover images (off by default): one picture per published post, committed to the
+    # site's repository on the post's own branch and named in its frontmatter. A cover
+    # that can't be had never stops publishing.
     publish_cover_images: bool = False
+    # Where that picture comes from: gemini draws an illustration (GEMINI_IMAGE_MODEL),
+    # pexels picks a stock photo by fixed rules (PEXELS_API_KEY; no model call).
+    cover_image_source: Literal["gemini", "pexels"] = "gemini"
+    pexels_api_key: SecretStr | None = None  # pexels.com/api, free; blank: covers are skipped
     cover_image_dir: str = "public/blog/covers"  # in the site's repository
     cover_image_url_prefix: str = "/blog/covers"  # what the frontmatter points at
     wordpress_base_url: str | None = None  # e.g. https://blog.example.com (no credentials)
@@ -276,7 +280,7 @@ class Settings(BaseSettings):
     pipeline_approve_opportunities: bool = True
     pipeline_min_opportunity_score: float = Field(default=60.0, ge=0, le=100)
 
-    @field_validator("api_key", "gemini_api_key", "wordpress_application_password", "github_token", "vercel_protection_bypass_secret", mode="before")  # fmt: skip
+    @field_validator("api_key", "gemini_api_key", "wordpress_application_password", "github_token", "vercel_protection_bypass_secret", "pexels_api_key", mode="before")  # fmt: skip
     @classmethod
     def _blank_secret_is_unset(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value

@@ -13,6 +13,7 @@ from app.cms.github.mdx import (
     CATEGORIES,
     SiteConfig,
     compose,
+    cover_credit,
     filter_internal_links,
     frontmatter_text,
     jsx_attr,
@@ -354,6 +355,32 @@ def test_a_cover_of_unknown_size_is_referenced_without_dimensions() -> None:
 def test_validation_rejects_a_cover_the_site_would_ignore(keys: str, problem: str) -> None:
     text = f"---\ntitle: 'T'\npublishedAt: '2026-09-16'\ndescription: 'd'\ncategory: 'Playbook'\ntags: []\n{keys}\ndraft: false\nagentPublication: '{MARKER}'\n---\n\n<BlogCTA title=\"a\" />\n"  # fmt: skip
     assert any(problem in p for p in validate(text, marker=MARKER)), validate(text, marker=MARKER)
+
+
+def test_a_stock_photo_is_credited_in_the_pull_request_and_nowhere_in_the_file() -> None:
+    photo = cover(source="pexels", credit="Grace Hopper", credit_url="https://www.pexels.com/@grace", source_url="https://www.pexels.com/photo/desk-1/")  # fmt: skip
+    mdx = compose(document(cover=photo), marker=MARKER, config=config(), allowed_paths=ALLOWED, published_on=date(2026, 9, 16))  # fmt: skip
+    body = pr_body(document(cover=photo), mdx, generated_at=datetime(2026, 9, 16, 6, 30, tzinfo=UTC))  # fmt: skip
+    assert "- Cover photo: [Grace Hopper](https://www.pexels.com/@grace) on Pexels — https://www.pexels.com/photo/desk-1/" in body  # fmt: skip
+    # The site reads no credit field: the frontmatter keeps exactly the keys it always had.
+    fields, _ = split_frontmatter(mdx.text)
+    assert fields is not None
+    assert "Grace Hopper" not in mdx.text
+    assert set(fields) & {"coverImage", "coverWidth", "coverHeight"} == {"coverImage", "coverWidth", "coverHeight"}  # fmt: skip
+    assert validate(mdx.text, marker=MARKER) == []
+
+
+def test_a_generated_illustration_gets_no_credit_line() -> None:
+    mdx = compose(document(cover=cover()), marker=MARKER, config=config(), allowed_paths=ALLOWED, published_on=date(2026, 9, 16))  # fmt: skip
+    assert "Cover photo" not in pr_body(document(cover=cover()), mdx, generated_at=datetime(2026, 9, 16, 6, 30, tzinfo=UTC))  # fmt: skip
+    assert cover_credit(None) == ""
+
+
+def test_a_photographers_name_can_never_become_markup_in_the_description() -> None:
+    page = "https://www.pexels.com/photo/desk-1/"
+    credit = cover_credit(cover(source="pexels", credit="Eve [x](http://evil.test) `id`", source_url=page))  # fmt: skip
+    assert credit == f"- Cover photo: Eve x http://evil.test id on Pexels — {page}"
+    assert not set("[]()`") & set(credit.removesuffix(page))  # no link but the source's own
 
 
 def test_the_pull_request_description_carries_provenance_and_no_secret() -> None:

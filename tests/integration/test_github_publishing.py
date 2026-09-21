@@ -21,6 +21,7 @@ from app.db.models import (
     Article,
     ArticleApproval,
     ArticleCover,
+    ArticleVersion,
     Job,
     LLMCall,
     Opportunity,
@@ -35,11 +36,17 @@ from app.domain.articles import ArticleStatus
 from app.domain.history import RunStatus, RunTrigger
 from app.domain.jobs import JobStatus, StageStatus
 from app.domain.opportunities import OpportunityStatus
-from app.domain.publishing import ApprovalChannel, PublicationStatus, TargetStatus
+from app.domain.publishing import (
+    ApprovalChannel,
+    CoverImageSource,
+    PublicationStatus,
+    TargetStatus,
+)
+from app.images import pexels
 from app.llm import LazyLLM, LLMResponseError
 from app.prompts import cover_image
 from app.services.approvals import ApprovalService
-from app.services.covers import CoverService
+from app.services.covers import MAX_COVER_BYTES, CoverService
 from app.services.daily_limits import published_on
 from app.services.publishing import (
     PublishingConflictError,
@@ -49,6 +56,16 @@ from app.services.publishing import (
 )
 from tests.fakegithub import BASE, REPO, SITE, TOKEN, FakeGitHub
 from tests.fakellm import COVER_PNG, COVER_SIZE, FakeLLM
+from tests.fakepexels import (
+    KEY,
+    LANDSCAPE,
+    NARROW,
+    PHOTO_PNG,
+    PHOTO_SIZE,
+    SECOND,
+    SQUARE,
+    FakePexels,
+)
 from tests.fakesite import (
     NOW,
     FakeClock,
@@ -82,6 +99,7 @@ class Git:
     world: World
     gh: FakeGitHub
     clock: Clock
+    pex: FakePexels
 
     @property
     def article_id(self) -> int:
@@ -126,10 +144,12 @@ async def git(world: World) -> AsyncIterator[Git]:
     assert validated.status is ArticleStatus.READY
     gh = FakeGitHub()
     gh.add_post("existing-post", "---\ntitle: 'Existing'\npublishedAt: 2026-03-02\ncategory: 'Playbook'\ndraft: false\n---\n\nHello.\n")  # fmt: skip
+    pex = FakePexels(default=[SQUARE, LANDSCAPE, NARROW])  # every query finds the same shelf
     with respx.mock(assert_all_called=False) as router:
         gh.mount(router)
+        pex.mount(router)
         world.fake.requests.clear()
-        yield Git(world, gh, Clock())
+        yield Git(world, gh, Clock(), pex)
 
 
 # ── the publishing service with the GitHub adapter ───────────────────────────
@@ -477,6 +497,215 @@ async def test_a_dry_run_shows_the_frontmatter_without_generating_a_picture(git:
     assert dry.payload is not None
     assert "coverImage" not in dry.payload["content"]
     assert git.gh.mutations == []
+
+
+# ── cover images from Pexels (COVER_IMAGE_SOURCE=pexels) ─────────────────────
+
+PEXELS: dict[str, Any] = {**COVERS, "cover_image_source": "pexels", "pexels_api_key": KEY}
+
+
+async def seed_used_photo(git: Git, photo_id: int) -> None:
+    """A cover of an *earlier* version of this article, using that photo: exactly what the
+    next post has to skip. Written directly, as an earlier run would have left it."""
+    article = await git.world.article()
+    async with git.world.env.sessions() as session, session.begin():
+        versions = list(await session.scalars(select(ArticleVersion).where(ArticleVersion.article_id == git.article_id).order_by(ArticleVersion.id)))  # fmt: skip
+        earlier = next(v for v in versions if v.id != article.recommended_version_id)
+        session.add(ArticleCover(article_id=git.article_id, version_id=earlier.id, filename="earlier.png", mime="image/png", width=1920, height=1080, data=PHOTO_PNG, byte_size=len(PHOTO_PNG), sha256="e" * 64, alt="an earlier cover", prompt="earlier query", prompt_version=pexels.QUERY_VERSION, model=None, source=CoverImageSource.PEXELS.value, source_id=str(photo_id), created_at=git.world.env.wall()))  # fmt: skip
+
+
+async def test_a_cover_can_come_from_pexels_instead_of_the_image_model(git: Git) -> None:
+    await git.approve()
+    result, outcome = await git.publish(**PEXELS)
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    [pr] = git.gh.pulls.values()
+    slug = pr.head.removeprefix("blog/")
+    fields, _ = split_frontmatter(git.gh.file(slug, branch=pr.head) or "")
+    assert fields is not None
+    assert fields["coverImage"] == f"/blog/covers/{slug}.png"
+    assert (fields["coverWidth"], fields["coverHeight"]) == PHOTO_SIZE
+    assert git.gh.image(cover_path(git), branch=pr.head) == PHOTO_PNG
+    assert git.world.fake.image_requests == []  # no model was asked to draw anything
+    assert await cover_calls(git) == []
+    [row] = await covers_of(git)
+    assert (row.source, row.source_id, row.model) == ("pexels", str(LANDSCAPE.id), None)
+    assert (row.photographer, row.source_url) == (LANDSCAPE.photographer, LANDSCAPE.page_url)
+    assert row.prompt_version == pexels.QUERY_VERSION
+    publication = await git.publication(result.publication_id or 0)
+    assert publication.details["cover_image"]["source"] == "pexels"
+    assert publication.details["cover_image"]["credit"] == LANDSCAPE.photographer
+    assert "bytes" not in str(publication.details)
+
+
+async def test_the_photo_is_searched_for_with_the_articles_own_words_as_search_words(git: Git) -> None:  # fmt: skip
+    await git.approve()
+    result, _ = await git.publish(**PEXELS)
+    publication = await git.publication(result.publication_id or 0)
+    keyword = pexels.words(publication.details["primary_keyword"], limit=4)
+    [query] = git.pex.queries  # the first search already offered a usable photo
+    assert set(keyword) <= set(query.split())
+    assert all(part.isalnum() for part in query.split())
+    [row] = await covers_of(git)
+    assert row.prompt == query  # what was searched for is what the row records
+    assert git.pex.downloads == [LANDSCAPE.variant_url]  # a sized variant, not the original
+
+
+async def test_the_photo_closest_to_the_cover_shape_is_the_one_committed(git: Git) -> None:
+    await git.approve()
+    await git.publish(**PEXELS)
+    [row] = await covers_of(git)
+    assert row.source_id == str(LANDSCAPE.id)  # not the square one, not the small one
+
+
+async def test_a_photo_an_earlier_cover_used_is_never_chosen_again(git: Git) -> None:
+    await seed_used_photo(git, LANDSCAPE.id)
+    git.pex.default = [LANDSCAPE, SECOND]
+    await git.approve()
+    _, outcome = await git.publish(**PEXELS)
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert [c.source_id for c in await covers_of(git)] == [str(LANDSCAPE.id), str(SECOND.id)]
+    assert git.pex.downloads == [SECOND.variant_url]
+
+
+async def test_every_photo_already_used_leaves_the_post_without_a_cover(git: Git) -> None:
+    await seed_used_photo(git, LANDSCAPE.id)
+    git.pex.default = [LANDSCAPE]
+    await git.approve()
+    _, outcome = await git.publish(**PEXELS)
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert any("no cover image" in w for w in outcome.warnings), outcome.warnings
+    assert len(await covers_of(git)) == 1  # only the one that was already there
+    assert git.pex.downloads == []
+
+
+async def test_a_search_with_no_results_falls_through_to_the_next_query(git: Git) -> None:
+    git.pex.default = []  # nothing for the article's own words...
+    git.pex.offer(pexels.FALLBACK_QUERY, LANDSCAPE)  # ...but the last query always finds one
+    await git.approve()
+    _, outcome = await git.publish(**PEXELS)
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert git.pex.queries[-1] == pexels.FALLBACK_QUERY
+    assert 2 <= len(git.pex.queries) <= pexels.MAX_QUERIES
+    [row] = await covers_of(git)
+    assert (row.prompt, row.source_id) == (pexels.FALLBACK_QUERY, str(LANDSCAPE.id))
+
+
+async def test_no_photo_for_any_query_publishes_the_post_without_a_cover(git: Git) -> None:
+    git.pex.default = []
+    await git.approve()
+    _, outcome = await git.publish(**PEXELS)
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert any("no cover image" in w for w in outcome.warnings), outcome.warnings
+    assert len(git.pex.queries) == pexels.MAX_QUERIES  # every query was tried
+    assert await covers_of(git) == []
+    [pr] = git.gh.pulls.values()
+    assert "coverImage" not in (git.gh.file(pr.head.removeprefix("blog/"), branch=pr.head) or "")
+    assert git.gh.images(branch=pr.head) == []
+
+
+async def test_a_rejected_key_publishes_without_a_cover_and_never_names_the_key(git: Git) -> None:
+    git.pex.fail("search", 401)
+    await git.approve()
+    result, outcome = await git.publish(**PEXELS)
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert outcome.status is PublicationStatus.DRAFT_CREATED
+    assert any("no cover image" in w for w in outcome.warnings), outcome.warnings
+    assert await covers_of(git) == []
+    publication = await git.publication(result.publication_id or 0)
+    assert KEY not in str(publication.details)
+    assert git.pex.downloads == []
+
+
+async def test_a_photo_type_the_site_cannot_serve_is_never_committed(git: Git) -> None:
+    git.pex.mime = "image/gif"
+    await git.approve()
+    _, outcome = await git.publish(**PEXELS)
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert any("no cover image" in w for w in outcome.warnings), outcome.warnings
+    assert await covers_of(git) == []
+    assert git.gh.images(branch=next(iter(git.gh.pulls.values())).head) == []
+
+
+async def test_an_oversized_photo_is_refused_and_the_post_published_without_one(git: Git) -> None:
+    git.pex.photo = PHOTO_PNG + b"0" * MAX_COVER_BYTES
+    await git.approve()
+    _, outcome = await git.publish(**PEXELS)
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert any("no cover image" in w for w in outcome.warnings), outcome.warnings
+    assert await covers_of(git) == []
+    assert git.gh.images(branch=next(iter(git.gh.pulls.values())).head) == []
+
+
+async def test_pexels_without_a_key_skips_the_cover_and_publishes_anyway(git: Git) -> None:
+    await git.approve()
+    _, outcome = await git.publish(**{**PEXELS, "pexels_api_key": None})
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert any("no cover image" in w for w in outcome.warnings), outcome.warnings
+    assert git.pex.requests == []  # Pexels was never contacted
+    assert await covers_of(git) == []
+
+
+async def test_a_publish_retried_after_a_lost_answer_neither_re_searches_nor_re_downloads(git: Git) -> None:  # fmt: skip
+    await git.approve()
+    git.gh.fail("create_pull", "lost")
+    result, outcome = await git.publish(**PEXELS)
+    assert await git.attempts(result.publication_id or 0) == [("create", "unknown"), ("reconcile", "succeeded")]  # fmt: skip
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    searches, downloads = list(git.pex.queries), list(git.pex.downloads)
+    _, second = await git.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True, **PEXELS)  # fmt: skip
+    assert second.status is PublicationStatus.PUBLISHED, second.error
+    assert (git.pex.queries, git.pex.downloads) == (searches, downloads)
+    assert len(downloads) == 1
+    assert len(await covers_of(git)) == 1
+    assert len([c for c in git.gh.mutations if c[1].endswith(cover_path(git))]) == 1
+    assert git.gh.image(cover_path(git)) == PHOTO_PNG  # merged to main with the post
+
+
+async def test_the_pull_request_credits_the_photographer(git: Git) -> None:
+    await git.approve()
+    await git.publish(**PEXELS)
+    body = git.gh.pulls[61].body
+    assert f"- Cover photo: [{LANDSCAPE.photographer}](" in body
+    assert LANDSCAPE.page_url in body
+    assert "on Pexels" in body
+
+
+async def test_choosing_gemini_keeps_todays_behaviour_and_asks_pexels_nothing(git: Git) -> None:
+    await git.approve()
+    _, outcome = await git.publish(**COVERS)
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert git.pex.requests == []
+    assert len(git.world.fake.image_requests) == 1
+    [row] = await covers_of(git)
+    assert (row.source, row.source_id, row.photographer) == ("gemini", None, None)
+    assert row.model == DEFAULT_GEMINI_IMAGE_MODEL
+    assert git.gh.image(cover_path(git), branch=next(iter(git.gh.pulls.values())).head) == COVER_PNG
+    assert "Cover photo:" not in git.gh.pulls[61].body
+
+
+async def test_the_key_never_reaches_the_ledger_the_repository_or_the_row(git: Git) -> None:
+    await git.approve()
+    result, _ = await git.publish(**PEXELS)
+    async with git.world.env.sessions() as session:
+        publication = await session.get_one(Publication, result.publication_id or 0)
+        run = await session.get_one(Run, result.run_id or 0)
+        attempts = list(await session.scalars(select(PublicationAttempt).where(PublicationAttempt.publication_id == publication.id)))  # fmt: skip
+        covers = list(await session.scalars(select(ArticleCover)))
+    haystack = " ".join([str(publication.details), str(publication.preflight), str(run.summary), str(run.error), *(str(a.error) for a in attempts), *(f"{c.prompt} {c.source_url} {c.photographer_url} {c.filename}" for c in covers), git.gh.pulls[61].body, str(git.gh.trees), str(git.gh.blobs.keys())])  # fmt: skip
+    assert KEY not in haystack
+    assert all(KEY not in str(r.url) for r in git.pex.requests)  # never in a URL either
+    assert git.pex.authorizations.count(KEY) == 1  # the search host, once; nowhere else
+
+
+async def test_a_dry_run_searches_for_nothing(git: Git) -> None:
+    await git.approve()
+    dry = await git.service(**PEXELS).dry_run(git.article_id)
+    assert dry.preflight.ready
+    assert git.pex.requests == []
+    assert await covers_of(git) == []
+    assert dry.payload is not None
+    assert "coverImage" not in dry.payload["content"]
+    assert KEY not in dry.model_dump_json()
 
 
 # ── the Phase 8 pipeline with the GitHub adapter ─────────────────────────────
