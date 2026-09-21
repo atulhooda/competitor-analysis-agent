@@ -56,6 +56,13 @@ def test_the_queries_are_words_and_never_instructions() -> None:
         assert all(part.isalnum() for part in query.split()), query
 
 
+def test_a_word_the_keyword_already_carries_is_not_repeated() -> None:
+    # "missed call recovery for clinics" for clinics: "clinics clinics" searches worse.
+    queries = pexels.search_queries(primary_keyword="missed call recovery for clinics", audience="clinics", content_type="guide")  # fmt: skip
+    assert queries[0] == "missed call recovery clinics"
+    assert not any(len(q.split()) != len(set(q.split())) for q in queries)
+
+
 def test_stop_words_and_punctuation_never_reach_a_search() -> None:
     assert pexels.words("The Best Guide to A/B Testing, for You!", limit=6) == ["testing"]
     assert pexels.words("WhatsApp follow-ups — 24/7 reception", limit=6) == ["whatsapp", "follow", "ups", "24", "reception"]  # fmt: skip

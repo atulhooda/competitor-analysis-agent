@@ -126,11 +126,13 @@ def search_queries(*, primary_keyword: str = "", audience: str | None = None, co
     article is for, the keyword alone, the keyword with the subject its format suggests,
     and a plain business scene that always finds something."""
     keyword = words(primary_keyword, limit=4)
-    who = words(audience, limit=2)
+    # Most keywords already say who they are for ("... for clinics"), and "clinics clinics"
+    # is a worse search than "clinics".
+    who = [w for w in words(audience, limit=2) if w not in keyword]
     term = FORMAT_TERMS.get((content_type or "").strip().lower(), DEFAULT_TERM)
     queries: list[str] = []
     for parts in ([*keyword, *who], keyword, [*keyword[:2], term], FALLBACK_QUERY.split()):
-        query = " ".join(parts)[:MAX_QUERY_CHARS].strip()
+        query = " ".join(dict.fromkeys(parts))[:MAX_QUERY_CHARS].strip()
         if query and query not in queries:
             queries.append(query)
     return queries[:MAX_QUERIES]
