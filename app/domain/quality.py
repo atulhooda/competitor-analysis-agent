@@ -250,10 +250,23 @@ class JudgeReport(BaseModel):
     missing: list[str] = Field(default_factory=list)
 
 
+class GateStatus(StrEnum):
+    PASSED = "passed"
+    FAILED = "failed"
+    # The check needs Gemini and wasn't made: only an authored report (a piece written by a
+    # person and imported) may carry one, and ``app.services.approval_rules`` enforces that.
+    NOT_RUN = "not_run"
+
+
 class Gate(BaseModel):
     name: str
-    passed: bool
+    passed: bool = Field(description="It doesn't block publication (a not-run gate on an authored report doesn't)")  # fmt: skip
     detail: str
+    status: GateStatus | None = Field(default=None, description="None: it ran, and `passed` is its outcome")  # fmt: skip
+
+    @property
+    def state(self) -> GateStatus:
+        return self.status or (GateStatus.PASSED if self.passed else GateStatus.FAILED)
 
 
 class QualityIssue(BaseModel):
@@ -275,6 +288,7 @@ class QualityAssessment(BaseModel):
     gates: list[Gate]
     passed: bool
     issues: list[QualityIssue]
+    authored: bool = Field(default=False, description="The deterministic checks of an imported article; the Gemini gates weren't run")  # fmt: skip
 
 
 # ── Read models ──────────────────────────────────────────────────────────────
@@ -337,6 +351,7 @@ class QualityReportView(BaseModel):
     breakdown: list[ScoreComponent]
     gates: list[Gate]
     passed: bool
+    authored: bool = Field(default=False, description="Written by a person: the Gemini gates weren't run")  # fmt: skip
     issues: list[QualityIssue]
     config_fingerprint: str
     fact_check_step_id: int | None

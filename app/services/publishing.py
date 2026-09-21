@@ -503,6 +503,9 @@ class PublishingService:
                 "meta_description": doc.excerpt,
                 "seo_plugin": None,  # none configured: meta title/description kept here; the excerpt carries the description
                 "primary_keyword": doc.primary_keyword,
+                # Provenance: this post was written by a person, not by the agent, and the
+                # agent's Gemini gates never ran on it.
+                "authored": doc.authored,
                 "category": category,
                 "tags": [{"name": t.name, "id": t.id} for t in terms.tags],
                 "missing_tags": list(terms.missing_tags),
@@ -676,7 +679,11 @@ class PublishingService:
         # configuration, not from the article: without them in the hash, changing one leaves
         # every published post showing the old one, and a republish reports nothing to do.
         content_hash = hashlib.sha256(f"{doc.content_hash}:{self._cms.presentation}".encode()).hexdigest()  # fmt: skip
-        return doc.model_copy(update={"article_id": snap.article.id, "version_id": snap.version.id if snap.version else None, "content_type": snap.article.content_type, "quality_score": snap.report.overall_score if snap.report else None, "opportunity_title": snap.opportunity_title, "content_hash": content_hash})  # fmt: skip
+        # An authored report has no combined score (the components that carry it need
+        # Gemini): the pull request says who wrote it instead of showing a score of zero.
+        authored = bool(snap.report is not None and snap.report.authored)
+        score = snap.report.overall_score if snap.report is not None and not authored else None
+        return doc.model_copy(update={"article_id": snap.article.id, "version_id": snap.version.id if snap.version else None, "content_type": snap.article.content_type, "authored": authored, "quality_score": score, "opportunity_title": snap.opportunity_title, "content_hash": content_hash})  # fmt: skip
 
     # ── preflight ────────────────────────────────────────────────────────────
 
@@ -693,8 +700,11 @@ class PublishingService:
             add("quality", False, "no quality report for the recommended version")
         else:
             failed = [g["name"] for g in report.gates if not g.get("passed")]
-            ok = report.passed and report.version_id == version.id and not failed
-            add("quality", ok, f"report #{report.id}: {report.overall_score:.1f}/100, every gate passes" if ok else f"report #{report.id} fails: {', '.join(failed) or 'it is for another version'}")  # fmt: skip
+            ok = report.passed and report.version_id == version.id and not failed and not readiness_problems(article, report)  # fmt: skip
+            score = "written by a person: no agent score" if report.authored else f"{report.overall_score:.1f}/100"  # fmt: skip
+            add("quality", ok, f"report #{report.id}: {score}, every gate that ran passes" if ok else f"report #{report.id} fails: {', '.join(failed) or '; '.join(readiness_problems(article, report)) or 'it is for another version'}")  # fmt: skip
+        if report is not None and report.authored:
+            add("provenance", True, "written by a person and imported: the agent checked its length, citations, structure and the site's MDX contract, and did not fact-check, originality-check or score it", blocking=False)  # fmt: skip
         problem = authorization_problem(article, report, snap.live)
         auto = problem is not None and s.publish_auto_approve and not readiness_problems(article, report) and not (snap.live is not None and snap.live.decision == "rejected" and snap.live.invalidated_at is None and snap.live.version_id == article.recommended_version_id and snap.live.quality_report_id == article.quality_report_id)  # fmt: skip
         if auto:

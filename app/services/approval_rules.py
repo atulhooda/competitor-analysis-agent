@@ -10,6 +10,12 @@ publishing. An approval authorizes publication only while all of these hold:
 
 Otherwise it's stale: ``invalidate_stale`` records that once, with the reason, and never
 deletes or rewrites the decision itself.
+
+**Authored reports.** An article a person wrote and imported (``articles import``) carries a
+report marked ``authored``: its deterministic gates ran and the ones that need Gemini are
+recorded as *not run*. Such a report is publishable, and only on an imported article —
+``authored_problems`` refuses it on a generated one, and refuses a not-run gate on a report
+that isn't authored. A generated article can never skip its gates this way.
 """
 
 from datetime import datetime
@@ -18,8 +24,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Article, ArticleApproval, ArticleQualityReport
-from app.domain.articles import ArticleStatus
+from app.domain.articles import ArticleOrigin, ArticleStatus
 from app.domain.publishing import ApprovalDecision
+from app.domain.quality import GateStatus
 
 
 async def live_decision(session: AsyncSession, article_id: int) -> ArticleApproval | None:
@@ -46,7 +53,22 @@ def readiness_problems(article: Article, report: ArticleQualityReport | None) ->
         if not report.passed:
             failed = [g["name"] for g in report.gates if not g.get("passed")]
             problems.append(f"its quality report #{report.id} fails gate(s): {', '.join(failed) or 'unknown'}")  # fmt: skip
+        problems += authored_problems(article, report)
     return problems
+
+
+def authored_problems(article: Article, report: ArticleQualityReport) -> list[str]:
+    """An authored report belongs to an imported article and to no other. Checked on every
+    approval and again immediately before the CMS is called, so a report that claims gates
+    were skipped can never carry an article the agent wrote."""
+    not_run = [g["name"] for g in report.gates if g.get("status") == GateStatus.NOT_RUN.value]
+    if not report.authored:
+        if not_run:
+            return [f"quality report #{report.id} records gate(s) as not run ({', '.join(not_run)}) but isn't an authored report: only an article written by a person may skip a gate"]  # fmt: skip
+        return []
+    if article.origin != ArticleOrigin.IMPORTED.value:
+        return [f"quality report #{report.id} is an authored report (a person's own checks, no Gemini gates) but article {article.id} was written by the agent: it must pass its own gates"]  # fmt: skip
+    return []
 
 
 def stale_reason(article: Article, approval: ArticleApproval) -> str | None:
@@ -96,4 +118,4 @@ async def invalidate_all(session: AsyncSession, article_id: int, now: datetime, 
     return 1
 
 
-__all__ = ["authorization_problem", "invalidate_all", "invalidate_stale", "live_decision", "readiness_problems", "stale_reason"]  # fmt: skip
+__all__ = ["authored_problems", "authorization_problem", "invalidate_all", "invalidate_stale", "live_decision", "readiness_problems", "stale_reason"]  # fmt: skip

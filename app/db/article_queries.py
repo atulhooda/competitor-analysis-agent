@@ -25,6 +25,7 @@ from app.domain.articles import (
     ArticleBrief,
     ArticleContent,
     ArticleDetail,
+    ArticleOrigin,
     ArticleOutline,
     ArticleProgress,
     ArticleRunView,
@@ -52,6 +53,7 @@ def summary(article: Article) -> ArticleSummary:
         id=article.id,
         opportunity_id=article.opportunity_id,
         attempt=article.attempt,
+        origin=ArticleOrigin(article.origin),
         status=ArticleStatus(article.status),
         current_step=ArticleStep(article.current_step) if article.current_step else None,
         title=article.title,
@@ -168,6 +170,7 @@ def _version_summary(v: ArticleVersion, current: set[int]) -> VersionSummary:
         issues=len(v.issues),
         prompt_version=v.prompt_version,
         model=v.model,
+        authored=(v.prompt_version or "").startswith("import/"),
         created_at=v.created_at,
         current=v.id in current,
     )

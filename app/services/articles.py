@@ -58,6 +58,7 @@ from app.domain.articles import (
     VALIDATABLE_STATUSES,
     ArticleBrief,
     ArticleContent,
+    ArticleOrigin,
     ArticleOutline,
     ArticleStatus,
     ArticleStep,
@@ -278,6 +279,8 @@ class ArticleService:
             if opportunity is None:
                 raise OpportunityNotFoundError(f"Unknown opportunity {opportunity_id}")
             latest = await self._latest(session, opportunity_id)
+            if latest is not None and latest.origin == ArticleOrigin.IMPORTED.value and ArticleStatus(latest.status) not in ENDED_STATUSES:  # fmt: skip
+                raise ArticleConflictError(f"Article {latest.id} for opportunity {opportunity_id} was written by a person and imported: the agent never rewrites it (cancel it first, or import the file again)")  # fmt: skip
             if latest is not None and ArticleStatus(latest.status) not in ENDED_STATUSES:
                 if regenerate:
                     raise ArticleConflictError(f"Article {latest.id} for opportunity {opportunity_id} is {latest.status}: cancel it before regenerating")  # fmt: skip
@@ -325,6 +328,8 @@ class ArticleService:
                 raise ArticleNotFoundError(f"Unknown article {article_id}")
             if article.status == ArticleStatus.CANCELLED.value:
                 raise ArticleConflictError(f"Article {article_id} was cancelled, which is final: regenerate a new attempt from its opportunity")  # fmt: skip
+            if article.origin == ArticleOrigin.IMPORTED.value:
+                raise ArticleConflictError(f"Article {article_id} was written by a person and imported: there is nothing for the agent to resume (edit the file and `articles import` it again)")  # fmt: skip
             opportunity = await session.get_one(Opportunity, article.opportunity_id)
             if opportunity.status != OpportunityStatus.APPROVED.value:
                 raise OpportunityNotApprovedError(f"Opportunity {opportunity.id} is {opportunity.status}: approve it again to resume")  # fmt: skip

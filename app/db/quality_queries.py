@@ -110,6 +110,7 @@ def _report_view(report: ArticleQualityReport, version: ArticleVersion) -> Quali
         breakdown=[ScoreComponent.model_validate(c) for c in report.breakdown],
         gates=[Gate.model_validate(g) for g in report.gates],
         passed=report.passed,
+        authored=report.authored,
         issues=[QualityIssue.model_validate(i) for i in report.issues],
         config_fingerprint=report.config_fingerprint,
         fact_check_step_id=report.fact_check_step_id,

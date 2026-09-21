@@ -46,6 +46,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.timeutils import utcnow
 from app.db.base import Base, TimestampMixin, one_of
 from app.domain.articles import (
+    ArticleOrigin,
     ArticleStatus,
     ArticleStep,
     SourceType,
@@ -62,6 +63,7 @@ class Article(TimestampMixin, Base):
     __tablename__ = "articles"
     __table_args__ = (
         one_of("status", ArticleStatus),
+        one_of("origin", ArticleOrigin),
         one_of("current_step", ArticleStep),
         one_of("failed_step", ArticleStep),
         Index("ix_articles_status_created_at", "status", "created_at"),
@@ -80,6 +82,8 @@ class Article(TimestampMixin, Base):
     assessment_id: Mapped[int] = mapped_column(ForeignKey("opportunity_assessments.id", ondelete="RESTRICT"))  # fmt: skip
     company_profile_id: Mapped[int] = mapped_column(ForeignKey("company_profiles.id", ondelete="RESTRICT"))  # fmt: skip
     attempt: Mapped[int]
+    # Who wrote it: the five Gemini steps, or a person whose file was imported.
+    origin: Mapped[str] = mapped_column(String(16), default=ArticleOrigin.GENERATED.value, server_default=ArticleOrigin.GENERATED.value)  # fmt: skip
     status: Mapped[str] = mapped_column(String(16))
     current_step: Mapped[str | None] = mapped_column(String(16))
     title: Mapped[str] = mapped_column(Text)
@@ -300,6 +304,9 @@ class ArticleQualityReport(Base):
     breakdown: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
     gates: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
     passed: Mapped[bool]
+    # The deterministic checks of an article a person wrote (`articles import`): the gates
+    # that need Gemini are recorded as not run. Only an imported article may carry one.
+    authored: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
     issues: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list, server_default=text("'[]'::jsonb"))  # fmt: skip
     config_fingerprint: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(default=utcnow, server_default=func.now())

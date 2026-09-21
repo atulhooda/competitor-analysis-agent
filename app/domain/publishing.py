@@ -157,6 +157,7 @@ class RenderedDocument(BaseModel):
     article_id: int | None = None
     version_id: int | None = None
     content_type: str | None = Field(default=None, description="The brief's content format (guide, comparison, ...)")  # fmt: skip
+    authored: bool = Field(default=False, description="Written by a person and imported: no Gemini fact-check, originality check or score")  # fmt: skip
     quality_score: float | None = None
     opportunity_title: str | None = None
     sources: list[RenderedSource]

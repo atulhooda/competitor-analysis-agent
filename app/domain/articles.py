@@ -18,6 +18,13 @@ from pydantic import BaseModel, Field
 from app.domain.analysis import ContentFormat, SearchIntent
 
 
+class ArticleOrigin(StrEnum):
+    """Who wrote the article."""
+
+    GENERATED = "generated"  # the five Phase 5 steps (Gemini), validated by Phase 6
+    IMPORTED = "imported"  # a Markdown file written by a person (`articles import`)
+
+
 class ArticleStatus(StrEnum):
     QUEUED = "queued"
     RESEARCHING = "researching"
@@ -334,6 +341,7 @@ class ArticleSummary(BaseModel):
     id: int
     opportunity_id: int
     attempt: int
+    origin: ArticleOrigin = Field(default=ArticleOrigin.GENERATED, description="imported: written by a person, not by the agent")  # fmt: skip
     status: ArticleStatus
     current_step: ArticleStep | None
     title: str
@@ -397,6 +405,7 @@ class VersionSummary(BaseModel):
     issues: int
     prompt_version: str | None
     model: str | None
+    authored: bool = Field(default=False, description="Written by a person and imported, not generated")  # fmt: skip
     created_at: datetime
     current: bool
 

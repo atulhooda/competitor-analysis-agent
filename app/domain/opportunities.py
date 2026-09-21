@@ -50,6 +50,9 @@ class OpportunityOrigin(StrEnum):
 # "editorial:<label key>" to the editorial planner.
 SIGNAL_KEY_PREFIXES = ("topic:", "core:")
 EDITORIAL_KEY_PREFIX = "editorial:"
+# "manual:<label key>": an opportunity created for an article a person wrote and imported
+# (`articles import`). Nothing reconciles these: the article already exists.
+MANUAL_KEY_PREFIX = "manual:"
 
 
 def opportunity_origin(key: str) -> OpportunityOrigin:

@@ -34,7 +34,7 @@ from app.db import (
 )
 from app.db.session import SessionFactory, create_engine, create_session_factory
 from app.domain.analysis import MixShift, Share, TopicTrend
-from app.domain.articles import ArticleBrief, ArticleStatus
+from app.domain.articles import ArticleBrief, ArticleOrigin, ArticleStatus
 from app.domain.competitor_profile import Claim
 from app.domain.content import ContentType
 from app.domain.history import ChangeType, RunStatus, RunTrigger
@@ -57,7 +57,7 @@ from app.domain.publishing import (
     PublicationView,
     TargetStatus,
 )
-from app.domain.quality import ClaimVerdict
+from app.domain.quality import ClaimVerdict, GateStatus
 from app.domain.scan import ScanResult
 from app.llm import LazyLLM, LLMConfigurationError
 from app.scheduling.runtime import Scheduling, standalone
@@ -69,6 +69,8 @@ from app.services.analysis import (
     AnalysisService,
 )
 from app.services.approvals import ApprovalService
+from app.services.article_file import ArticleFileError
+from app.services.article_import import ArticleImportService, ImportOutcome
 from app.services.articles import (
     ArticleBudgetExhaustedError,
     ArticleConflictError,
@@ -1469,6 +1471,7 @@ def _article_errors() -> tuple[type[Exception], ...]:
     return (
         LLMConfigurationError,
         OpportunityNotFoundError,
+        NoCompanyProfileError,  # an import (or a brief) without a company profile
         ArticleNotFoundError,
         OpportunityNotApprovedError,
         ArticleConflictError,
@@ -1575,6 +1578,53 @@ def generate_article(
         raise typer.Exit(code=1)
 
 
+@articles_cli.command("import")
+def import_article_cmd(
+    file: Annotated[
+        Path,
+        typer.Argument(
+            help="A Markdown file with YAML frontmatter (see the README, 'Importing an article you wrote')."
+        ),
+    ],
+    opportunity: int | None = typer.Option(
+        None,
+        "--opportunity",
+        help="Attach it to this opportunity instead of creating one of its own.",
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Import an article you wrote yourself: it becomes a ready article with an authored
+    quality report (length, citations, structure and the site's MDX contract checked; no
+    Gemini fact-check, originality check or score) that `articles approve` and
+    `articles publish` handle like any other. Nothing is published here."""
+    settings = get_settings()
+
+    async def work(engine: AsyncEngine, sessions: SessionFactory) -> ImportOutcome:
+        return await ArticleImportService(engine, sessions, settings).import_path(file, opportunity_id=opportunity)  # fmt: skip
+
+    try:
+        outcome = _run_db(work)
+    except ArticleFileError as exc:
+        err.print(f"[red]{escape(str(file))} isn't a publishable article:[/red]")
+        for problem in exc.problems:
+            err.print(f"  • {escape(problem)}")
+        raise typer.Exit(code=2) from exc
+    except _article_errors() as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    if json_output:
+        sys.stdout.write(json.dumps(outcome.as_dict(), indent=2) + "\n")
+        return
+    if not outcome.created:
+        console.print(f"[yellow]nothing written[/yellow]: {escape(outcome.message or '')}")
+        console.print(f"[dim]details: `articles show {outcome.article_id}`[/dim]")
+        return
+    console.print(f"article [bold]{outcome.article_id}[/bold] [green]ready[/green] · opportunity {outcome.opportunity_id} · version {outcome.version_id} · report #{outcome.quality_report_id}")  # fmt: skip
+    console.print(f"[bold]{escape(outcome.title)}[/bold] · slug: {outcome.slug} · {outcome.word_count:,} words · {outcome.sources} source(s)")  # fmt: skip
+    console.print("[yellow]written by a person[/yellow]: length, citations, structure and the site's MDX contract were checked; it was not fact-checked, originality-checked or scored by the agent")  # fmt: skip
+    console.print(f"next: `articles show {outcome.article_id}` · `articles approve {outcome.article_id}` · `articles publish {outcome.article_id}`")  # fmt: skip
+
+
 @articles_cli.command("resume")
 def resume_article(article_id: int, json_output: bool = typer.Option(False, "--json")) -> None:
     """Continue a failed or interrupted article from its first unfinished step (earlier
@@ -1667,6 +1717,8 @@ def show_article(
         console.print(f"[bold]#{detail.id} {escape(detail.title)}[/bold] · {detail.status.value}")
         console.print(f"opportunity #{detail.opportunity_id} ({detail.opportunity_status}) · attempt {detail.attempt} · assessment {detail.assessment_id} · company profile v{detail.company_profile_version}")  # fmt: skip
         console.print(f"slug: {detail.slug} · {detail.content_type.value} · audience: {escape(detail.target_audience or '—')} · intent: {detail.search_intent.value if detail.search_intent else '—'} · words: {detail.word_count or '—'} · tokens: {detail.tokens_used:,} of {detail.token_budget:,}")  # fmt: skip
+        if detail.origin is ArticleOrigin.IMPORTED:
+            console.print("[yellow]written by a person and imported[/yellow] (`articles import`): its length, citations, structure and the site's MDX contract were checked; it was [bold]not[/bold] fact-checked, originality-checked or scored by the agent")  # fmt: skip
         done = {s.value for s in detail.progress.completed_steps}
         console.print("progress: " + " → ".join(f"{s}{' ✓' if s in done else ''}" for s in ("brief", "research", "outline", "draft", "edit")) + f" ({detail.progress.percent}%)")  # fmt: skip
         table = Table("Step", "Status", "Prompt", "Model", "Calls", "Tokens", "Finished", "Error")
@@ -1751,7 +1803,7 @@ def article_versions_cmd(
                 if json_output:
                     sys.stdout.write(detail.model_dump_json(indent=2) + "\n")
                     return
-                console.print(f"[bold]{detail.kind.value} v{detail.number}[/bold] · {detail.prompt_version} · {detail.model} · {len(detail.citations)} citation(s)")  # fmt: skip
+                console.print(f"[bold]{detail.kind.value} v{detail.number}[/bold] · {detail.prompt_version} · {detail.model or ('written by a person' if detail.authored else '—')} · {len(detail.citations)} citation(s)")  # fmt: skip
                 if detail.reason:
                     console.print(f"  reason: {escape(detail.reason)} · issues addressed: {', '.join(detail.issues_addressed) or '—'}")  # fmt: skip
                 for change in detail.changes:
@@ -1769,7 +1821,7 @@ def article_versions_cmd(
             return
         table = Table("ID", "Kind", "No.", "Parent", "Current", "Words", "Issues", "Prompt", "Model", "Created", "Title")  # fmt: skip
         for r in rows:
-            table.add_row(str(r.id), r.kind.value, str(r.number), str(r.parent_version_id or "—"), "yes" if r.current else "", str(r.word_count or "—"), str(r.issues), r.prompt_version or "—", r.model or "—", f"{r.created_at:%Y-%m-%d %H:%M}", escape(r.title[:50]))  # fmt: skip
+            table.add_row(str(r.id), r.kind.value, str(r.number), str(r.parent_version_id or "—"), "yes" if r.current else "", str(r.word_count or "—"), str(r.issues), r.prompt_version or "—", r.model or ("by hand" if r.authored else "—"), f"{r.created_at:%Y-%m-%d %H:%M}", escape(r.title[:50]))  # fmt: skip
         console.print(table)
 
     _run_db(work)
@@ -1906,14 +1958,19 @@ def article_quality_cmd(
             console.print(f"Not validated yet: `articles validate {article_id}`.")
             return
         verdict = "[green]passes every gate[/green]" if report.passed else "[yellow]needs review[/yellow]"  # fmt: skip
-        console.print(f"version {report.version_id} ({report.version_kind} v{report.version_number}) · score [bold]{report.overall_score:.1f}[/bold]/100 · {verdict}")  # fmt: skip
-        table = Table("Component", "Weight", "Value", "Points", "Detail")
-        for c in report.breakdown:
-            table.add_row(c.dimension, f"{c.max_points:g}", f"{c.value:.2f}", f"{c.points:.1f}", escape(c.detail))  # fmt: skip
-        console.print(table)
-        gates = Table("Gate", "Passed", "Detail")
+        score = "written by a person: no agent score" if report.authored else f"score [bold]{report.overall_score:.1f}[/bold]/100"  # fmt: skip
+        console.print(f"version {report.version_id} ({report.version_kind} v{report.version_number}) · {score} · {verdict}")  # fmt: skip
+        if report.authored:
+            console.print("[yellow]authored report[/yellow]: the article was written by a person and imported. The deterministic checks ran; the gates that need Gemini are recorded as not run and nothing here claims a fact-check.")  # fmt: skip
+        if report.breakdown:
+            table = Table("Component", "Weight", "Value", "Points", "Detail")
+            for c in report.breakdown:
+                table.add_row(c.dimension, f"{c.max_points:g}", f"{c.value:.2f}", f"{c.points:.1f}", escape(c.detail))  # fmt: skip
+            console.print(table)
+        gates = Table("Gate", "Result", "Detail")
         for g in report.gates:
-            gates.add_row(g.name, "[green]yes[/green]" if g.passed else "[red]no[/red]", escape(g.detail))  # fmt: skip
+            result = {GateStatus.PASSED: "[green]yes[/green]", GateStatus.FAILED: "[red]no[/red]", GateStatus.NOT_RUN: "[yellow]not run[/yellow]"}[g.state]  # fmt: skip
+            gates.add_row(g.name, result, escape(g.detail))
         console.print(gates)
         if report.issues:
             console.print(f"[bold]Issues[/bold] ({len(report.issues)}, most serious first)")

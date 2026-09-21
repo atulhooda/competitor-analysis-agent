@@ -138,6 +138,14 @@ approved opportunity → brief (deterministic) → research (Google Search + URL
 **Phase 5 generates drafts but does not publish them.** See
 [Article drafts](#article-drafts).
 
+**Articles you write yourself.** `articles import <file>` turns one Markdown file with YAML
+frontmatter into a `ready` article that goes through the same publishing machinery. It needs
+no Gemini. What can be checked without it is checked (length, citations, structure, the site's
+MDX contract); the fact-check, originality and judge gates are recorded as **not run**, and
+the article, its version, the pull request and the publication record all say the piece was
+written by a person and not machine-fact-checked. See
+[Importing an article you wrote](#importing-an-article-you-wrote).
+
 **Article validation (Phase 6).** Checks a completed draft and prepares it for a person to
 publish:
 
@@ -357,6 +365,11 @@ uv run python -m app articles versions 1             # outline, draft and edited
 uv run python -m app articles steps 1                # the checkpoint log (fingerprints, prompts, tokens)
 uv run python -m app articles resume 1               # continue from the first unfinished step
 uv run python -m app articles cancel 1               # stop for good
+
+# An article you wrote yourself (no Gemini; nothing is published)
+uv run python -m app articles import drafts/my-post.md          # → a ready article + its own opportunity
+uv run python -m app articles import drafts/my-post.md --opportunity 12   # attach it to an existing one
+uv run python -m app articles import drafts/my-post.md --json   # ids, slug, word count, what it did
 
 # Article validation (needs GEMINI_API_KEY; nothing is published)
 uv run python -m app articles validate 1             # fact-check, originality, SEO, score, revise → ready / needs_review
@@ -917,6 +930,143 @@ fails the step, and a resume retries it.
   decides the exact queries. The queries it ran are recorded.
 - **One language.** Articles are written in English.
 
+## Importing an article you wrote
+
+Not every post has to be written by Gemini. `articles import` takes one Markdown file you
+wrote yourself and turns it into a `ready` article that goes through **the same** publishing
+machinery as a generated one: the site's MDX contract, the cover image, the pull request, the
+merge, the live check, the publication record and its idempotency. It needs no Gemini key and
+makes no LLM call. It publishes nothing: `articles approve` and `articles publish` still do.
+
+### The file
+
+YAML frontmatter, then the body in Markdown:
+
+```markdown
+---
+title: How small support teams hand work to AI agents
+description: A practical guide to splitting customer support work between an AI agent and the people who own the hard cases.
+primary_keyword: AI agents for customer support
+target_audience: founders
+content_type: guide            # guide | listicle | comparison | research | tutorial | article
+tags:                          # 3 to 6; lowercased when published
+  - ai agents
+  - customer support
+  - handoff
+slug: ai-agents-customer-support-handoff   # optional: derived from the title otherwise
+sources:                       # one per [S…] marker the body uses; at least one
+  - label: S1
+    title: Zendesk CX Trends
+    url: https://example.com/cx-trends
+  - label: S2
+    title: Intercom support benchmark
+    url: https://example.org/benchmark
+---
+
+Support teams of three or four people carry the same ticket volume as teams twice their
+size, and the difference is almost always where the work is split. An AI agent that answers
+the repetitive half of the queue buys a small team the hours it needs [S1].
+
+## What an agent should answer first
+
+Start with the tickets that already have one correct answer: order status, password resets,
+plan changes [S2].
+
+- Order and delivery status
+- Password and login problems
+
+### The rule of the single source
+
+An agent is only as good as the page it reads from. Keep one canonical help centre article
+per answer and let the agent quote it.
+
+## Designing the handoff
+
+The handoff is the part teams get wrong, so the agent hands over the whole conversation, its
+own confidence and the article it used [S1].
+
+1. The agent says it is handing over, by name
+2. The transcript lands in the ticket
+```
+
+- **Structure.** Paragraphs before the first `##` are the introduction (the site renders the
+  title, so the body has no H1); every `##` opens a section; `###` is a subheading; `-`/`*`
+  and `1.` are lists; a wrapped line continues its paragraph or list item.
+- **Citations.** `[S1]` marks the source of the claim it follows, exactly as the writing step
+  marks one. Each label must be defined in `sources`, and each listed source must be cited.
+  When the post is published, a marker becomes an inline link to that page.
+- **Prose, not markup.** The body is escaped before it reaches the site, so a file containing
+  a tag (`<BlogCTA />`), a brace (`{…}`) or an `import`/`export` line is refused rather than
+  published as literal text. Inline Markdown (`**bold**`, links) is not interpreted either.
+- **It is parsed into the same `ArticleContent`** the writing step produces, so everything
+  downstream — rendering, the MDX file, the cover, the pull request — is unchanged.
+
+### What the import creates
+
+In one transaction:
+
+- an **opportunity of its own**, key `manual:<label key of the title>`, approved, scored by
+  strategic fit to your company profile, with the profile as its evidence and a `created`
+  event by the actor `import` — or the opportunity you name with `--opportunity <id>`
+  (`new` and `reviewed` ones are approved, since a person decided to write the piece);
+- the **article** (origin `imported`, status `ready`) with its deterministic brief, one
+  **final version** (recommended) with its sources and claim → source citations, and the
+  **step rows** that say where it came from: prompt version `import/1`, no LLM call, no token
+  (there are no outline and draft steps, because those steps never happened);
+- an **authored quality report**.
+
+### The authored quality report
+
+The checks this project can run without Gemini are run and recorded as gates that pass:
+`content_valid` (`ARTICLE_MIN_WORDS`, sections, headings, no empty block), `citation_integrity`
+(every `[S…]` resolves, at least one source), `mdx_safe` (the file is composed exactly as
+publishing would compose it and checked with the site's own safety check), and `seo_fields`
+(keyword, meta title, meta description and slug, from the frontmatter).
+
+The gates that need Gemini — `no_contradicted_claims`, `unsupported_claims`, `uncited_claims`,
+`originality` and the `minimum_score` they feed — are recorded as **not run**, with the reason
+*"written by a person, not fact-checked by the agent"*. There is no combined score, and none is
+invented: `articles quality` prints "written by a person: no agent score".
+
+**It is not a loophole.** An authored report is valid only on an imported article, and
+`app/services/approval_rules.py` says so as a first-class rule, checked on every approval and
+again immediately before the CMS is called:
+
+- a report marked `authored` on an article whose origin is `generated` blocks approval and
+  publication ("it must pass its own gates");
+- a gate recorded as *not run* in a report that is **not** marked `authored` blocks them too,
+  so the marker alone can never buy a generated article a pass.
+
+The agent also never rewrites an imported article: `articles resume` and `articles generate
+--regenerate` refuse it and point back at the file.
+
+### Provenance
+
+Nothing claims a fact-check that never happened:
+
+- `articles show` and `articles import` say the article was written by a person and what was
+  and was not checked; `articles quality` marks the report as authored and prints each Gemini
+  gate as *not run*; `articles versions` shows the version's prompt version `import/1` and
+  "by hand" where a model would be;
+- `articles preflight` adds a non-blocking `provenance` check saying the same;
+- the publication record carries `details.authored`;
+- the **pull request** says: *"Written by hand and imported into the competitor-analysis
+  agent, which checked its length, its citations, its structure and this file against the
+  site's contract… It was **not** fact-checked, originality-checked or scored by the agent's
+  Gemini quality gates"*, and its quality line reads "none (written by a person, not scored by
+  the agent)".
+
+### Idempotency and limits
+
+- Importing the same file twice creates nothing the second time: the title's opportunity
+  already has a live article, which the command reports instead (versions are never
+  overwritten). Edit the piece, cancel the article, and import again for a new attempt.
+- The file is refused, with every problem named at once, when it is shorter than
+  `ARTICLE_MIN_WORDS`, cites a source it doesn't define, lists a source it never cites, has
+  no usable slug, or contains anything MDX would read as code.
+- An imported article can still be validated with Gemini (`articles validate`) once credits
+  allow: that produces an ordinary report which replaces the authored one.
+
 ## Article validation
 
 Phase 6 turns a completed draft into a checked, scored article that a person can publish.
@@ -1084,6 +1234,10 @@ is `ready` only if **every** gate passes; otherwise it is `needs_review`:
 | originality | a passage at or above `ORIGINALITY_MAX_OVERLAP` similarity |
 | seo_fields | primary keyword, meta title, meta description or slug missing |
 | minimum_score | score below `QUALITY_MIN_SCORE` (70) |
+
+A gate can also be recorded as **not run**, which only an *authored* report — the deterministic
+checks of an article a person wrote and imported — may do; see
+[Importing an article you wrote](#importing-an-article-you-wrote).
 
 ### Revisions and the recommended version
 
@@ -1287,6 +1441,10 @@ publication already in progress.
 - **Auto-approval** (`PUBLISH_AUTO_APPROVE`, off by default). A publish request for a ready
   article with no decision records an automatic approval (method `auto`). It never overrides
   a rejection, and it still needs an explicit publish request: nothing publishes by itself.
+- **Authored reports.** An article written by a person and imported carries a report whose
+  Gemini gates are recorded as not run; it is approvable and publishable, and only ever on an
+  imported article (see [Importing an article you wrote](#importing-an-article-you-wrote)).
+  The pull request and the publication record say the piece wasn't machine-fact-checked.
 
 ### WordPress setup (the earlier adapter, `CMS_PROVIDER=wordpress`)
 
@@ -1627,8 +1785,8 @@ PostgreSQL, managed with Alembic migrations (`migrations/`), in separate layers:
 | Normalized | `content_items`, `content_versions`, `change_events` | One row per URL (lifecycle + reliable dates); immutable snapshots; the change log |
 | Analysis (Phase 3) | `topics`, `topic_aliases`, `content_analyses`, `content_analysis_topics`, `change_summaries`, `competitor_profiles`, `landscape_reports` | Model-produced interpretations, each with its run, model and prompt version; profiles and reports stored with the metrics they were grounded on |
 | Recommendations (Phase 4) | `company_profiles`, `opportunities`, `opportunity_assessments`, `opportunity_evidence`, `opportunity_events` | Versioned company profiles; one opportunity per topic with its status; immutable scored assessments (breakdown, gaps, signals, suggestion, Gemini interpretation); the evidence each assessment rests on; the status and scoring timeline |
-| Generation (Phase 5) | `articles`, `article_steps`, `article_versions`, `article_sources`, `article_citations` | Article drafts linked to their opportunity, assessment and company profile version; the checkpoint log; immutable outline/draft/edited versions; retrieved research sources with their facts; claim → source citations. Never published |
-| Validation (Phase 6) | `article_claim_checks`, `article_originality_flags`, `article_quality_reports`; revision rows in `article_versions` | One verdict per (claim, cited source) and per uncited factual claim, with evidence and provenance; flagged passages with the page they overlap; each version's score, breakdown, gates and issues, linked to the steps it came from. The article points at its recommended version and report. Never published |
+| Generation (Phase 5) | `articles`, `article_steps`, `article_versions`, `article_sources`, `article_citations` | Article drafts linked to their opportunity, assessment and company profile version; the checkpoint log; immutable outline/draft/edited versions; retrieved research sources with their facts; claim → source citations. `articles.origin` says who wrote it (`generated`, or `imported` for a file a person wrote). Never published |
+| Validation (Phase 6) | `article_claim_checks`, `article_originality_flags`, `article_quality_reports`; revision rows in `article_versions` | One verdict per (claim, cited source) and per uncited factual claim, with evidence and provenance; flagged passages with the page they overlap; each version's score, breakdown, gates and issues, linked to the steps it came from; `authored` marks the deterministic report of an imported article, whose Gemini gates are recorded as not run. The article points at its recommended version and report. Never published |
 | Publishing (Phase 7) | `article_approvals`, `publications`, `publication_attempts`, `article_covers` | Decisions on an exact article version and quality report (never deleted; invalidated with a reason; one live per article); one publication per article version and CMS site (idempotency key, post id, URL, status, what was mapped, last preflight); every CMS change attempted and its outcome; one generated cover picture per article version, with the prompt, prompt version and model that made it. No credentials |
 | Scheduling (Phase 8) | `jobs`, `scheduler_state`; `publications.limit_day` | One row per execution (type, trigger, status, the scheduled time and its unique key, attempts, heartbeat, error kind, stage checkpoints and progress, the report; no secrets); the persisted pause switch; the local day an automated publication reserved |
 | Operations | `runs`, `run_events`, `llm_calls` | What ran, when, with what result (article runs carry `article_id`); every LLM call with its tokens |
@@ -1861,6 +2019,8 @@ app/
     research.py                search → URL screening → URL-context reading → sources and facts
     article_writing.py         outline, draft and editorial pass (Gemini)
     article_content.py         citations, completion checks, slugs, Markdown preview (no LLM)
+    article_file.py            the import file format: frontmatter + Markdown → ArticleContent
+    article_import.py          an article a person wrote → opportunity, article, authored report
     checkpoints.py             step fingerprints and checkpoint lookup (Phases 5 and 6)
     quality.py                 validation runs: steps, revision loop, best version, finish
     fact_check.py              claim verdicts, evidence checks, re-reads, uncited claims
