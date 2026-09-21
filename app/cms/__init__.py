@@ -9,6 +9,8 @@ publishing credentials; only publishing fails, with a clear ``CMSConfigurationEr
 """
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -87,6 +89,32 @@ class LazyCMS:
     @property
     def configuration_hint(self) -> str:
         return self._settings.cms_hint
+
+    @property
+    def presentation(self) -> str:
+        """What the target shows around the article: the byline, the closing line, the call
+        to action, the cover. It is configuration rather than content, but a post already
+        published still shows the old one until it is written again, so it belongs in the
+        fingerprint that decides whether there is anything to change."""
+        s = self._settings
+        data = {
+            "provider": s.cms_provider,
+            "author": [
+                s.publish_author_name,
+                s.publish_author_role,
+                s.publish_author_initials,
+                s.publish_author_linkedin,
+            ],
+            "byline": s.publish_byline,
+            "cta": [
+                s.publish_cta_title,
+                s.publish_cta_body,
+                s.publish_cta_label,
+                s.publish_cta_href,
+            ],
+            "cover": [s.publish_cover_images, s.cover_image_source, s.cover_image_url_prefix],
+        }
+        return hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
 
     def get(self) -> PublishingAdapter:
         if self._publisher is None:

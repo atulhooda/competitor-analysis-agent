@@ -197,6 +197,26 @@ async def test_publishing_the_same_version_again_changes_nothing(git: Git) -> No
     assert not result.created
 
 
+async def test_changing_the_byline_reaches_a_post_that_is_already_out(git: Git) -> None:
+    """The byline, the closing line and the call to action come from configuration rather
+    than from the article. A post already published keeps showing the old one until it is
+    written again, so changing one has to count as something to change."""
+    await git.approve()
+    await git.publish()
+    [pr] = git.gh.open_pulls()
+    before = git.gh.file(pr.head.removeprefix("blog/"), branch=pr.head) or ""
+    assert "author: 'Engageo Team'" in before
+
+    result, outcome = await git.publish(publish_author_name="Atul Hooda", publish_author_role="CTO", publish_author_initials="AH")  # fmt: skip
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert outcome.action == "update"  # not "none": the reader would still see the old one
+    after = git.gh.file(pr.head.removeprefix("blog/"), branch=pr.head) or ""
+    assert "author: 'Atul Hooda'" in after
+    assert "authorRole: 'CTO'" in after
+    assert len(git.gh.pulls) == 1  # the same pull request, never a second one
+    assert not result.created
+
+
 async def test_publishing_publicly_merges_and_verifies_the_live_page(git: Git) -> None:
     await git.approve()
     result, outcome = await git.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True)

@@ -672,7 +672,11 @@ class PublishingService:
         doc = render_article(snap.content, sources=snap.sources, seo=snap.seo.package if snap.seo else None, allowed_internal=snap.allowed_internal, allowed_external=snap.allowed_external)  # fmt: skip
         # Provenance the target may show (a pull request description): no secret, no id
         # the reader can't use.
-        return doc.model_copy(update={"article_id": snap.article.id, "version_id": snap.version.id if snap.version else None, "content_type": snap.article.content_type, "quality_score": snap.report.overall_score if snap.report else None, "opportunity_title": snap.opportunity_title})  # fmt: skip
+        # The byline, the closing line, the call to action and the cover come from
+        # configuration, not from the article: without them in the hash, changing one leaves
+        # every published post showing the old one, and a republish reports nothing to do.
+        content_hash = hashlib.sha256(f"{doc.content_hash}:{self._cms.presentation}".encode()).hexdigest()  # fmt: skip
+        return doc.model_copy(update={"article_id": snap.article.id, "version_id": snap.version.id if snap.version else None, "content_type": snap.article.content_type, "quality_score": snap.report.overall_score if snap.report else None, "opportunity_title": snap.opportunity_title, "content_hash": content_hash})  # fmt: skip
 
     # ── preflight ────────────────────────────────────────────────────────────
 
