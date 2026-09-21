@@ -1,7 +1,9 @@
 # Running the agent on Railway
 
-The agent then writes and publishes on its own schedule, whether or not your laptop is on.
-One always-on worker process, one PostgreSQL database, no web service needed.
+**This is deployed.** Project `engageo-content-agent`
+(https://railway.com/project/4f55650a-69f2-4b0d-a0e8-cca9bd56b063): one always-on worker
+and one PostgreSQL database, both running, with the local database restored into it.
+What follows is how it was set up and how to change it.
 
 ```
 Railway project
@@ -88,7 +90,23 @@ From this Mac, with the project's local database running:
 
 Then redeploy the service so `alembic upgrade head` runs against it.
 
-## 4. Check it works
+## 4. Day to day
+
+```bash
+railway logs --service content-agent        # what the worker is doing
+railway variables --service content-agent   # every setting (values included: careful)
+railway up --service content-agent          # deploy the working directory as it is
+railway connect Postgres                    # a psql shell on the live database
+```
+
+`.railwayignore` keeps `.env` and the local YAML out of anything uploaded; the image reads
+configuration from Railway's variables alone.
+
+The database has **no public endpoint**. To reach it from a laptop, add one
+(`railway tcp-proxy create --service Postgres --port 5432`), do the work, then remove it
+(`railway tcp-proxy delete <id> --service Postgres`).
+
+## 5. Check it works
 
 - **Logs** (service → *Deployments* → *View logs*): `worker.started` with the schedule, then
   at 14:00 IST `job.started … full_pipeline`.
@@ -97,13 +115,13 @@ Then redeploy the service so `alembic upgrade head` runs against it.
   `railway run python -m app schedule status`.
 - **What it published**: `railway run python -m app articles list` and your blog.
 
-## 5. Cost
+## 6. Cost
 
 Railway bills the container and the database by usage: roughly $5–10/month for a worker
 this small plus Postgres. Gemini is billed separately by Google and is the larger number at
 10+ articles a day.
 
-## Keeping the laptop copy
+## The laptop copy
 
 Once Railway runs the schedule, **turn the Mac worker off** so two workers don't race:
 

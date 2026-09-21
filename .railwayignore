@@ -1,0 +1,12 @@
+# Never upload local configuration or secrets to the builder: the image takes everything
+# from environment variables (see deploy/RAILWAY.md).
+.env
+.env.*
+!.env.example
+config/*.yaml
+!config/*.example.yaml
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
