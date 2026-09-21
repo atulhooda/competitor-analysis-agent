@@ -65,6 +65,9 @@ class FakeGitHub:
     # branch → {path: bytes}: the files that aren't text (cover images).
     blobs: dict[str, dict[str, bytes]] = field(default_factory=dict)
     branch_heads: dict[str, str] = field(default_factory=dict)
+    # The base branch's head when a branch was created or reset: what tells a branch that
+    # is merely ahead from one left behind by a squash merge ("diverged").
+    branch_bases: dict[str, str] = field(default_factory=dict)
     pulls: dict[int, FakePullRequest] = field(default_factory=dict)
     deployments: list[FakeDeployment] = field(default_factory=list)
     # How a deployment goes once created: "success" (default), "failure", "pending"
@@ -123,6 +126,8 @@ class FakeGitHub:
             ("GET", rf"^{r}/branches/(?P<branch>[^/]+)$", self._get_branch),
             ("GET", rf"^{r}/git/ref/heads/(?P<branch>.+)$", self._get_ref),
             ("POST", rf"^{r}/git/refs$", self._create_ref),
+            ("PATCH", rf"^{r}/git/refs/heads/(?P<branch>.+)$", self._update_ref),
+            ("GET", rf"^{r}/compare/(?P<spec>.+)$", self._compare),
             ("GET", rf"^{r}/contents/(?P<path>.+)$", self._get_contents),
             ("PUT", rf"^{r}/contents/(?P<path>.+)$", self._put_contents),
             ("GET", rf"^{r}/pulls$", self._list_pulls),
@@ -204,6 +209,7 @@ class FakeGitHub:
         self.trees[branch] = dict(self.trees[source])
         self.blobs[branch] = dict(self.blobs.get(source, {}))
         self.branch_heads[branch] = self.branch_heads[source]
+        self.branch_bases[branch] = self.branch_heads[BASE]
         if failure == "lost":
             raise httpx.ReadTimeout("timed out after the branch was created (fake)", request=request)  # fmt: skip
         return httpx.Response(201, json={"ref": body["ref"], "object": {"sha": self.branch_heads[branch]}})  # fmt: skip
@@ -322,6 +328,8 @@ class FakeGitHub:
         body = json.loads(request.content)
         if body.get("merge_method") != "squash":
             return _error(405, "Merge method not allowed")
+        if self._status_of(pr.head) == "diverged":
+            return _error(405, "Pull Request has merge conflicts")
         self.trees[pr.base].update(self.trees[pr.head])
         self.blobs.setdefault(pr.base, {}).update(self.blobs.get(pr.head, {}))
         sha = self._sha(f"merge{pr.number}")
@@ -331,6 +339,49 @@ class FakeGitHub:
         if failure == "lost":
             raise httpx.ReadTimeout("timed out after the merge (fake)", request=request)
         return httpx.Response(200, json={"sha": sha, "merged": True, "message": "Pull Request successfully merged"})  # fmt: skip
+
+    def _status_of(self, branch: str) -> str:
+        """What GitHub's compare endpoint would say about ``base...branch``."""
+        if branch == BASE or branch not in self.trees:
+            return "identical"
+        head, base = self.branch_heads[branch], self.branch_heads[BASE]
+        if head == base:
+            return "identical"
+        cut = self.branch_bases.get(branch, base)
+        own = head != cut  # commits of its own
+        if cut == base:
+            return "ahead" if own else "identical"
+        return "diverged" if own else "behind"
+
+    def _compare(self, request: httpx.Request, spec: str) -> httpx.Response:
+        failure = self._injected("compare")
+        if failure is not None:
+            return self._failure(failure, request)
+        base, _, head = spec.partition("...")
+        if head not in self.trees or base not in self.trees:
+            return _error(404, "Not Found")
+        return httpx.Response(200, json={"status": self._status_of(head), "ahead_by": 0, "behind_by": 0})  # fmt: skip
+
+    def _update_ref(self, request: httpx.Request, branch: str) -> httpx.Response:
+        """Moving a branch, as `git push --force` does: the tree comes with it."""
+        failure = self._injected("update_ref")
+        if failure is not None:
+            return self._failure(failure, request)
+        if branch not in self.trees:
+            return _error(404, "Not Found")
+        if not self.push:
+            return _error(403, "Resource not accessible by personal access token")
+        body = json.loads(request.content)
+        sha = str(body["sha"])
+        source = next((b for b, head in self.branch_heads.items() if head == sha), None)
+        if source is None:
+            return _error(422, "Object does not exist")
+        self.trees[branch] = dict(self.trees[source])
+        self.blobs[branch] = dict(self.blobs.get(source, {}))
+        self.branch_heads[branch] = sha
+        self.branch_bases[branch] = self.branch_heads[BASE]
+        self.mutations.append(("PATCH", f"git/refs/heads/{branch}"))
+        return httpx.Response(200, json={"ref": f"refs/heads/{branch}", "object": {"sha": sha}})
 
     # ── deployments (what Vercel reports to GitHub) ──────────────────────────
 

@@ -441,7 +441,7 @@ class GitHubPublishingAdapter:
     async def _ensure_branch(self, branch: str) -> str:
         ref = await self._gh.get_optional(f"repos/{self._repo}/git/ref/heads/{branch}")
         if ref is not None:
-            return str(ref["object"]["sha"])
+            return await self._fresh_branch(branch, str(ref["object"]["sha"]))
         base = await self._gh.get(f"repos/{self._repo}/git/ref/heads/{self._base}")
         sha = str(base["object"]["sha"])
         try:
@@ -452,6 +452,23 @@ class GitHubPublishingAdapter:
         log.info("github.branch", repo=self._repo, branch=branch, base=self._base)
         ref = await self._gh.get(f"repos/{self._repo}/git/ref/heads/{branch}")
         return str(ref["object"]["sha"])
+
+    async def _fresh_branch(self, branch: str, head: str) -> str:
+        """A branch left behind by an earlier squash merge holds commits the base branch's
+        history doesn't, so anything written on it now can't be merged back ("merge
+        conflicts"). With no pull request open on it, it is taken back to the base branch
+        first; with one open, it is left exactly as it is — that branch is under review."""
+        if await self._open_pr(branch) is not None:
+            return head
+        comparison = await self._gh.get(f"repos/{self._repo}/compare/{self._base}...{branch}")
+        status = str(comparison.get("status") or "")
+        if status not in ("behind", "diverged"):
+            return head
+        base = await self._gh.get(f"repos/{self._repo}/git/ref/heads/{self._base}")
+        sha = str(base["object"]["sha"])
+        await self._gh.patch(f"repos/{self._repo}/git/refs/heads/{branch}", {"sha": sha, "force": True})  # fmt: skip
+        log.info("github.branch_reset", repo=self._repo, branch=branch, base=self._base, was=status)  # fmt: skip
+        return sha
 
     async def _ensure_cover(self, branch: str, payload: dict[str, Any]) -> None:
         """The post's cover picture on its own branch, committed at most once.

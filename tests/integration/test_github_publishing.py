@@ -197,6 +197,25 @@ async def test_publishing_the_same_version_again_changes_nothing(git: Git) -> No
     assert not result.created
 
 
+async def test_a_post_can_be_changed_after_it_went_live(git: Git) -> None:
+    """The branch of a merged post still holds the commit the squash merge left behind, so
+    anything written on it afterwards can no longer be merged ("merge conflicts"). The
+    branch is taken back to the base branch first, and the change reaches the site."""
+    await git.approve()
+    await git.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True)
+    branch = git.gh.pulls[61].head
+    assert git.gh._status_of(branch) == "diverged"  # what the squash merge left behind
+
+    _, outcome = await git.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True, publish_author_name="Atul Hooda", publish_author_role="CTO", publish_author_initials="AH")  # fmt: skip
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert outcome.status is PublicationStatus.PUBLISHED
+    live = git.gh.file(branch.removeprefix("blog/")) or ""  # on the base branch
+    assert "author: 'Atul Hooda'" in live
+    assert "authorRole: 'CTO'" in live
+    assert "updatedAt:" in live  # and the original publishedAt is kept
+    assert sum(1 for p in git.gh.pulls.values() if p.merged_at) == 2  # the follow-up merged
+
+
 async def test_changing_the_byline_reaches_a_post_that_is_already_out(git: Git) -> None:
     """The byline, the closing line and the call to action come from configuration rather
     than from the article. A post already published keeps showing the old one until it is
