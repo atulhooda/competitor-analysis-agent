@@ -18,7 +18,7 @@ from app.config import Settings
 from app.db.models import Article, Opportunity, OpportunityAssessment, OpportunityEvidence
 from app.domain.jobs import JobStatus, JobTrigger, JobType, JobView
 from app.domain.opportunities import InterpretationConfig, OpportunityStatus, ScoringConfig
-from app.llm import LazyLLM
+from app.llm import LazyLLM, WritingRouter
 from app.prompts.seo import SEOOut
 from app.scheduling.runtime import Scheduling, build_scheduling
 from app.services.analysis import AnalysisService
@@ -31,7 +31,7 @@ from app.services.pipeline import PipelineServices
 from app.services.publishing import PublishingService
 from app.services.quality import QualityService
 from app.services.scans import ScanService
-from tests.fakellm import _seo
+from tests.fakellm import FakeLLM, _seo
 from tests.fakesite import make_settings, public_resolver
 from tests.fakewordpress import BASE, PASSWORD, USERNAME, FakeWordPress
 from tests.pipeline import Env
@@ -73,10 +73,13 @@ class Rig:
         values = {**self.DEFAULTS, **overrides}
         return make_settings(database_url=self.env.settings.database_url.get_secret_value(), **values)  # fmt: skip
 
-    def scheduling(self, **overrides: Any) -> Scheduling:
+    def scheduling(self, *, claude: FakeLLM | None = None, **overrides: Any) -> Scheduling:
+        """``claude`` gives article generation a second writer (WRITING_PROVIDER routes to
+        it, and a Gemini failure no retry fixes falls back to it)."""
         s = self.settings(**overrides)
         env = self.env
         llm = LazyLLM(s, provider=env.fake)
+        writers = WritingRouter(s, llm, LazyLLM(s, provider=claude, name="claude") if claude else None)  # type: ignore[arg-type]  # fmt: skip
         covers = CoverService(env.sessions, s, llm, now=env.wall)
         cms = LazyCMS(s, sleep=no_sleep, covers=covers)
         engine: Any = env.engine
@@ -87,7 +90,13 @@ class Rig:
                 engine, env.sessions, llm, s, now=env.wall, scoring=SCORING
             ),
             articles=ArticleService(
-                engine, env.sessions, llm, s, now=env.wall, resolver=public_resolver
+                engine,
+                env.sessions,
+                llm,
+                s,
+                now=env.wall,
+                resolver=public_resolver,
+                writers=writers,
             ),
             quality=QualityService(
                 engine, env.sessions, llm, s, now=env.wall, resolver=public_resolver
@@ -109,8 +118,8 @@ class Rig:
         )
         return build_scheduling(engine, env.sessions, s, services, now=env.wall, heartbeat_seconds=3_600)  # fmt: skip
 
-    async def run(self, job_type: JobType = JobType.FULL_PIPELINE, *, trigger: JobTrigger = JobTrigger.CLI, dry_run: bool = False, **overrides: Any) -> JobView:  # fmt: skip
-        jobs = self.scheduling(**overrides).jobs
+    async def run(self, job_type: JobType = JobType.FULL_PIPELINE, *, trigger: JobTrigger = JobTrigger.CLI, dry_run: bool = False, claude: FakeLLM | None = None, **overrides: Any) -> JobView:  # fmt: skip
+        jobs = self.scheduling(claude=claude, **overrides).jobs
         view, _ = await jobs.enqueue(job_type, trigger=trigger, dry_run=dry_run)
         return await jobs.run(view.id)
 

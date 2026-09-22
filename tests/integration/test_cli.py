@@ -359,6 +359,8 @@ def test_article_commands(configured: Path, monkeypatch: pytest.MonkeyPatch, tmp
     assert articles[0]["status"] == "completed"
     shown = runner.invoke(cli, ["articles", "show", article])
     assert shown.exit_code == 0, shown.output
+    assert "written by: gemini" in shown.output  # which provider wrote it, always shown
+    assert "fell back" not in shown.output  # nothing to fall back from here
     assert "edited article (preview; not published)" in shown.output
     assert "## Sources" in shown.output
     assert "article-edit/1" in shown.output

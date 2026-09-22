@@ -34,7 +34,7 @@ from app.db import (
 )
 from app.db.session import SessionFactory, create_engine, create_session_factory
 from app.domain.analysis import MixShift, Share, TopicTrend
-from app.domain.articles import ArticleBrief, ArticleOrigin, ArticleStatus
+from app.domain.articles import ArticleBrief, ArticleOrigin, ArticleRunView, ArticleStatus
 from app.domain.competitor_profile import Claim
 from app.domain.content import ContentType
 from app.domain.history import ChangeType, RunStatus, RunTrigger
@@ -1692,6 +1692,11 @@ def list_articles_cmd(
     _run_db(work)
 
 
+def _writer_fallbacks(runs: list[ArticleRunView]) -> list[str]:
+    """Every provider handover the article's runs recorded, oldest first."""
+    return [str(note) for run in runs for note in run.summary.get("writer_fallbacks") or []]
+
+
 @articles_cli.command("show")
 def show_article(
     article_id: int,
@@ -1717,6 +1722,8 @@ def show_article(
         console.print(f"[bold]#{detail.id} {escape(detail.title)}[/bold] · {detail.status.value}")
         console.print(f"opportunity #{detail.opportunity_id} ({detail.opportunity_status}) · attempt {detail.attempt} · assessment {detail.assessment_id} · company profile v{detail.company_profile_version}")  # fmt: skip
         console.print(f"slug: {detail.slug} · {detail.content_type.value} · audience: {escape(detail.target_audience or '—')} · intent: {detail.search_intent.value if detail.search_intent else '—'} · words: {detail.word_count or '—'} · tokens: {detail.tokens_used:,} of {detail.token_budget:,}")  # fmt: skip
+        if detail.origin is not ArticleOrigin.IMPORTED:
+            console.print(f"written by: {detail.writer.value if detail.writer else '—'}" + "".join(f"\n  [yellow]fell back[/yellow] · {escape(note)}" for note in _writer_fallbacks(detail.runs)))  # fmt: skip
         if detail.origin is ArticleOrigin.IMPORTED:
             console.print("[yellow]written by a person and imported[/yellow] (`articles import`): its length, citations, structure and the site's MDX contract were checked; it was [bold]not[/bold] fact-checked, originality-checked or scored by the agent")  # fmt: skip
         done = {s.value for s in detail.progress.completed_steps}
@@ -1768,6 +1775,7 @@ def article_sources_cmd(
     async def work(_: AsyncEngine, sessions: SessionFactory) -> None:
         async with sessions() as session:
             rows = await article_queries.get_sources(session, article_id, include_all=all_runs)
+            notes = await article_queries.research_notes(session, article_id)
         if rows is None:
             err.print(f"[red]Unknown article {article_id}[/red]")
             raise typer.Exit(code=2)
@@ -1781,6 +1789,8 @@ def article_sources_cmd(
         console.print(table if rows else "No sources (research hasn't run yet).")
         if any(r.attribution_required for r in rows):
             console.print("[dim]* competitor or company source: its facts may only be stated with attribution[/dim]")  # fmt: skip
+        for note in notes:  # how the research went: searches, rejected calls, budgets
+            console.print(f"[dim]· {escape(note)}[/dim]")
 
     _run_db(work)
 

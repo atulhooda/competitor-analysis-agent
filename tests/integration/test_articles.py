@@ -33,7 +33,14 @@ from app.db.session import create_session_factory
 from app.domain.articles import ArticleStatus, ResearchResult
 from app.domain.history import RunStatus, RunTrigger
 from app.domain.opportunities import EvidenceKind, OpportunityStatus
-from app.llm import LazyLLM, LLMRateLimitError, LLMResponseError
+from app.llm import (
+    LazyLLM,
+    LLMBillingError,
+    LLMRateLimitError,
+    LLMRequestRejectedError,
+    LLMResponseError,
+    WritingRouter,
+)
 from app.prompts import article_edit, article_outline
 from app.prompts.article_common import SECURITY
 from app.prompts.article_draft import ArticleContentOut
@@ -49,7 +56,8 @@ from app.services.articles import (
     OpportunityNotApprovedError,
 )
 from app.services.opportunities import OpportunityNotFoundError, OpportunityService
-from tests.fakellm import INJECTION, FakeLLM
+from app.services.research import MAX_URLS_PER_CALL
+from tests.fakellm import FOLLOW_UP, INJECTION, FakeLLM
 from tests.fakellm import _outline as fake_outline
 from tests.fakesite import NOW, FakeClock, acme_competitor, make_settings, public_resolver
 from tests.pipeline import Env, WallClock
@@ -73,15 +81,18 @@ class World:
     def fake(self) -> FakeLLM:
         return self.env.fake
 
-    def service(self, **settings: Any) -> ArticleService:
+    def service(self, *, claude: FakeLLM | None = None, **settings: Any) -> ArticleService:
+        """``claude`` gives the service a second writer; without it only Gemini exists,
+        which is what every other test here runs with."""
         s: Settings = make_settings(database_url=self.env.settings.database_url.get_secret_value(), **settings) if settings else self.env.settings  # fmt: skip
-        return ArticleService(self.env.engine, self.env.sessions, LazyLLM(s, provider=self.fake), s, now=self.env.wall, resolver=public_resolver)  # type: ignore[arg-type]  # fmt: skip
+        writers = WritingRouter(s, LazyLLM(s, provider=self.fake), LazyLLM(s, provider=claude, name="claude") if claude else None)  # type: ignore[arg-type]  # fmt: skip
+        return ArticleService(self.env.engine, self.env.sessions, LazyLLM(s, provider=self.fake), s, now=self.env.wall, resolver=public_resolver, writers=writers)  # type: ignore[arg-type]  # fmt: skip
 
     def opportunities(self) -> OpportunityService:
         return OpportunityService(self.env.engine, self.env.sessions, LazyLLM(self.env.settings, provider=self.fake), self.env.settings, now=self.env.wall)  # type: ignore[arg-type]  # fmt: skip
 
-    async def generate(self, **settings: Any) -> tuple[ArticleRequestResult, ArticleOutcome]:
-        result, outcome = await self.service(**settings).generate(self.opportunity_id, trigger=RunTrigger.CLI)  # fmt: skip
+    async def generate(self, *, claude: FakeLLM | None = None, **settings: Any) -> tuple[ArticleRequestResult, ArticleOutcome]:  # fmt: skip
+        result, outcome = await self.service(claude=claude, **settings).generate(self.opportunity_id, trigger=RunTrigger.CLI)  # fmt: skip
         assert outcome is not None, result.message
         return result, outcome
 
@@ -159,7 +170,9 @@ async def test_an_approved_opportunity_becomes_a_researched_cited_edited_article
         assert (source.article_id, source.step_id) == (article.id, article.research_step_id)
         assert citation.claim
         assert "[S" not in citation.claim
-    assert purposes == sorted(["article_research"] * 3 + ["article_outline", "article_draft", "article_edit"])  # fmt: skip
+    # One search and one page-reading call: the second reading call stays unspent, in case
+    # the pass comes up short of sources and a second search is needed.
+    assert purposes == sorted(["article_research"] * 2 + ["article_outline", "article_draft", "article_edit"])  # fmt: skip
 
 
 async def test_research_screens_urls_and_records_why_each_was_or_wasnt_used(world: World) -> None:  # fmt: skip
@@ -178,7 +191,7 @@ async def test_research_screens_urls_and_records_why_each_was_or_wasnt_used(worl
     assert ("skipped", "duplicate of another candidate") in handoff  # the ?utm_source= copy
     assert research.search_queries == ["ai agents human handoff guidelines", "ai support agents resolution study"]  # fmt: skip
     assert [q.id for q in research.questions] == ["Q1", "Q2", "Q3"]
-    assert research.calls == {"discover": 1, "read": 2}
+    assert research.calls == {"discover": 1, "read": 1}  # one call is kept for a follow-up
     assert {s.url for s in research.sources} == RETRIEVED
     assert all(f.source in {s.label for s in research.sources} for f in research.facts)
     [discover] = world.fake.calls(DiscoverOut)
@@ -431,6 +444,119 @@ async def test_research_without_usable_sources_fails_and_keeps_what_it_found(wor
     assert world.fake.calls(OutlineOut) == []  # nothing is written without research
 
 
+REJECTED = LLMRequestRejectedError(
+    "Gemini rejected this request (HTTP 400): {'error': {'message': 'Request contains an "
+    "invalid argument.', 'code': 'invalid_request'}}"
+)
+
+
+async def test_a_rejected_page_reading_request_costs_only_its_own_pages(world: World) -> None:
+    # Gemini refuses the whole read call for some sets of URLs, billing nothing. That must
+    # cost those pages and nothing else: research carries on and the article is written.
+    world.fake.fail_schema = {ReadOut: [REJECTED]}
+    world.fake.follow_up = list(FOLLOW_UP)
+
+    result, outcome = await world.generate()
+
+    assert outcome.status is ArticleStatus.COMPLETED, outcome.error
+    async with world.env.sessions() as session:
+        article = await session.get_one(Article, result.article_id)
+        step = await session.get_one(ArticleStepRun, article.research_step_id)
+    research = ResearchResult.model_validate(step.output)
+    rejected = [c for c in research.candidates if c.reason == "the page-reading request was rejected"]  # fmt: skip
+    assert {c.url for c in rejected} == {c.url for c in research.candidates if c.outcome == "not_retrieved"} - set(FOLLOW_UP)  # fmt: skip
+    assert all(c.outcome == "not_retrieved" for c in rejected)
+    assert any("was rejected by Gemini" in n for n in research.notes)
+    # The pages it could not send are replaced by a second search, inside the same budgets.
+    assert {s.url for s in research.sources} == set(FOLLOW_UP)
+    assert research.calls == {"discover": 2, "read": 2}
+
+
+async def test_research_fails_alone_when_every_page_reading_request_is_rejected(world: World) -> None:  # fmt: skip
+    world.fake.fail_schema = {ReadOut: [REJECTED, REJECTED]}
+    world.fake.follow_up = list(FOLLOW_UP)
+
+    result, outcome = await world.generate()
+
+    # The article fails, with the research it has; it is not an LLM outage and nothing else
+    # in the run is stopped (the pipeline stage asserts that in tests/integration).
+    assert outcome.status is ArticleStatus.FAILED
+    article = await world.article(result.article_id)
+    assert article.failed_step == "research"
+    assert "usable source" in (article.error or "")
+
+
+async def test_a_second_search_runs_when_the_first_pass_is_short_of_sources(world: World) -> None:  # fmt: skip
+    # The pages the first search proposes can't be read (PDFs, portals, logins in the wild).
+    world.fake.web = {url: page for url, page in world.fake.web.items() if url in FOLLOW_UP}
+    world.fake.follow_up = list(FOLLOW_UP)
+
+    result, outcome = await world.generate()
+
+    assert outcome.status is ArticleStatus.COMPLETED, outcome.error
+    async with world.env.sessions() as session:
+        article = await session.get_one(Article, result.article_id)
+        step = await session.get_one(ArticleStepRun, article.research_step_id)
+    research = ResearchResult.model_validate(step.output)
+    assert research.calls == {"discover": 2, "read": 2}  # both passes inside the same caps
+    assert {s.url for s in research.sources} == set(FOLLOW_UP)
+    assert any("search passes" in n for n in research.notes)
+    follow_up_prompt = world.fake.calls(DiscoverOut)[1].prompt
+    assert "Questions still without evidence:" in follow_up_prompt
+    assert "https://standards.example.org/ai-agents/handoff" in follow_up_prompt  # already tried
+    # And the owner sees how many passes it took, under `articles sources`.
+    async with world.env.sessions() as session:
+        shown = await article_queries.research_notes(session, result.article_id)
+    assert any("search passes" in n for n in shown)
+
+
+async def test_a_second_search_needs_a_page_reading_call_it_can_still_pay_for(world: World) -> None:  # fmt: skip
+    world.fake.web = {}  # nothing can be read, so the first pass is short whatever it finds
+
+    result, outcome = await world.generate(article_research_max_url_context_calls=1)
+
+    assert outcome.status is ArticleStatus.FAILED
+    article = await world.article(result.article_id)
+    async with world.env.sessions() as session:
+        step = await session.scalar(select(ArticleStepRun).where(ArticleStepRun.article_id == article.id, ArticleStepRun.step == "research"))  # fmt: skip
+    assert step is not None
+    research = ResearchResult.model_validate(step.output)
+    assert research.calls == {"discover": 1, "read": 1}  # no second search without a call
+    assert any("no page-reading call left" in n for n in research.notes)
+
+
+async def test_a_second_search_is_not_run_on_a_spent_token_budget(world: World) -> None:
+    world.fake.web = {}
+    world.fake.extra_tokens = 3_000  # what reading pages costs on the real thing
+
+    result, outcome = await world.generate(article_research_max_tokens=8_000)
+
+    assert outcome.status is ArticleStatus.FAILED
+    article = await world.article(result.article_id)
+    async with world.env.sessions() as session:
+        step = await session.scalar(select(ArticleStepRun).where(ArticleStepRun.article_id == article.id, ArticleStepRun.step == "research"))  # fmt: skip
+    assert step is not None
+    research = ResearchResult.model_validate(step.output)
+    assert research.calls["discover"] == 1
+    assert any("no second search" in n for n in research.notes)
+
+
+async def test_no_page_reading_call_is_sent_more_urls_than_the_tool_takes(world: World) -> None:
+    world.fake.candidates = [f"https://docs.example.org/guide-{i}" for i in range(1, 46)]
+    world.fake.follow_up = list(FOLLOW_UP)
+
+    await world.generate(article_research_max_sources=40, article_research_max_url_context_calls=3)  # fmt: skip
+
+    batches = [re.findall(r"^U\d+ \| (\S+)$", r.prompt, re.MULTILINE) for r in world.fake.calls(ReadOut)]  # fmt: skip
+    assert batches
+    sent: list[str] = []
+    for urls in batches:
+        assert 0 < len(urls) <= MAX_URLS_PER_CALL  # Gemini's own limit, never exceeded
+        assert len(set(urls)) == len(urls)  # and never the same page twice in one call
+        sent += urls
+    assert len(set(sent)) == len(sent)  # nor across calls
+
+
 async def test_an_edit_that_fails_the_completion_checks_is_never_marked_completed(world: World) -> None:  # fmt: skip
     world.fake.edit_too_short = True
     result, outcome = await world.generate()
@@ -556,3 +682,124 @@ async def test_read_models_show_progress_steps_sources_and_a_preview(world: Worl
     async with world.env.sessions() as session:
         assert await article_queries.get_article(session, 999_999, token_budget=1) is None
         assert await article_queries.get_sources(session, 999_999) is None
+
+
+# ── who writes it: Gemini, Claude, and the fallback between them ─────────────
+
+
+def claude_fake() -> FakeLLM:
+    """A second writer, indistinguishable from the first except in what it reports."""
+    return FakeLLM(provider="claude", model="fake-claude")
+
+
+async def test_the_default_keeps_every_step_on_gemini(world: World) -> None:
+    world.fake.provider = "gemini"
+
+    _, outcome = await world.generate(claude=claude_fake())
+
+    assert outcome.status is ArticleStatus.COMPLETED, outcome.error
+    assert outcome.writer == "gemini"
+    assert outcome.fallbacks == ()
+    article = await world.article(outcome.article_id)
+    assert article.writer == "gemini"
+    async with world.env.sessions() as session:
+        providers = set(await session.scalars(select(LLMCall.provider).where(LLMCall.run_id == outcome.run_id)))  # fmt: skip
+    assert providers == {"gemini"}
+
+
+async def test_writing_provider_claude_writes_the_whole_article_with_claude(world: World) -> None:
+    claude = claude_fake()
+    world.fake.provider = "gemini"
+
+    _, outcome = await world.generate(claude=claude, writing_provider="claude")
+
+    assert outcome.status is ArticleStatus.COMPLETED, outcome.error
+    assert outcome.writer == "claude"
+    assert (await world.article(outcome.article_id)).writer == "claude"
+    assert not world.fake.requests  # Gemini was never called
+    assert claude.calls(EditOut)
+    async with world.env.sessions() as session:
+        rows = list(await session.execute(select(LLMCall.provider, LLMCall.model).where(LLMCall.run_id == outcome.run_id)))  # fmt: skip
+    assert {p for p, _ in rows} == {"claude"}
+    assert {m for _, m in rows} == {"claude-sonnet-5"}  # CLAUDE_MODEL, not GEMINI_WRITING_MODEL
+
+
+async def test_split_leaves_competitor_articles_with_gemini(world: World) -> None:
+    # This world's opportunity came from a competitor's pages, so split keeps it on Gemini.
+    claude = claude_fake()
+
+    _, outcome = await world.generate(claude=claude, writing_provider="split")
+
+    assert outcome.writer == "gemini"
+    assert not claude.requests
+
+
+async def test_a_gemini_billing_failure_falls_back_to_claude_and_says_so(world: World) -> None:
+    world.fake.provider = "gemini"
+    world.fake.failures = [LLMBillingError("Gemini cannot bill this call (HTTP 402): prepayment credits are depleted")]  # fmt: skip
+    claude = claude_fake()
+
+    _, outcome = await world.generate(claude=claude, writing_provider="gemini")
+
+    assert outcome.status is ArticleStatus.COMPLETED, outcome.error
+    assert outcome.writer == "claude"
+    [handover] = outcome.fallbacks
+    assert "research: gemini failed" in handover
+    assert "claude wrote it instead" in handover
+    article = await world.article(outcome.article_id)
+    assert article.writer == "claude"  # the provider that produced the content
+    async with world.env.sessions() as session:
+        run = await session.get_one(Run, outcome.run_id)
+        rows = list(await session.execute(select(LLMCall.provider, LLMCall.status).where(LLMCall.run_id == outcome.run_id)))  # fmt: skip
+        steps = list(await session.scalars(select(ArticleStepRun).where(ArticleStepRun.article_id == article.id).order_by(ArticleStepRun.id)))  # fmt: skip
+    # The run summary names the handover: a fallback is never silent.
+    assert run.summary["writer"] == "claude"
+    assert run.summary["writer_fallbacks"] == list(outcome.fallbacks)
+    # The ledger keeps both providers apart, so cost stays attributable.
+    assert ("gemini", "failed") in rows
+    assert ("claude", "succeeded") in rows
+    # The failed Gemini research step is kept; Claude's replaces it as the current one.
+    research = [s for s in steps if s.step == "research"]
+    assert [(s.status, s.model) for s in research] == [("failed", "gemini-3.8-flash"), ("succeeded", "claude-sonnet-5")]  # fmt: skip
+    assert article.research_step_id == research[-1].id
+
+
+async def test_a_rate_limit_is_not_worth_another_provider(world: World) -> None:
+    world.fake.failures = [LLMRateLimitError("429")]
+    claude = claude_fake()
+
+    _, outcome = await world.generate(claude=claude)
+
+    assert outcome.status is ArticleStatus.FAILED
+    assert outcome.fallbacks == ()
+    assert not claude.requests  # the article waits for a retry on Gemini instead
+
+
+async def test_without_an_anthropic_key_nothing_falls_back(world: World) -> None:
+    world.fake.failures = [LLMBillingError("prepayment credits are depleted")]
+
+    _, outcome = await world.generate()  # no second writer configured
+
+    assert outcome.status is ArticleStatus.FAILED
+    assert outcome.error is not None
+    assert "credits are depleted" in outcome.error
+    assert outcome.fallbacks == ()
+    assert (await world.article(outcome.article_id)).writer == "gemini"
+
+
+async def test_a_resume_continues_with_the_provider_that_started_the_article(world: World) -> None:
+    claude = claude_fake()
+    # Claude researches and outlines, then runs out of its budget mid-article.
+    claude.fail_schema = {ArticleContentOut: [LLMRateLimitError("429")]}
+    _, outcome = await world.generate(claude=claude, writing_provider="claude")
+    assert outcome.status is ArticleStatus.FAILED
+
+    resumed = await world.service(claude=claude, writing_provider="claude").resume_now(outcome.article_id, trigger=RunTrigger.CLI)  # fmt: skip
+    _, second = resumed
+
+    assert second is not None
+    assert second.status is ArticleStatus.COMPLETED, second.error
+    assert second.writer == "claude"
+    # The research and outline Claude already wrote were reused, not paid for twice.
+    assert second.steps["research"] == "reused"
+    assert second.steps["outline"] == "reused"

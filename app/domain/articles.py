@@ -21,8 +21,19 @@ from app.domain.analysis import ContentFormat, SearchIntent
 class ArticleOrigin(StrEnum):
     """Who wrote the article."""
 
-    GENERATED = "generated"  # the five Phase 5 steps (Gemini), validated by Phase 6
+    GENERATED = "generated"  # the five Phase 5 steps (an LLM), validated by Phase 6
     IMPORTED = "imported"  # a Markdown file written by a person (`articles import`)
+
+
+class ArticleWriter(StrEnum):
+    """The LLM provider whose five steps produced a generated article's content.
+
+    An article is written by one provider from research to edit. A run falls back to the
+    other one only when the first fails in a way no retry fixes, and then rewrites this.
+    """
+
+    GEMINI = "gemini"
+    CLAUDE = "claude"
 
 
 class ArticleStatus(StrEnum):
@@ -342,6 +353,7 @@ class ArticleSummary(BaseModel):
     opportunity_id: int
     attempt: int
     origin: ArticleOrigin = Field(default=ArticleOrigin.GENERATED, description="imported: written by a person, not by the agent")  # fmt: skip
+    writer: ArticleWriter | None = Field(default=None, description="the LLM provider whose steps produced the content; null for imported articles and ones written before Claude was a writer")  # fmt: skip
     status: ArticleStatus
     current_step: ArticleStep | None
     title: str

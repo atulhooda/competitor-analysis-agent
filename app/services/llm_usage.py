@@ -100,6 +100,17 @@ class BudgetedLLM:
         self._token_limit_name = token_limit_name
         self.usage = RunUsage()
 
+    def switch_to(self, provider: LLMProvider) -> None:
+        """Send the rest of this run's calls to another provider (an article falling back
+        to its second writer). The run's usage, budgets and ledger carry on unchanged: the
+        budget is the run's, not the provider's, and each ``llm_calls`` row records the
+        provider that actually served it."""
+        self._provider = provider
+
+    @property
+    def provider_name(self) -> str:
+        return self._provider.name
+
     async def structured[T: BaseModel](
         self,
         request: LLMRequest,

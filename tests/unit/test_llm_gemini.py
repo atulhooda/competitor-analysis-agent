@@ -17,6 +17,7 @@ from app.llm import (
     LLMProvider,
     LLMRateLimitError,
     LLMRequest,
+    LLMRequestRejectedError,
     LLMResponseError,
     LLMUnavailableError,
 )
@@ -170,6 +171,35 @@ async def test_http_errors_map_to_provider_neutral_errors(
             await provider.generate(LLMRequest(prompt="x"))
     if status < 500 and status != 429:
         assert route.call_count == 1  # client errors are never retried
+
+
+@pytest.mark.parametrize("tool", ["url_context", "google_search"])
+async def test_a_400_on_a_tool_call_condemns_that_call_only(provider: GeminiProvider, tool: str) -> None:  # fmt: skip
+    # A call with a built-in tool carries whatever that tool pulled off the web, and Gemini
+    # answers 400 when it dislikes that ("invalid argument", recitation, unparseable JSON).
+    # Probing it showed the same URLs accepted on one attempt and rejected on the next, so
+    # this must not be the systemic error that stops a whole pipeline stage.
+    with respx.mock() as router:
+        router.post(url__regex=INTERACTIONS).mock(return_value=api_error(400))
+        with pytest.raises(LLMRequestRejectedError) as caught:
+            await provider.generate(LLMRequest(prompt="x", tools=(tool,)))
+    assert not isinstance(caught.value, LLMInvalidRequestError)
+
+
+@pytest.mark.parametrize("status", [400, 404])
+async def test_a_call_without_tools_is_still_a_systemic_rejection(provider: GeminiProvider, status: int) -> None:  # fmt: skip
+    with respx.mock() as router:
+        router.post(url__regex=INTERACTIONS).mock(return_value=api_error(status))
+        with pytest.raises(LLMInvalidRequestError):
+            await provider.generate(LLMRequest(prompt="x"))
+
+
+async def test_a_404_on_a_tool_call_is_systemic_too(provider: GeminiProvider) -> None:
+    # Not found is the model or the endpoint, not the pages: every later call fails the same.
+    with respx.mock() as router:
+        router.post(url__regex=INTERACTIONS).mock(return_value=api_error(404))
+        with pytest.raises(LLMInvalidRequestError):
+            await provider.generate(LLMRequest(prompt="x", tools=("url_context",)))
 
 
 async def test_auth_errors_never_echo_the_api_key(provider: GeminiProvider) -> None:

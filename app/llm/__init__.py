@@ -23,15 +23,18 @@ from app.llm.base import (
 )
 from app.llm.errors import (
     LLMAuthenticationError,
+    LLMBillingError,
     LLMBudgetExceededError,
     LLMConfigurationError,
     LLMError,
     LLMInvalidRequestError,
     LLMRateLimitError,
+    LLMRequestRejectedError,
     LLMResponseError,
     LLMUnavailableError,
 )
 from app.llm.factory import LazyLLM, create_llm_provider, get_llm
+from app.llm.router import WritingRouter, unrecoverable
 
 __all__ = [
     "Citation",
@@ -39,6 +42,7 @@ __all__ = [
     "ImageRequest",
     "ImageResponse",
     "LLMAuthenticationError",
+    "LLMBillingError",
     "LLMBudgetExceededError",
     "LLMConfigurationError",
     "LLMError",
@@ -46,6 +50,7 @@ __all__ = [
     "LLMProvider",
     "LLMRateLimitError",
     "LLMRequest",
+    "LLMRequestRejectedError",
     "LLMResponse",
     "LLMResponseError",
     "LLMUnavailableError",
@@ -55,6 +60,8 @@ __all__ = [
     "RetrievedURL",
     "StructuredResponse",
     "Tool",
+    "WritingRouter",
     "create_llm_provider",
     "get_llm",
+    "unrecoverable",
 ]

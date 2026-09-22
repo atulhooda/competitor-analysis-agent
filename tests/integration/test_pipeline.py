@@ -34,7 +34,13 @@ from app.domain.articles import ArticleStatus
 from app.domain.jobs import ErrorKind, JobStatus, JobTrigger, JobType, StageStatus
 from app.domain.opportunities import OpportunityStatus
 from app.domain.publishing import ApprovalChannel, PublicationStatus
-from app.llm import LLMAuthenticationError, LLMUnavailableError
+from app.llm import (
+    LLMAuthenticationError,
+    LLMBillingError,
+    LLMRequestRejectedError,
+    LLMUnavailableError,
+)
+from app.prompts.article_research import DiscoverOut, ReadOut
 from app.prompts.content_analysis import ContentAnalysisResponse
 from app.services.approvals import ApprovalService
 from tests.fakellm import FakeLLM
@@ -310,6 +316,32 @@ async def test_invalid_gemini_credentials_fail_at_once_without_retries(rig: Rig)
     assert calls <= 2  # stopped at the first credential failure
 
 
+async def test_a_rejected_page_reading_request_never_fails_the_whole_stage(rig: Rig) -> None:
+    # Gemini refuses a url_context call over the URLs in it, without billing anything. That
+    # is about those pages, not about the run: the stage must not be stopped, nor retried.
+    rig.env.fake.fail_schema = {ReadOut: [LLMRequestRejectedError("Gemini rejected this request (HTTP 400): Request contains an invalid argument.")] * 20}  # fmt: skip
+
+    job = await rig.run(job_max_attempts=3)
+
+    assert job.status is not JobStatus.FAILED, job.last_error
+    assert stage(job, "generate") is not StageStatus.FAILED
+    assert job.error_kind is not ErrorKind.PERMANENT
+    assert job.attempt_count == 1
+    assert stage(job, "publish") is not StageStatus.FAILED  # the run went on to its end
+
+
+async def test_bad_credentials_while_reading_pages_still_stop_the_whole_stage(rig: Rig) -> None:
+    # The same call, a failure that every later call repeats: this one still stops the run.
+    rig.env.fake.fail_schema = {ReadOut: [LLMAuthenticationError("401: API key not valid")] * 20}  # fmt: skip
+
+    job = await rig.run(job_max_attempts=3)
+
+    assert job.status is JobStatus.FAILED
+    assert job.error_kind is ErrorKind.PERMANENT
+    assert job.attempt_count == 1  # never retried
+    assert stage(job, "generate") is StageStatus.FAILED
+
+
 async def test_a_spent_token_budget_skips_the_gemini_stages_without_retrying(rig: Rig) -> None:
     rig.env.fake.requests.clear()
     job = await rig.run(llm_daily_token_budget=1)
@@ -484,3 +516,37 @@ async def test_no_trigger_gets_around_a_publishing_switch(rig: Rig, trigger: Job
     assert await count(rig, Publication) == 0
     assert await count(rig, ArticleApproval) == 0
     assert rig.wp.mutations == []
+
+
+async def test_gemini_running_out_of_credits_hands_the_article_to_claude(rig: Rig) -> None:
+    # Gemini answers HTTP 402 on the first writing call. That failure never fixes itself, so
+    # the article falls back to Claude — and the stage must not be stopped by the Gemini
+    # failure that is still in the ledger, because the run went on and produced an article.
+    rig.env.fake.provider = "gemini"
+    rig.env.fake.fail_schema = {DiscoverOut: [LLMBillingError("Gemini cannot bill this call (HTTP 402): prepayment credits are depleted")]}  # fmt: skip
+    claude = FakeLLM(provider="claude", model="fake-claude")
+
+    job = await rig.run(claude=claude)
+
+    assert job.status is JobStatus.COMPLETED_WITH_WARNINGS, (job.last_error, [(s.stage, s.status, s.warnings) for s in job.stages])  # fmt: skip
+    assert stage(job, "generate") is StageStatus.COMPLETED_WITH_WARNINGS
+    generate = summary(job, "generate")
+    assert list(generate["writers"].values()) == ["claude"]
+    [handover] = generate["writer_fallbacks"]
+    assert "gemini failed with an error no retry fixes" in handover
+    assert "claude wrote it instead" in handover
+    # The handover is a warning on the stage, not a silent recovery.
+    assert any("claude wrote it instead" in w for w in next(s.warnings for s in job.stages if s.stage.value == "generate"))  # fmt: skip
+    assert stage(job, "publish") is StageStatus.COMPLETED  # the day's post still went out
+
+
+async def test_without_a_second_writer_running_out_of_credits_stops_the_stage(rig: Rig) -> None:
+    rig.env.fake.provider = "gemini"
+    rig.env.fake.fail_schema = {DiscoverOut: [LLMBillingError("prepayment credits are depleted")] * 20}  # fmt: skip
+
+    job = await rig.run(job_max_attempts=3)
+
+    assert job.status is JobStatus.FAILED
+    assert job.error_kind is ErrorKind.PERMANENT
+    assert job.attempt_count == 1  # never retried: no retry fixes an empty account
+    assert stage(job, "generate") is StageStatus.FAILED

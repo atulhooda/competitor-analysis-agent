@@ -17,6 +17,7 @@ from app.llm import (
     LLMConfigurationError,
     LLMInvalidRequestError,
     LLMRateLimitError,
+    LLMRequestRejectedError,
     LLMResponseError,
     LLMUnavailableError,
 )
@@ -150,6 +151,7 @@ def test_days_are_23_or_25_hours_long_across_daylight_saving_time() -> None:
         (LLMAuthenticationError("401"), ErrorKind.PERMANENT),
         (LLMConfigurationError("GEMINI_API_KEY is not set"), ErrorKind.PERMANENT),
         (LLMInvalidRequestError("unknown model"), ErrorKind.PERMANENT),
+        (LLMRequestRejectedError("400 on a url_context call"), ErrorKind.PERMANENT),
         (LLMResponseError("invalid JSON"), ErrorKind.PERMANENT),
         (CMSAuthError("401: incorrect password", status=401), ErrorKind.PERMANENT),
         (ArticleConflictError("not ready"), ErrorKind.PERMANENT),

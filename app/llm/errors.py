@@ -20,6 +20,27 @@ class LLMInvalidRequestError(LLMError, PermanentError):
     """The provider rejected the request (HTTP 400/404, e.g. an unknown model)."""
 
 
+class LLMBillingError(LLMError, PermanentError):
+    """The account cannot pay for the call (HTTP 402: no credits, billing suspended).
+
+    Separate from :class:`LLMInvalidRequestError` because the request itself was fine: only
+    another provider (or a human topping the account up) can make the call succeed.
+    """
+
+
+class LLMRequestRejectedError(LLMError, PermanentError):
+    """The provider rejected one particular request (HTTP 400) over what was in it.
+
+    Deliberately **not** an ``LLMInvalidRequestError``: that one means the setup is wrong
+    (an unknown model, a malformed configuration) and every later call fails the same way.
+    This one is about this call's content - the web pages a built-in tool pulled into it,
+    or output it could not parse - and Gemini answers it non-deterministically: the same
+    URLs are accepted on one attempt and rejected ("Request contains an invalid argument",
+    "Request blocked due to copyright/recitation content") on the next. The caller drops
+    what it sent and carries on.
+    """
+
+
 class LLMRateLimitError(LLMError, TransientError):
     """Rate limited (HTTP 429) after the SDK's own retries."""
 

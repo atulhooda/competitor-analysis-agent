@@ -770,12 +770,17 @@ Phase 5 turns an approved opportunity into a complete blog draft and stores it.
 
 | Step | Status | How |
 |---|---|---|
-| brief | stored when the article is created | Deterministic, from stored data. No Gemini |
-| research | `researching` | Gemini with Google Search finds sources; Gemini's URL context tool reads them |
-| outline | `outlining` | Gemini, structured sections |
-| draft | `drafting` | Gemini, structured content with citation markers |
-| edit | `editing` | Gemini editorial pass, then the completion checks |
+| brief | stored when the article is created | Deterministic, from stored data. No LLM |
+| research | `researching` | Web search finds sources; a page-reading tool reads them |
+| outline | `outlining` | Structured sections |
+| draft | `drafting` | Structured content with citation markers |
+| edit | `editing` | Editorial pass, then the completion checks |
 | | `completed` | Stored; a person reviews it |
+
+The five steps are written by **one provider**: Gemini by default, or Claude — see
+[Claude: the second writer](#claude-the-second-writer) for `WRITING_PROVIDER`, the
+`split` routing and the automatic fallback. `articles.writer` records which one wrote the
+article, and `articles show` prints it.
 
 Only an opportunity with status `approved` can get an article. Its generation runs in the
 background (`POST /api/v1/articles`, or synchronously with `articles generate`).
@@ -1841,6 +1846,91 @@ topics = await llm.generate_structured(LLMRequest(prompt="..."), TopicList)  # a
   terms allow content sent on the unpaid tier to be used to improve Google's products; check the
   current terms.
 
+### Claude: the second writer
+
+Articles can be written by **Anthropic Claude** instead of, or alongside, Gemini.
+`app/llm/claude.py` implements the same provider protocol as `app/llm/gemini.py` with the
+official [`anthropic`](https://pypi.org/project/anthropic/) SDK, and is the only module that
+imports it (loaded lazily). The writing services can't tell the two apart:
+
+- **Structured output** goes through the SDK's `messages.parse()` helper, which sends each
+  prompt's Pydantic model as a `json_schema` output format and returns it validated.
+- **Tools.** The project asks for `google_search` and `url_context`; on Claude those become
+  the server-side **web search** and **web fetch** tools, and what they did is reported as the
+  same `Grounding` — queries run, URLs requested, the final URL and status of each read, and
+  the citations on the answer — so research, citations and provenance work unchanged.
+- **Usage** is reported as input (uncached + cache reads + cache writes), output and thinking
+  tokens, so the `llm_calls` ledger and the token budgets keep working. Each row records the
+  provider that served it.
+- **Errors** map onto the same neutral taxonomy. HTTP 402 (`billing_error`) becomes
+  `LLMBillingError`, deliberately *not* `LLMInvalidRequestError`: an account that cannot pay
+  is a different problem from a request that is malformed, and only the first is worth
+  retrying on the other provider. Gemini's own HTTP 402 ("prepayment credits are depleted")
+  maps there too.
+- Claude **generates no images**: cover pictures stay with Gemini or Pexels.
+
+#### Who writes which article
+
+| `WRITING_PROVIDER` | Effect |
+|---|---|
+| `gemini` (default) | Gemini writes every article. Nothing changes from before. |
+| `claude` | Claude writes every article. |
+| `split` | Articles from **editorial topics** are written by Claude, articles from **competitor opportunities** by Gemini. |
+
+`split` is how "10 from Claude, 4 from Gemini a day" is expressed in the system's own terms:
+the two opportunity origins already have their own daily allowances
+(`MAX_EDITORIAL_ARTICLES_PER_DAY` and `MAX_ARTICLES_GENERATED_PER_DAY`). Set them to 10 and 4,
+with `ARTICLE_GENERATION_SCHEDULE` every two hours and `MAX_ARTICLES_PER_RUN=1`, and the day
+produces 14 posts spread over the day, 10 of them Claude's.
+
+`CLAUDE_ARTICLE_SHARE` (default 10) caps how many articles Claude writes in one
+`SCHEDULER_TIMEZONE` day; past the cap the rest of the day's editorial articles go to Gemini.
+`CLAUDE_ARTICLE_SHARE=0` turns Claude off without unsetting its key.
+
+Routing is a property of the **article**, not of a call: one article is researched, outlined,
+drafted and edited by one provider, so its steps stay consistent and a resume continues with
+the provider whose checkpoints are on disk instead of paying for them again. The step
+fingerprint includes the model, so a step Gemini produced is never reused as if Claude had
+written it.
+
+#### Fallback
+
+If the chosen provider fails a step with an error **no retry fixes** — bad credentials,
+billing/credits, a configuration problem, or a rejected request — the article falls back to
+the other **configured** provider, that provider redoes the step, and the run continues with
+it. Rate limits, 5xx, unusable output and budget stops are *not* fallback reasons: those are
+worth retrying on the same provider.
+
+A fallback is never silent:
+
+- `articles.writer` is rewritten to the provider that actually produced the content, and
+  `articles show` prints `written by: claude` plus a `fell back · …` line per handover;
+- the run summary carries `writer` and `writer_fallbacks`, and the pipeline's job summary
+  repeats both (`writers`, `writer_fallbacks`) and raises a stage warning;
+- both providers' calls stay in the `llm_calls` ledger with their own `provider` and `model`,
+  and the failed step row is kept next to the one that replaced it.
+
+A provider with no API key is never chosen and never fallen back to: **with
+`ANTHROPIC_API_KEY` unset, behaviour is identical to before.** The pipeline stops a stage on a
+systemic LLM failure as it always did, except when another provider took over in the same run
+and produced an article.
+
+**Validation stays on Gemini.** Fact-checking, originality, SEO, the judge and revisions are
+unchanged, on `GEMINI_QUALITY_MODEL`. That is deliberate: the judge is one component of the
+quality score (`gemini_judgment` in `QUALITY_WEIGHTS`), the fact-check re-read step depends on
+Gemini's URL-context retrieval statuses, and scores are only comparable across articles while
+one model produces them. Moving validation too would re-baseline every gate and threshold.
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `ANTHROPIC_API_KEY` | For writing with Claude | *(empty)* | Anthropic API key. Without it Claude is never used and nothing falls back to it. |
+| `CLAUDE_MODEL` | No | `claude-sonnet-5` | Model ID for the writing steps. Use a 4.6-or-later model: the provider sends adaptive thinking and the `_20260209` web tools. |
+| `WRITING_PROVIDER` | No | `gemini` | `gemini`, `claude` or `split` (see above) |
+| `CLAUDE_ARTICLE_SHARE` | No | `10` | With `split`: articles Claude may write per `SCHEDULER_TIMEZONE` day |
+
+`LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `LLM_MAX_TOKENS_PER_RUN` and
+`LLM_DAILY_TOKEN_BUDGET` apply to both providers.
+
 | Phase | Uses Gemini? |
 |---|---|
 | 1 · Website monitoring | **No.** Deterministic. Works with `GEMINI_API_KEY` empty. |
@@ -1879,7 +1969,11 @@ All settings are environment variables (or `.env`); see [`.env.example`](.env.ex
 | `COMPANY_FILE` | `config/company.yaml` | Company profile YAML for `company import` |
 | `SCORING_FILE` | `config/scoring.yaml` | Optional opportunity scoring configuration (weights, thresholds, Gemini candidates); built-in defaults without it |
 | `EDITORIAL_TOPICS_PER_RUN` | `10` | Editorial ideas kept per proposal run (Gemini is asked for about a third more) |
-| `GEMINI_WRITING_MODEL` | `GEMINI_MODEL` | Model for article research, outline, draft and editing |
+| `GEMINI_WRITING_MODEL` | `GEMINI_MODEL` | Model for article research, outline, draft and editing (Gemini's turn) |
+| `ANTHROPIC_API_KEY` | *(empty)* | Anthropic key. Without it Claude never writes and nothing falls back to it |
+| `CLAUDE_MODEL` | `claude-sonnet-5` | Model for article research, outline, draft and editing (Claude's turn) |
+| `WRITING_PROVIDER` | `gemini` | `gemini`, `claude`, or `split` (editorial topics → Claude, competitor opportunities → Gemini) |
+| `CLAUDE_ARTICLE_SHARE` | `10` | With `split`: articles Claude may write per `SCHEDULER_TIMEZONE` day |
 | `WRITING_REASONING_EFFORT` / `RESEARCH_REASONING_EFFORT` | `medium` / `low` | Gemini `thinking_level` for writing and for research |
 | `ARTICLE_MAX_TOKENS` | `400000` | Token budget per article, across every step and resume |
 | `ARTICLE_TARGET_WORDS` / `ARTICLE_MIN_WORDS` | `1500` / `600` | Length the writer aims for / the minimum to complete |

@@ -89,6 +89,16 @@ async def generated_on(session: AsyncSession, day: date, settings: Settings, *, 
     return int(await session.scalar(query) or 0)
 
 
+async def written_by_on(session: AsyncSession, day: date, settings: Settings, *, writer: str) -> int:  # fmt: skip
+    """Articles created on ``day`` that ``writer`` (an ``ArticleWriter`` value) wrote.
+
+    Counted from ``articles.writer``, stamped by the generation run, so an article that
+    fell back to the other provider counts for the provider that actually wrote it.
+    """
+    start, end = day_bounds(day, settings.scheduler_tz)
+    return int(await session.scalar(select(func.count(Article.id)).where(Article.created_at >= start, Article.created_at < end, Article.writer == writer)) or 0)  # fmt: skip
+
+
 def generation_limit(settings: Settings, origin: OpportunityOrigin) -> int:
     if origin is OpportunityOrigin.EDITORIAL:
         return settings.max_editorial_articles_per_day
@@ -122,4 +132,4 @@ async def daily_counts(session: AsyncSession, settings: Settings, now: datetime)
     )
 
 
-__all__ = ["daily_counts", "generated_on", "generation_limit", "published_on", "reserve_publication_slot"]  # fmt: skip
+__all__ = ["daily_counts", "generated_on", "generation_limit", "published_on", "reserve_publication_slot", "written_by_on"]  # fmt: skip

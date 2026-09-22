@@ -13,6 +13,19 @@ Gemini's URL context tool reads them. This process never fetches a page itself.
 A candidate becomes a source only if the URL tool reports that page as retrieved: a URL the
 model made up, or one that fails to load, never reaches the article. Every fact is tied to
 the source it was read from.
+
+A read call can be refused outright (HTTP 400, nothing billed): "Request contains an
+invalid argument", "Request blocked due to copyright/recitation content", "Model generated
+invalid JSON syntax". Probing this with real url_context calls (2026-09-23: PDFs, 2 000
+character URLs, query strings, fragments, punycode and non-ASCII hosts, http://, duplicate
+URLs, 404s, login walls, and 1, 4, 8, 16, 20 and 24 URLs in one call) found no URL shape
+that provokes it reliably - the same call was accepted on one attempt and refused on the
+next - so nothing extra is screened out. Such a refusal costs its own pages and no more.
+
+Discovery, screening and reading run again (once) when the first pass ends with fewer than
+ARTICLE_RESEARCH_MIN_SOURCES usable sources: the second search asks the unanswered questions
+differently and asks for source types that can actually be read. The two passes share one
+token budget and one page-reading budget, and the minimum is never lowered.
 """
 
 import math
@@ -22,7 +35,7 @@ from difflib import SequenceMatcher
 from typing import Any, Self
 from urllib.parse import urlsplit
 
-from app.config import Settings
+from app.config import GEMINI, Settings
 from app.core.errors import PermanentError
 from app.crawling.errors import FetchError, UnsafeDestinationError
 from app.crawling.netguard import Resolver, ensure_public_destination
@@ -42,6 +55,7 @@ from app.domain.articles import (
 from app.llm import (
     LLMBudgetExceededError,
     LLMRequest,
+    LLMRequestRejectedError,
     LLMResponseError,
     ReasoningEffort,
     RetrievedURL,
@@ -54,6 +68,8 @@ MAX_URL_LENGTH = 2_000
 MAX_URLS_PER_CALL = 20  # Gemini's URL context limit per request
 MAX_FACTS = 40
 MAX_EXCERPT = 1_000
+MAX_DISCOVERY_PASSES = 2  # the first search, and one more when it came up short
+MAX_TRIED_IN_PROMPT = 20  # URLs the follow-up search is told not to propose again
 
 
 class ResearchFailedError(PermanentError):
@@ -75,9 +91,10 @@ class ResearchConfig:
     min_sources: int
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> Self:
+    def from_settings(cls, settings: Settings, provider: str = GEMINI) -> Self:
+        """``provider`` picks the model: GEMINI_WRITING_MODEL or CLAUDE_MODEL."""
         return cls(
-            model=settings.writing_model,
+            model=settings.writing_model_for(provider),
             reasoning_effort=settings.research_reasoning_effort,
             max_queries=settings.article_research_max_queries,
             max_sources=settings.article_research_max_sources,
@@ -217,10 +234,26 @@ async def research(
     company_domain: str | None,
 ) -> ResearchResult:
     """Research for ``brief``. Raises ``ResearchFailedError`` with fewer than
-    ``config.min_sources`` usable sources; LLM budget and availability errors propagate."""
+    ``config.min_sources`` usable sources; LLM budget and availability errors propagate.
+
+    Up to ``MAX_DISCOVERY_PASSES`` searches. The best pages are often the ones that resist
+    automated reading (PDFs, portals, anything behind a login), so when the first pass ends
+    short of ``min_sources``, a second search asks the questions that still have no evidence
+    in other words and asks for other kinds of source. Both passes share one token budget
+    (``ARTICLE_RESEARCH_MAX_TOKENS``) and one page-reading budget
+    (``ARTICLE_RESEARCH_MAX_URL_CONTEXT_CALLS``): the second pass reads what the first left
+    unspent, never more.
+    """
     start = llm.usage.total_tokens
     notes: list[str] = []
     calls = {"discover": 0, "read": 0}
+    dispositions: list[CandidateDisposition] = []
+    reads: list[_Read] = []
+    seen: set[str] = set()
+    questions: list[ResearchQuestion] = []
+    queries: list[str] = []
+    tried: list[str] = []
+    rank = 0  # the order candidates were proposed in, across passes
 
     def spent() -> int:
         return llm.usage.total_tokens - start
@@ -228,52 +261,17 @@ async def research(
     def fits(request: LLMRequest) -> bool:
         return spent() + llm.estimate(request) <= config.max_tokens
 
-    discover = LLMRequest(
-        prompt=prompt.render_discover(
-            brief, max_questions=config.max_queries, max_sources=config.max_sources
-        ),
-        system=prompt.DISCOVER_SYSTEM,
-        model=config.model,
-        max_output_tokens=prompt.DISCOVER_MAX_OUTPUT_TOKENS,
-        reasoning_effort=config.reasoning_effort,
-        tools=("google_search",),
-    )
-    if not fits(discover):
-        raise LLMBudgetExceededError(f"ARTICLE_RESEARCH_MAX_TOKENS={config.max_tokens:,} is too small for the search call")  # fmt: skip
-    found = await llm.structured(discover, prompt.DiscoverOut, purpose=LLMPurpose.ARTICLE_RESEARCH, prompt_version=prompt.VERSION)  # fmt: skip
-    calls["discover"] += 1
-    queries = list(found.raw.grounding.search_queries)
-    if not queries:
-        notes.append("Gemini ran no Google Search query; its suggested URLs were still checked by reading them")  # fmt: skip
-    # Our own ids (Q1, Q2, ...): the read prompt lists them and facts must cite them.
-    questions = [ResearchQuestion(id=f"Q{i}", question=q.question, claim=q.claim) for i, q in enumerate(found.data.questions[: config.max_queries], start=1)]  # fmt: skip
+    def usable() -> int:
+        """Pages read so far, counted the way ``_assemble`` counts sources."""
+        return len({normalize_url(r.url) or r.url for r in reads})
 
-    dispositions: list[CandidateDisposition] = []
-    accepted: list[_Candidate] = []
-    seen: set[str] = set()
-    company = company_domain
-    for order, c in enumerate(found.data.sources):
-        url, reason = await safe_public_url(c.url, resolver)
-        kind = classify(url or c.url, c.source_type, brief.competitor_domains, company)
-        if url is None:
-            dispositions.append(CandidateDisposition(url=c.url[:500], title=c.title, source_type=kind, outcome="rejected", reason=reason))  # fmt: skip
-        elif url in seen:
-            dispositions.append(CandidateDisposition(url=url, title=c.title, source_type=kind, outcome="skipped", reason="duplicate of another candidate"))  # fmt: skip
-        else:
-            seen.add(url)
-            accepted.append(_Candidate(url, c.title, c.publisher, kind, order))
-    accepted.sort(key=lambda a: (SOURCE_PRIORITY[a.source_type], a.order))
-    for extra in accepted[config.max_sources :]:
-        dispositions.append(CandidateDisposition(url=extra.url, title=extra.title, source_type=extra.source_type, outcome="skipped", reason="over ARTICLE_RESEARCH_MAX_SOURCES"))  # fmt: skip
-    chosen = accepted[: config.max_sources]
-
-    reads: list[_Read] = []
-    if chosen:
-        size = min(MAX_URLS_PER_CALL, math.ceil(len(chosen) / config.max_url_context_calls))
+    async def read_pages(chosen: Sequence[_Candidate], allowance: int) -> None:
+        """Read ``chosen`` with at most ``allowance`` URL context calls."""
+        size = min(MAX_URLS_PER_CALL, math.ceil(len(chosen) / allowance))
         batches = [chosen[i : i + size] for i in range(0, len(chosen), size)]
         for index, batch in enumerate(batches):
-            if index >= config.max_url_context_calls:
-                dispositions += [CandidateDisposition(url=c.url, title=c.title, source_type=c.source_type, outcome="skipped", reason="over ARTICLE_RESEARCH_MAX_URL_CONTEXT_CALLS") for c in batch]  # fmt: skip
+            if index >= allowance:
+                dispositions.extend(CandidateDisposition(url=c.url, title=c.title, source_type=c.source_type, outcome="skipped", reason="over ARTICLE_RESEARCH_MAX_URL_CONTEXT_CALLS") for c in batch)  # fmt: skip
                 continue
             urls = [c.url for c in batch]
             request = LLMRequest(
@@ -287,14 +285,21 @@ async def research(
             if not fits(request):
                 pending = [c for b in batches[index:] for c in b]
                 notes.append(f"research token budget reached (ARTICLE_RESEARCH_MAX_TOKENS={config.max_tokens:,}): {len(pending)} page(s) not read")  # fmt: skip
-                dispositions += [CandidateDisposition(url=c.url, title=c.title, source_type=c.source_type, outcome="skipped", reason="research token budget reached") for c in pending]  # fmt: skip
-                break
+                dispositions.extend(CandidateDisposition(url=c.url, title=c.title, source_type=c.source_type, outcome="skipped", reason="research token budget reached") for c in pending)  # fmt: skip
+                return
             calls["read"] += 1
             try:
                 read = await llm.structured(request, prompt.ReadOut, purpose=LLMPurpose.ARTICLE_RESEARCH, prompt_version=prompt.VERSION)  # fmt: skip
+            except LLMRequestRejectedError as exc:
+                # Gemini refused this call over what was in it (nothing was billed). Another
+                # set of URLs can still be read, and the article can still be written from
+                # the sources it does have, so only these pages are lost.
+                notes.append(f"page-reading call {calls['read']} was rejected by Gemini; its {len(urls)} page(s) weren't read ({exc})")  # fmt: skip
+                dispositions.extend(CandidateDisposition(url=c.url, title=c.title, source_type=c.source_type, outcome="not_retrieved", reason="the page-reading request was rejected") for c in batch)  # fmt: skip
+                continue
             except LLMResponseError as exc:
                 notes.append(f"page-reading call {calls['read']} returned unusable output; its {len(urls)} page(s) weren't used ({exc})")  # fmt: skip
-                dispositions += [CandidateDisposition(url=c.url, title=c.title, source_type=c.source_type, outcome="not_retrieved", reason="unusable model output") for c in batch]  # fmt: skip
+                dispositions.extend(CandidateDisposition(url=c.url, title=c.title, source_type=c.source_type, outcome="not_retrieved", reason="unusable model output") for c in batch)  # fmt: skip
                 continue
             if not read.raw.grounding.retrieved_urls:
                 notes.append(f"page-reading call {calls['read']}: the URL context tool reported no retrieved page")  # fmt: skip
@@ -316,6 +321,77 @@ async def research(
                     continue
                 dispositions.append(CandidateDisposition(url=candidate.url, title=candidate.title, source_type=candidate.source_type, outcome="not_retrieved", reason=reason))  # fmt: skip
 
+    for pass_number in range(1, MAX_DISCOVERY_PASSES + 1):
+        # Never more usable sources than asked for, and never more reading than paid for.
+        room = config.max_sources - usable()
+        left = config.max_url_context_calls - calls["read"]
+        if pass_number > 1 and (room < 1 or left < 1):
+            notes.append(f"a second search would have had no page-reading call left (ARTICLE_RESEARCH_MAX_URL_CONTEXT_CALLS={config.max_url_context_calls})")  # fmt: skip
+            break
+        if pass_number == 1:
+            asked = prompt.render_discover(brief, max_questions=config.max_queries, max_sources=config.max_sources)  # fmt: skip
+            search = LLMRequest(
+                prompt=asked,
+                system=prompt.DISCOVER_SYSTEM,
+                model=config.model,
+                max_output_tokens=prompt.DISCOVER_MAX_OUTPUT_TOKENS,
+                reasoning_effort=config.reasoning_effort,
+                tools=("google_search",),
+            )
+        else:
+            answered = {q for r in reads for f in r.page.facts for q in f.question_ids}
+            open_questions = [q for q in questions if q.id not in answered] or questions
+            asked = prompt.render_follow_up(brief, questions=open_questions, tried=tried[:MAX_TRIED_IN_PROMPT], max_sources=room)  # fmt: skip
+            search = LLMRequest(
+                prompt=asked,
+                system=prompt.DISCOVER_SYSTEM,
+                model=config.model,
+                max_output_tokens=prompt.DISCOVER_MAX_OUTPUT_TOKENS,
+                reasoning_effort=config.reasoning_effort,
+                tools=("google_search",),
+            )
+        if not fits(search):
+            if pass_number == 1:
+                raise LLMBudgetExceededError(f"ARTICLE_RESEARCH_MAX_TOKENS={config.max_tokens:,} is too small for the search call")  # fmt: skip
+            notes.append(f"research token budget reached (ARTICLE_RESEARCH_MAX_TOKENS={config.max_tokens:,}): no second search")  # fmt: skip
+            break
+        found = await llm.structured(search, prompt.DiscoverOut, purpose=LLMPurpose.ARTICLE_RESEARCH, prompt_version=prompt.VERSION)  # fmt: skip
+        calls["discover"] += 1
+        queries.extend(q for q in found.raw.grounding.search_queries if q not in queries)
+        if pass_number == 1:
+            if not found.raw.grounding.search_queries:
+                notes.append("Gemini ran no Google Search query; its suggested URLs were still checked by reading them")  # fmt: skip
+            # Our own ids (Q1, Q2, ...): the read prompt lists them and facts must cite them.
+            questions = [ResearchQuestion(id=f"Q{i}", question=q.question, claim=q.claim) for i, q in enumerate(found.data.questions[: config.max_queries], start=1)]  # fmt: skip
+
+        accepted: list[_Candidate] = []
+        for c in found.data.sources:
+            url, reason = await safe_public_url(c.url, resolver)
+            kind = classify(url or c.url, c.source_type, brief.competitor_domains, company_domain)
+            if url is None:
+                dispositions.append(CandidateDisposition(url=c.url[:500], title=c.title, source_type=kind, outcome="rejected", reason=reason))  # fmt: skip
+            elif url in seen:
+                dispositions.append(CandidateDisposition(url=url, title=c.title, source_type=kind, outcome="skipped", reason="duplicate of another candidate"))  # fmt: skip
+            else:
+                seen.add(url)
+                accepted.append(_Candidate(url, c.title, c.publisher, kind, rank))
+                rank += 1
+        accepted.sort(key=lambda a: (SOURCE_PRIORITY[a.source_type], a.order))
+        for extra in accepted[room:]:
+            dispositions.append(CandidateDisposition(url=extra.url, title=extra.title, source_type=extra.source_type, outcome="skipped", reason="over ARTICLE_RESEARCH_MAX_SOURCES"))  # fmt: skip
+        chosen = accepted[:room]
+        tried.extend(c.url for c in chosen)
+
+        if chosen:
+            # Never more calls than the run has left, and the first pass keeps one back.
+            allowance = _read_allowance(len(chosen), config, reserve=pass_number == 1)
+            await read_pages(chosen, min(allowance, left))
+        if usable() >= config.min_sources:
+            break
+
+    if calls["discover"] > 1:
+        notes.append(f"{calls['discover']} search passes: the first left too few pages that could be read, so the unanswered questions were searched again from other angles")  # fmt: skip
+
     result = _assemble(reads, questions, queries, dispositions, notes, calls)
     if len(result.sources) < config.min_sources:
         raise ResearchFailedError(
@@ -323,6 +399,19 @@ async def research(
             result,
         )
     return result
+
+
+def _read_allowance(chosen: int, config: ResearchConfig, *, reserve: bool) -> int:
+    """How many URL context calls one pass may spend.
+
+    The first pass keeps one call back for a follow-up search, but only when the pages it
+    has fit in the calls that remain: reading everything it found always comes first. A
+    reserved call that isn't needed is never made, so the saving costs nothing.
+    """
+    cap = config.max_url_context_calls
+    if reserve and cap > 1 and chosen <= MAX_URLS_PER_CALL * (cap - 1):
+        return cap - 1
+    return cap
 
 
 def _assemble(

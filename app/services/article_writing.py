@@ -12,7 +12,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Self
 
-from app.config import Settings
+from app.config import GEMINI, Settings
 from app.core.errors import PermanentError
 from app.domain.analysis import LLMPurpose
 from app.domain.articles import (
@@ -57,9 +57,10 @@ class WritingConfig:
     max_context_chars: int
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> Self:
+    def from_settings(cls, settings: Settings, provider: str = GEMINI) -> Self:
+        """``provider`` picks the model: GEMINI_WRITING_MODEL or CLAUDE_MODEL."""
         return cls(
-            model=settings.writing_model,
+            model=settings.writing_model_for(provider),
             reasoning_effort=settings.writing_reasoning_effort,
             target_words=settings.article_target_words,
             min_words=settings.article_min_words,

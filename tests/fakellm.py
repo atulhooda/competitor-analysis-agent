@@ -136,6 +136,9 @@ def analyze_document(ref: str, body: str) -> DocumentAnalysisOut:
 @dataclass
 class FakeLLM:
     model: str = "fake-gemini"
+    # The provider name it reports (llm_calls.provider). Tests that run two writers give
+    # each fake the real provider name so the ledger can tell them apart.
+    provider: str = "fake"
     requests: list[tuple[LLMRequest, type[BaseModel]]] = field(default_factory=list)
     # Exceptions raised by the next calls, in order (None = answer normally).
     failures: list[Exception | None] = field(default_factory=list)
@@ -153,8 +156,14 @@ class FakeLLM:
     # the candidate URLs the search call proposes, in order.
     web: dict[str, "FakePage"] = field(default_factory=lambda: dict(WEB))
     candidates: list[str] = field(default_factory=lambda: list(CANDIDATES))
+    # What a follow-up search proposes (the second discover call, run when too few of the
+    # first pass's pages could be read). Empty: it proposes the same URLs again.
+    follow_up: list[str] = field(default_factory=list)
     # Exceptions raised the next time a given schema is requested (per schema, in order).
     fail_schema: dict[type[BaseModel], list[Exception]] = field(default_factory=dict)
+    # Output tokens billed on top of the answer itself, per call: what the real thing bills
+    # for the pages a tool read. Lets a test spend a research budget realistically.
+    extra_tokens: int = 0
     # The edit returns an article too short to complete.
     edit_too_short: bool = False
     # Phase 6. Fact-check verdicts by claim text (substring → verdict): "supported",
@@ -191,7 +200,7 @@ class FakeLLM:
 
     @property
     def name(self) -> str:
-        return "fake"
+        return self.provider
 
     @property
     def default_model(self) -> str:
@@ -222,7 +231,7 @@ class FakeLLM:
         return ImageResponse(
             data=self.image_data,
             mime_type=self.image_mime,
-            provider="fake",
+            provider=self.provider,
             model=request.model or self.image_model,
             usage=usage,
             width=width,
@@ -235,10 +244,11 @@ class FakeLLM:
         self, request: LLMRequest, schema: type[T]
     ) -> StructuredResponse[T]:
         self.requests.append((request, schema))
+        output = 200 + self.extra_tokens
         usage = LLMUsage(
             input_tokens=len(request.prompt) // 4,
-            output_tokens=200,
-            total_tokens=len(request.prompt) // 4 + 200,
+            output_tokens=output,
+            total_tokens=len(request.prompt) // 4 + output,
         )
         if self.failures:
             failure = self.failures.pop(0)
@@ -281,7 +291,7 @@ class FakeLLM:
         elif schema is EditorialIdeasOut:
             data = _editorial(request.prompt, self.editorial_pool, self.editorial_numbers)
         elif schema is DiscoverOut:
-            data, grounding = self._discover()
+            data, grounding = self._discover(request.prompt)
         elif schema is ReadOut:
             data, grounding = self._read(request.prompt)
         elif schema is OutlineOut:
@@ -319,7 +329,7 @@ class FakeLLM:
             data=data,
             raw=LLMResponse(
                 text=data.model_dump_json(),
-                provider="fake",
+                provider=self.provider,
                 model=request.model or self.model,
                 usage=usage,
                 finish_reason="completed",
@@ -328,7 +338,10 @@ class FakeLLM:
             ),
         )
 
-    def _discover(self) -> tuple[DiscoverOut, Grounding]:
+    def _discover(self, asked: str) -> tuple[DiscoverOut, Grounding]:
+        if FOLLOW_UP_MARKER in asked:  # a second search: other wording, other pages
+            sources = [self._candidate(url) for url in (self.follow_up or self.candidates)]
+            return DiscoverOut(questions=[], sources=sources), Grounding(search_queries=("ai helpdesk handoff checklist", "ai support rollout report"))  # fmt: skip
         questions = [
             QuestionOut(
                 id="q-handoff",
@@ -344,12 +357,13 @@ class FakeLLM:
                 id="q-scope", question="How should teams scope AI agents?", claim="rollout advice"
             ),
         ]
-        sources = []
-        for url in self.candidates:
-            page = self.web.get(url.split("?")[0], FakePage())
-            sources.append(CandidateOut(url=url, title=page.title or None, publisher=page.publisher, source_type=page.source_type, question_ids=["Q1"]))  # type: ignore[arg-type]  # fmt: skip
+        sources = [self._candidate(url) for url in self.candidates]
         grounding = Grounding(search_queries=("ai agents human handoff guidelines", "ai support agents resolution study"))  # fmt: skip
         return DiscoverOut(questions=questions, sources=sources), grounding
+
+    def _candidate(self, url: str) -> CandidateOut:
+        page = self.web.get(url.split("?")[0], FakePage())
+        return CandidateOut(url=url, title=page.title or None, publisher=page.publisher, source_type=page.source_type, question_ids=["Q1"])  # type: ignore[arg-type]  # fmt: skip
 
     def _fact_check(self, request: LLMRequest) -> tuple[FactCheckOut, Grounding]:
         claims = re.findall(r"^(C\d+) \[(S\d+)\] (.+)$", request.prompt, re.MULTILINE)
@@ -473,6 +487,32 @@ WEB: dict[str, FakePage] = {
             ),
         ),
     ),
+    "https://agency.example.gov/guidance/ai-helpdesks": FakePage(
+        status="success",
+        title="Guidance on automated helpdesks",
+        publisher="Example Agency",
+        published="2026-01-15",
+        source_type="organization",
+        facts=(
+            (
+                "Callers must be told they are talking to an automated system.",
+                "told they are talking to an automated system",
+            ),
+        ),
+    ),
+    "https://news.example.org/reports/ai-support-rollouts": FakePage(
+        status="success",
+        title="What AI support rollouts actually changed",
+        publisher="Example Report",
+        published="2026-02-02",
+        source_type="news",
+        facts=(
+            (
+                "Clinics that automated first-line answering reported shorter queues at the desk.",
+                "shorter queues at the desk",
+            ),
+        ),
+    ),
     "https://acme.test/blog/ai-support-agents": FakePage(
         status="success",
         title="AI support agents",
@@ -486,6 +526,13 @@ WEB: dict[str, FakePage] = {
         ),
     ),
 }
+# The phrase ``article_research.render_follow_up`` opens the second search with.
+FOLLOW_UP_MARKER = "A first search for this article already ran"
+# Pages a follow-up search proposes: readable where the first pass's pages weren't.
+FOLLOW_UP = [
+    "https://agency.example.gov/guidance/ai-helpdesks",
+    "https://news.example.org/reports/ai-support-rollouts",
+]
 CANDIDATES = [
     "https://docs.example.org/old-guide",
     "https://standards.example.org/ai-agents/handoff",

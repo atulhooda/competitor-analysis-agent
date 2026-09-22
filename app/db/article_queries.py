@@ -33,6 +33,7 @@ from app.domain.articles import (
     ArticleStep,
     ArticleStepView,
     ArticleSummary,
+    ArticleWriter,
     CitationView,
     ContentIssue,
     ResearchFact,
@@ -54,6 +55,7 @@ def summary(article: Article) -> ArticleSummary:
         opportunity_id=article.opportunity_id,
         attempt=article.attempt,
         origin=ArticleOrigin(article.origin),
+        writer=ArticleWriter(article.writer) if article.writer else None,
         status=ArticleStatus(article.status),
         current_step=ArticleStep(article.current_step) if article.current_step else None,
         title=article.title,
@@ -275,6 +277,18 @@ async def get_sources(session: AsyncSession, article_id: int, *, include_all: bo
         )
         for s in rows
     ]  # fmt: skip
+
+
+async def research_notes(session: AsyncSession, article_id: int) -> list[str]:
+    """What the current research run recorded about itself: how many searches it took, calls
+    Gemini rejected, budgets it ran into. Empty when research hasn't run."""
+    article = await session.get(Article, article_id)
+    if article is None or article.research_step_id is None:
+        return []
+    step = await session.get(ArticleStepRun, article.research_step_id)
+    output = step.output if step is not None and isinstance(step.output, dict) else {}
+    notes = output.get("notes")
+    return [str(note) for note in notes] if isinstance(notes, list) else []
 
 
 async def list_versions(session: AsyncSession, article_id: int) -> list[VersionSummary] | None:

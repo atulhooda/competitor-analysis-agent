@@ -31,6 +31,13 @@ ReasoningLevel = Literal["minimal", "low", "medium", "high"]
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 # Gemini's image model, used only for blog cover images. Override with GEMINI_IMAGE_MODEL.
 DEFAULT_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
+# The Claude model that writes articles when Claude is the writer. Override with CLAUDE_MODEL.
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"
+# The two text providers an article can be written by. Names are stored (articles.writer,
+# llm_calls.provider), so they are part of the data, not just configuration.
+GEMINI = "gemini"
+CLAUDE = "claude"
+WRITING_PROVIDERS = (GEMINI, CLAUDE)
 DEFAULT_USER_AGENT = (
     "CompetitorMonitorBot/0.1 (+https://github.com/atulhooda/competitor-analysis-agent)"
 )
@@ -117,6 +124,21 @@ class Settings(BaseSettings):
     # Cost controls. Tokens are counted from Gemini's reported usage.
     llm_max_tokens_per_run: int = Field(default=400_000, ge=1_000)
     llm_daily_token_budget: int = Field(default=2_000_000, ge=0, description="0 = unlimited")
+
+    # ── LLM: Anthropic Claude (second writer; research, outline, draft, edit) ─
+    # Claude writes articles alongside Gemini (WRITING_PROVIDER below) and is the provider
+    # an article falls back to when Gemini fails in a way no retry fixes. Validation
+    # (fact check, SEO, judge) and cover images stay with Gemini.
+    anthropic_api_key: SecretStr | None = None
+    claude_model: str = DEFAULT_CLAUDE_MODEL
+    # gemini: today's behaviour, Gemini writes everything.
+    # claude: Claude writes everything.
+    # split:  articles from editorial topics are written by Claude, articles from competitor
+    #         opportunities by Gemini (CLAUDE_ARTICLE_SHARE caps Claude's share of a day).
+    writing_provider: Literal["gemini", "claude", "split"] = "gemini"
+    # With "split": how many of a day's articles Claude may write (SCHEDULER_TIMEZONE days).
+    # The rest go to Gemini. 0 turns Claude off without unsetting its key.
+    claude_article_share: int = Field(default=10, ge=0, le=100)
 
     # ── Analysis (Phase 3) ───────────────────────────────────────────────────
     topics_file: Path = Path("config/topics.yaml")
@@ -284,7 +306,7 @@ class Settings(BaseSettings):
     pipeline_approve_opportunities: bool = True
     pipeline_min_opportunity_score: float = Field(default=60.0, ge=0, le=100)
 
-    @field_validator("api_key", "gemini_api_key", "wordpress_application_password", "github_token", "vercel_protection_bypass_secret", "pexels_api_key", mode="before")  # fmt: skip
+    @field_validator("api_key", "gemini_api_key", "anthropic_api_key", "wordpress_application_password", "github_token", "vercel_protection_bypass_secret", "pexels_api_key", mode="before")  # fmt: skip
     @classmethod
     def _blank_secret_is_unset(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
@@ -473,6 +495,19 @@ class Settings(BaseSettings):
     @property
     def writing_model(self) -> str:
         return self.gemini_writing_model or self.gemini_model
+
+    def writing_model_for(self, provider: str) -> str:
+        """The model that writes an article on ``provider`` (gemini or claude)."""
+        return self.claude_model if provider == CLAUDE else self.writing_model
+
+    def provider_configured(self, provider: str) -> bool:
+        """True when ``provider`` has an API key, so it can actually be called."""
+        key = self.anthropic_api_key if provider == CLAUDE else self.gemini_api_key
+        return key is not None
+
+    @property
+    def claude_configured(self) -> bool:
+        return self.anthropic_api_key is not None
 
     @property
     def quality_model(self) -> str:

@@ -28,10 +28,12 @@ from app.llm.base import (
 )
 from app.llm.errors import (
     LLMAuthenticationError,
+    LLMBillingError,
     LLMConfigurationError,
     LLMError,
     LLMInvalidRequestError,
     LLMRateLimitError,
+    LLMRequestRejectedError,
     LLMResponseError,
     LLMUnavailableError,
 )
@@ -188,7 +190,7 @@ class GeminiProvider:
             # because the SDK's public type exports don't match the runtime class.
             interaction: Any = await self._client.aio.interactions.create(**body)
         except Exception as exc:
-            mapped = _map_sdk_error(exc)
+            mapped = _map_sdk_error(exc, request)
             if mapped is None:
                 raise
             raise mapped from exc
@@ -364,8 +366,18 @@ def _errors(interaction: Any) -> str:
     return f": {'; '.join(messages)[:300]}" if messages else ""
 
 
-def _map_sdk_error(exc: Exception) -> LLMError | None:
-    """Map SDK/transport errors to our taxonomy by HTTP status (the SDK's classes are private)."""
+def _map_sdk_error(exc: Exception, request: LLMRequest | None = None) -> LLMError | None:
+    """Map SDK/transport errors to our taxonomy by HTTP status (the SDK's classes are private).
+
+    ``request`` tells the two kinds of HTTP 400 apart. A call that carries a built-in tool
+    also carries whatever that tool pulled off the web, and Gemini answers 400 when it
+    dislikes *that*: "Request contains an invalid argument", "Request blocked due to
+    copyright/recitation content", "Model generated invalid JSON syntax". Probing it with
+    real url_context calls (2026-09-23) showed the same URLs accepted on one attempt and
+    rejected on the next, so such a rejection says nothing about the next call and must not
+    stop the run. Without a tool, a 400 is about the setup (an unknown model, a bad
+    argument) and stays a systemic ``LLMInvalidRequestError``.
+    """
     status = getattr(exc, "status_code", None)
     detail = str(exc)[:300]
     if isinstance(status, int):
@@ -375,8 +387,13 @@ def _map_sdk_error(exc: Exception) -> LLMError | None:
             return LLMAuthenticationError(
                 f"Gemini rejected the credentials (HTTP {status}); check GEMINI_API_KEY"
             )
+        if status == 402:
+            # "prepayment credits are depleted": the request was fine, the account isn't.
+            return LLMBillingError(f"Gemini cannot bill this call (HTTP 402): {detail}")
         if status == 408 or status >= 500:
             return LLMUnavailableError(f"Gemini unavailable (HTTP {status}): {detail}")
+        if status == 400 and request is not None and request.tools:
+            return LLMRequestRejectedError(f"Gemini rejected this request (HTTP 400): {detail}")
         if 400 <= status < 500:
             return LLMInvalidRequestError(f"Gemini rejected the request (HTTP {status}): {detail}")
     names = {cls.__name__ for cls in type(exc).__mro__}

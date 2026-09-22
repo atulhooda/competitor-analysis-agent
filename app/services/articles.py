@@ -33,7 +33,7 @@ from sqlalchemy import func, select, true
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from app.config import Settings
+from app.config import GEMINI, Settings
 from app.core.errors import AppError, PermanentError, TransientError
 from app.core.timeutils import utcnow
 from app.crawling.netguard import Resolver, system_resolver
@@ -62,15 +62,21 @@ from app.domain.articles import (
     ArticleOutline,
     ArticleStatus,
     ArticleStep,
+    ArticleWriter,
     ContentIssue,
     ResearchResult,
     StepStatus,
     VersionKind,
 )
 from app.domain.history import ACTIVE_RUN_STATUSES, RunStatus, RunTrigger
-from app.domain.opportunities import OpportunityStatus
-from app.llm import LazyLLM, LLMConfigurationError, LLMError
+from app.domain.opportunities import (
+    OpportunityOrigin,
+    OpportunityStatus,
+    opportunity_origin,
+)
+from app.llm import LazyLLM, LLMConfigurationError, LLMError, WritingRouter, unrecoverable
 from app.prompts import article_draft, article_edit, article_outline, article_research
+from app.scheduling.schedules import local_day
 from app.services import article_brief
 from app.services.approval_rules import invalidate_all
 from app.services.article_brief import domain_of
@@ -91,6 +97,7 @@ from app.services.article_writing import (
 )
 from app.services.checkpoints import digest as _digest
 from app.services.checkpoints import fail_running_steps, find_checkpoint, new_run
+from app.services.daily_limits import written_by_on
 from app.services.llm_usage import BudgetedLLM, RunUsage
 from app.services.opportunities import OpportunityNotFoundError
 from app.services.research import ResearchConfig, ResearchFailedError, research
@@ -144,6 +151,8 @@ class ArticleOutcome:
     steps: dict[str, str]  # step → succeeded | reused | failed
     usage: RunUsage | None
     error: str | None
+    writer: str | None = None  # the provider that wrote it (gemini | claude)
+    fallbacks: tuple[str, ...] = ()  # one line per provider handover, never silent
 
 
 @dataclass
@@ -167,9 +176,10 @@ class _Chain:
 
 
 class _StepFailed(Exception):
-    def __init__(self, step: ArticleStep, message: str) -> None:
+    def __init__(self, step: ArticleStep, message: str, cause: BaseException | None = None) -> None:  # fmt: skip
         super().__init__(message)
         self.step = step
+        self.cause = cause  # the provider error, when one caused this
 
 
 class _Stopped(Exception):
@@ -205,6 +215,7 @@ class ArticleService:
         *,
         now: Callable[[], datetime] = utcnow,
         resolver: Resolver = system_resolver,
+        writers: WritingRouter | None = None,
     ) -> None:
         self._engine = engine
         self._sessions = sessions
@@ -212,6 +223,9 @@ class ArticleService:
         self._settings = settings
         self._now = now
         self._resolver = resolver  # DNS for the research URL safety check
+        # Which provider writes which article (WRITING_PROVIDER), and what it falls back
+        # to. ``llm`` stays the Gemini side, so an injected provider is still used.
+        self._writers = writers or WritingRouter(settings, llm)
 
     # ── fingerprints ─────────────────────────────────────────────────────────
 
@@ -219,12 +233,14 @@ class ArticleService:
     def _brief_fingerprint(assessment_id: int, company_profile_id: int) -> str:
         return _digest({"step": "brief", "builder": article_brief.BRIEF_VERSION, "assessment": assessment_id, "company_profile": company_profile_id})  # fmt: skip
 
-    def _fingerprint(self, step: ArticleStep, chain: _Chain) -> str:
+    def _fingerprint(self, step: ArticleStep, chain: _Chain, writer: str = GEMINI) -> str:
+        """The step's input fingerprint. ``writer`` is part of it through the model name,
+        so a step Gemini produced is never reused as if Claude had written it."""
         data: dict[str, Any] = {"step": step.value, "prompt": prompt_version(step), "brief": chain.brief_hash}  # fmt: skip
         if step is ArticleStep.RESEARCH:
-            data["config"] = ResearchConfig.from_settings(self._settings).fingerprint_data()
+            data["config"] = ResearchConfig.from_settings(self._settings, writer).fingerprint_data()  # fmt: skip
             return _digest(data)
-        data["config"] = WritingConfig.from_settings(self._settings).fingerprint_data(final=step is ArticleStep.EDIT)  # fmt: skip
+        data["config"] = WritingConfig.from_settings(self._settings, writer).fingerprint_data(final=step is ArticleStep.EDIT)  # fmt: skip
         data["research"] = chain.research_hash
         if step in (ArticleStep.DRAFT, ArticleStep.EDIT):
             data["outline"] = chain.outline_hash
@@ -235,10 +251,11 @@ class ArticleService:
     # ── requests ─────────────────────────────────────────────────────────────
 
     def _require_llm(self) -> None:
-        if not self._llm.configured:
+        if not self._writers.providers:
             raise LLMConfigurationError(
                 "GEMINI_API_KEY is not set: article generation needs Gemini "
-                "(the brief preview works without it)"
+                "(or ANTHROPIC_API_KEY, to write with Claude; the brief preview works "
+                "without either)"
             )
 
     async def preview_brief(self, opportunity_id: int) -> ArticleBrief:
@@ -392,6 +409,8 @@ class ArticleService:
         steps: dict[str, str] = {}
         llm: BudgetedLLM | None = None
         executed = False
+        writer = GEMINI
+        fallbacks: list[str] = []
         async with article_lock(self._engine, article_id) as acquired:
             if not acquired:
                 return await self._finish(run_id, article_id, RunStatus.FAILED, steps, None, "another run is generating this article")  # fmt: skip
@@ -405,13 +424,15 @@ class ArticleService:
                     run.started_at = now
                     article = await session.get_one(Article, article_id)
                     budget_left = max(self._settings.article_max_tokens - article.tokens_used, 0)
+                writer = await self._choose_writer(article_id)
+                await self._stamp_writer(article_id, writer)
                 llm = BudgetedLLM(
-                    self._llm.get(), self._sessions, self._settings, run_id=run_id, now=self._now,
+                    self._writers.get(writer), self._sessions, self._settings, run_id=run_id, now=self._now,
                     token_limit=budget_left, token_limit_name="ARTICLE_MAX_TOKENS (what's left for this article)",  # noqa: S106 - a setting name
                 )  # fmt: skip
                 chain = await self._brief_chain(article_id, run_id, steps)
                 for step in STEP_ORDER[1:]:
-                    fingerprint = self._fingerprint(step, chain)
+                    fingerprint = self._fingerprint(step, chain, writer)
                     async with self._sessions() as session, session.begin():
                         reused = await self._load_step(session, step, fingerprint, chain)
                         if reused:
@@ -419,30 +440,28 @@ class ArticleService:
                     if reused:
                         steps[step.value] = "reused"
                         continue
-                    await self._run_step(step, fingerprint, chain, llm, run_id)
+                    writer = await self._write_step(step, fingerprint, chain, llm, run_id, writer, fallbacks)  # fmt: skip
                     steps[step.value] = "succeeded"
                     executed = True
                 await self._complete(chain)
-                return await self._finish(run_id, article_id, RunStatus.SUCCEEDED, steps, llm, None)
+                return await self._finish(run_id, article_id, RunStatus.SUCCEEDED, steps, llm, None, writer, fallbacks)  # fmt: skip
             except _StepFailed as exc:
                 steps[exc.step.value] = "failed"
                 status = RunStatus.PARTIAL if executed else RunStatus.FAILED
-                return await self._finish(run_id, article_id, status, steps, llm, f"{exc.step.value}: {exc}")  # fmt: skip
+                return await self._finish(run_id, article_id, status, steps, llm, f"{exc.step.value}: {exc}", writer, fallbacks)  # fmt: skip
             except _Stopped as exc:
                 if not exc.cancelled:
                     await self._set_failed(article_id, exc.step, str(exc))
-                return await self._finish(
-                    run_id, article_id, RunStatus.FAILED, steps, llm, str(exc)
-                )
+                return await self._finish(run_id, article_id, RunStatus.FAILED, steps, llm, str(exc), writer, fallbacks)  # fmt: skip
             except asyncio.CancelledError:
                 await self._set_failed(article_id, None, "interrupted: the server stopped during generation")  # fmt: skip
-                await self._finish(run_id, article_id, RunStatus.FAILED, steps, llm, "cancelled")
+                await self._finish(run_id, article_id, RunStatus.FAILED, steps, llm, "cancelled", writer, fallbacks)  # fmt: skip
                 raise
             except Exception as exc:  # the article and run must never be left in progress
                 log.exception("article.crashed", article_id=article_id, run_id=run_id)
                 message = f"{type(exc).__name__}: {exc}"
                 await self._set_failed(article_id, None, message)
-                return await self._finish(run_id, article_id, RunStatus.FAILED, steps, llm, message)
+                return await self._finish(run_id, article_id, RunStatus.FAILED, steps, llm, message, writer, fallbacks)  # fmt: skip
 
     async def _brief_chain(self, article_id: int, run_id: int, steps: dict[str, str]) -> _Chain:
         async with self._sessions() as session, session.begin():
@@ -464,7 +483,54 @@ class ArticleService:
             steps[ArticleStep.BRIEF.value] = "succeeded"
             return _Chain(article_id=article_id, brief=brief, brief_hash=_digest(output))
 
-    async def _run_step(self, step: ArticleStep, fingerprint: str, chain: _Chain, llm: BudgetedLLM, run_id: int) -> None:  # fmt: skip
+    async def _choose_writer(self, article_id: int) -> str:
+        """Which provider writes this article.
+
+        An article that already has a writer keeps it, so a resume continues with the
+        provider whose steps are on disk instead of re-running them. A new one is routed by
+        WRITING_PROVIDER: under ``split``, articles from editorial topics go to Claude
+        (up to CLAUDE_ARTICLE_SHARE a day) and articles from competitor opportunities to
+        Gemini.
+        """
+        async with self._sessions() as session:
+            article = await session.get_one(Article, article_id)
+            if article.writer and self._writers.configured(article.writer):
+                return article.writer
+            opportunity = await session.get_one(Opportunity, article.opportunity_id)
+            editorial = opportunity_origin(opportunity.key) is OpportunityOrigin.EDITORIAL
+            written_today = 0
+            if editorial and self._writers.caps_claude():
+                day = local_day(self._now(), self._settings.scheduler_tz)
+                written_today = await written_by_on(session, day, self._settings, writer=ArticleWriter.CLAUDE.value)  # fmt: skip
+        return self._writers.choose(editorial=editorial, claude_written_today=written_today)
+
+    async def _stamp_writer(self, article_id: int, writer: str) -> None:
+        async with self._sessions() as session, session.begin():
+            article = await session.get_one(Article, article_id, with_for_update=True)
+            article.writer = writer
+
+    async def _write_step(self, step: ArticleStep, fingerprint: str, chain: _Chain, llm: BudgetedLLM, run_id: int, writer: str, fallbacks: list[str]) -> str:  # fmt: skip
+        """Run one step, falling back to the other provider when this one failed in a way
+        no retry fixes (credentials, billing, configuration, a rejected request). Returns
+        the provider that actually wrote the step: the rest of the article follows it."""
+        try:
+            await self._run_step(step, fingerprint, chain, llm, run_id, writer)
+            return writer
+        except _StepFailed as exc:
+            alternate = self._writers.fallback(writer) if unrecoverable(exc.cause) else None
+            if alternate is None:
+                raise
+            note = f"{step.value}: {writer} failed with an error no retry fixes ({exc}); {alternate} wrote it instead"  # fmt: skip
+            log.warning("article.writer_fallback", article_id=chain.article_id, run_id=run_id, step=step.value, failed=writer, took_over=alternate, error=str(exc)[:300])  # fmt: skip
+        fallbacks.append(note)
+        llm.switch_to(self._writers.get(alternate))
+        await self._stamp_writer(chain.article_id, alternate)
+        # A different model means a different fingerprint: the failed step is redone, never
+        # reused, and every later step is fingerprinted for the new provider too.
+        await self._run_step(step, self._fingerprint(step, chain, alternate), chain, llm, run_id, alternate)  # fmt: skip
+        return alternate
+
+    async def _run_step(self, step: ArticleStep, fingerprint: str, chain: _Chain, llm: BudgetedLLM, run_id: int, writer: str = GEMINI) -> None:  # fmt: skip
         now = self._now()
         async with self._sessions() as session, session.begin():
             article = await session.get_one(Article, chain.article_id, with_for_update=True)
@@ -476,28 +542,29 @@ class ArticleService:
             article.status = STATUS_FOR_STEP[step].value
             article.current_step = step.value
             article.error = None
-            row = ArticleStepRun(article_id=chain.article_id, run_id=run_id, step=step.value, status=StepStatus.RUNNING.value, fingerprint=fingerprint, prompt_version=prompt_version(step), model=self._settings.writing_model, started_at=now)  # fmt: skip
+            article.failed_step = None  # a fallback retry leaves no stale failure behind
+            row = ArticleStepRun(article_id=chain.article_id, run_id=run_id, step=step.value, status=StepStatus.RUNNING.value, fingerprint=fingerprint, prompt_version=prompt_version(step), model=self._settings.writing_model_for(writer), started_at=now)  # fmt: skip
             session.add(row)
             await session.flush()
             step_id = row.id
         tokens, calls = llm.usage.total_tokens, llm.usage.calls
         log.info("article.step", article_id=chain.article_id, step=step.value, run_id=run_id)
         try:
-            result = await self._generate(step, chain, llm)
+            result = await self._generate(step, chain, llm, writer)
         except BaseException as exc:
             partial = exc.result.model_dump(mode="json") if isinstance(exc, ResearchFailedError) else None  # fmt: skip
             message = str(exc) if isinstance(exc, AppError) else f"{type(exc).__name__}: {exc}"
             await self._record_failure(step_id, chain.article_id, step, message or type(exc).__name__, llm.usage.total_tokens - tokens, llm.usage.calls - calls, partial)  # fmt: skip
             if isinstance(exc, LLMError | ResearchFailedError | ContentRejectedError):
-                raise _StepFailed(step, message) from exc
+                raise _StepFailed(step, message, cause=exc) from exc
             raise
         await self._record_success(step, step_id, chain, result, llm.usage.total_tokens - tokens, llm.usage.calls - calls)  # fmt: skip
 
-    async def _generate(self, step: ArticleStep, chain: _Chain, llm: BudgetedLLM) -> ResearchResult | tuple[ArticleOutline, list[ContentIssue], str] | Written:  # fmt: skip
+    async def _generate(self, step: ArticleStep, chain: _Chain, llm: BudgetedLLM, writer: str = GEMINI) -> ResearchResult | tuple[ArticleOutline, list[ContentIssue], str] | Written:  # fmt: skip
         if step is ArticleStep.RESEARCH:
             website = chain.brief.company.website
-            return await research(llm, chain.brief, ResearchConfig.from_settings(self._settings), resolver=self._resolver, company_domain=domain_of(website) if website else None)  # fmt: skip
-        config = WritingConfig.from_settings(self._settings)
+            return await research(llm, chain.brief, ResearchConfig.from_settings(self._settings, writer), resolver=self._resolver, company_domain=domain_of(website) if website else None)  # fmt: skip
+        config = WritingConfig.from_settings(self._settings, writer)
         if chain.research is None:
             raise RuntimeError("the writing steps need research")
         if step is ArticleStep.OUTLINE:
@@ -624,15 +691,21 @@ class ArticleService:
             raise _StepFailed(ArticleStep.EDIT, "completion checks failed: " + "; ".join(problems))  # fmt: skip
         log.info("article.completed", article_id=chain.article_id)
 
-    async def _finish(self, run_id: int, article_id: int, status: RunStatus, steps: dict[str, str], llm: BudgetedLLM | None, error: str | None) -> ArticleOutcome:  # fmt: skip
+    async def _finish(self, run_id: int, article_id: int, status: RunStatus, steps: dict[str, str], llm: BudgetedLLM | None, error: str | None, writer: str | None = None, fallbacks: list[str] | None = None) -> ArticleOutcome:  # fmt: skip
         async with self._sessions() as session:
             article = await session.get_one(Article, article_id)
             article_status = ArticleStatus(article.status)
+            written_by = article.writer or writer
         usage = llm.usage if llm else None
-        summary = {"article_id": article_id, "article_status": article_status.value, "steps": steps}  # fmt: skip
+        handovers = tuple(fallbacks or ())
+        summary: dict[str, Any] = {"article_id": article_id, "article_status": article_status.value, "steps": steps, "writer": written_by}  # fmt: skip
+        if handovers:  # a provider handover is reported, never silent
+            summary["writer_fallbacks"] = list(handovers)
         await finish_run(self._sessions, run_id, status=status, now=self._now(), error=error, summary=summary, stats=usage.as_dict() if usage else None)  # fmt: skip
-        log.info("article.run_finished", article_id=article_id, run_id=run_id, status=status.value, article_status=article_status.value, error=error)  # fmt: skip
-        return ArticleOutcome(article_id, run_id, article_status, status, steps, usage, error)
+        log.info("article.run_finished", article_id=article_id, run_id=run_id, status=status.value, article_status=article_status.value, writer=written_by, fallbacks=len(handovers), error=error)  # fmt: skip
+        return ArticleOutcome(
+            article_id, run_id, article_status, status, steps, usage, error, written_by, handovers
+        )
 
     async def _set_failed(self, article_id: int, step: ArticleStep | None, error: str) -> None:
         async with self._sessions() as session, session.begin():
@@ -689,8 +762,9 @@ class ArticleService:
         chain = await self._load_brief(session, article)
         if chain is None:
             return list(STEP_ORDER)
+        writer = article.writer or GEMINI
         for index, step in enumerate(STEP_ORDER[1:], start=1):
-            if not await self._load_step(session, step, self._fingerprint(step, chain), chain):
+            if not await self._load_step(session, step, self._fingerprint(step, chain, writer), chain):  # fmt: skip
                 return list(STEP_ORDER[index:])
         return []
 

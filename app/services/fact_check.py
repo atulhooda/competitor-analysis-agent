@@ -42,7 +42,7 @@ from app.domain.quality import (
     SourceCheck,
     UncitedClaim,
 )
-from app.llm import LLMRequest, LLMResponseError, ReasoningEffort
+from app.llm import LLMRequest, LLMRequestRejectedError, LLMResponseError, ReasoningEffort
 from app.prompts import fact_check as prompt
 from app.services.article_content import citations, split_sentences, strip_markers, text_blocks
 from app.services.checkpoints import digest
@@ -468,6 +468,11 @@ async def _reread(llm: BudgetedLLM, unsettled: Sequence[PairResult], sources: Ma
         )
         try:
             response = await llm.structured(request, prompt.FactCheckOut, purpose=LLMPurpose.FACT_CHECK, prompt_version=prompt.VERSION, items=len(group))  # fmt: skip
+        except LLMRequestRejectedError:
+            # Gemini refused this one re-read over its content; the claim stays unverified.
+            for p in group:
+                p.verdict, p.explanation = ClaimVerdict.UNSUPPORTED.value, "Gemini rejected the request to re-read the source."  # fmt: skip
+            continue
         except LLMResponseError:
             for p in group:
                 p.verdict, p.explanation = ClaimVerdict.UNSUPPORTED.value, "Re-reading the source returned unusable output."  # fmt: skip

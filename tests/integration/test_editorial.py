@@ -15,6 +15,7 @@ from app.crawling.fetcher import PoliteFetcher
 from app.db import queries
 from app.db.locks import editorial_lock
 from app.db.models import (
+    Article,
     LLMCall,
     Opportunity,
     OpportunityAssessment,
@@ -33,7 +34,7 @@ from app.domain.opportunities import (
     OpportunityStatus,
     ScoringConfig,
 )
-from app.llm import LazyLLM, LLMConfigurationError, LLMUnavailableError
+from app.llm import LazyLLM, LLMConfigurationError, LLMUnavailableError, WritingRouter
 from app.prompts.editorial import EditorialIdeasOut
 from app.prompts.opportunity import OpportunityInterpretationOut
 from app.services.articles import ArticleService
@@ -77,8 +78,14 @@ class World:
             rows = await session.scalars(select(Opportunity).where(Opportunity.key.startswith(EDITORIAL_KEY_PREFIX)).order_by(Opportunity.id))  # fmt: skip
             return {o.topic_label: o for o in rows}
 
-    def articles(self) -> ArticleService:
-        return ArticleService(self.env.engine, self.env.sessions, LazyLLM(self.env.settings, provider=self.fake), self.env.settings, now=self.env.wall, resolver=public_resolver)  # type: ignore[arg-type]  # fmt: skip
+    def articles(self, *, claude: FakeLLM | None = None, **overrides: Any) -> ArticleService:
+        """``claude`` gives the service a second writer, so WRITING_PROVIDER can route."""
+        s = self.settings(**overrides) if overrides else self.env.settings
+        writers = WritingRouter(s, LazyLLM(s, provider=self.fake), LazyLLM(s, provider=claude, name="claude") if claude else None)  # type: ignore[arg-type]  # fmt: skip
+        return ArticleService(self.env.engine, self.env.sessions, LazyLLM(s, provider=self.fake), s, now=self.env.wall, resolver=public_resolver, writers=writers)  # type: ignore[arg-type]  # fmt: skip
+
+    async def approve(self, opportunity_id: int) -> None:
+        await OpportunityService(self.env.engine, self.env.sessions, LazyLLM(self.env.settings, provider=self.fake), self.env.settings, now=self.env.wall).set_status(opportunity_id, OpportunityStatus.APPROVED, note="write it", actor="cli")  # type: ignore[arg-type]  # fmt: skip
 
 
 @pytest.fixture
@@ -291,3 +298,51 @@ async def test_only_one_proposal_run_at_a_time(world: World) -> None:
     assert busy.status is RunStatus.FAILED
     assert busy.error == "another editorial proposal run is running"
     assert await world.editorial() == {}
+
+
+# ── who writes an editorial article (WRITING_PROVIDER=split) ────────────────
+
+
+def claude_fake() -> FakeLLM:
+    return FakeLLM(provider="claude", model="fake-claude")
+
+
+async def written_by(world: World, article_id: int) -> str | None:
+    async with world.env.sessions() as session:
+        return (await session.get_one(Article, article_id)).writer
+
+
+async def test_split_sends_editorial_articles_to_claude(world: World) -> None:
+    outcome = await world.propose(count=1)
+    [idea] = outcome.created
+    assert idea.opportunity_id is not None
+    await world.approve(idea.opportunity_id)
+    claude = claude_fake()
+
+    _, article = await world.articles(claude=claude, writing_provider="split").generate(idea.opportunity_id, trigger=RunTrigger.CLI)  # fmt: skip
+
+    assert article is not None
+    assert article.status is ArticleStatus.COMPLETED, article.error
+    assert article.writer == "claude"
+    assert await written_by(world, article.article_id) == "claude"
+    assert claude.calls(EditorialIdeasOut) == []  # only the writing steps moved
+
+
+async def test_the_daily_share_sends_the_rest_of_the_day_back_to_gemini(world: World) -> None:
+    outcome = await world.propose(count=2)
+    first, second = outcome.created
+    assert first.opportunity_id is not None
+    assert second.opportunity_id is not None
+    await world.approve(first.opportunity_id)
+    await world.approve(second.opportunity_id)
+    claude = claude_fake()
+    service = world.articles(claude=claude, writing_provider="split", claude_article_share=1)
+
+    _, one = await service.generate(first.opportunity_id, trigger=RunTrigger.CLI)
+    _, two = await service.generate(second.opportunity_id, trigger=RunTrigger.CLI)
+
+    assert one is not None
+    assert two is not None
+    assert one.writer == "claude"  # the day's one Claude article
+    assert two.writer == "gemini"  # the share is used up; the rest go to Gemini
+    assert await written_by(world, two.article_id) == "gemini"

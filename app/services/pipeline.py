@@ -76,6 +76,7 @@ from app.domain.publishing import ApprovalDecision, PublicationStatus, TargetSta
 from app.llm import (
     LazyLLM,
     LLMAuthenticationError,
+    LLMBillingError,
     LLMConfigurationError,
     LLMInvalidRequestError,
 )
@@ -95,8 +96,10 @@ from app.services.scans import ScanService
 
 log = structlog.get_logger(__name__)
 
-# Gemini failures that no retry fixes: every later call would fail the same way.
-_SYSTEMIC_LLM = (LLMAuthenticationError, LLMConfigurationError, LLMInvalidRequestError)
+# Provider failures that no retry fixes: every later call would fail the same way.
+# LLMRequestRejectedError is deliberately not one of them: a 400 on a call carrying web
+# content is about that content, and the next call can succeed (see app/llm/errors.py).
+_SYSTEMIC_LLM = (LLMAuthenticationError, LLMBillingError, LLMConfigurationError, LLMInvalidRequestError)  # fmt: skip
 _RUN_TRIGGER = {JobTrigger.CLI: RunTrigger.CLI, JobTrigger.API: RunTrigger.API}
 # Where a publication counts as done for a target (a public post is never re-sent as a draft).
 _DONE = {
@@ -272,16 +275,28 @@ class PipelineService:
         return f"LLM_DAILY_TOKEN_BUDGET={budget:,} is spent ({used:,} tokens used today, UTC)"
 
     async def _llm_blocker(self, run_ids: list[int]) -> StageResult | None:
-        """A failed stage if these runs hit a Gemini failure that affects every call
-        (credentials, configuration, an unknown model): no point going on, nor retrying."""
+        """A failed stage if these runs hit a provider failure that affects every call
+        (credentials, billing, configuration, an unknown model): no point going on, nor
+        retrying.
+
+        A failure the article recovered from by falling back to the other provider is not
+        a blocker: the run went on and produced an article. That is recognised by a
+        succeeded call from a *different* provider in the same run.
+        """
         if not run_ids:
             return None
         async with self._sessions() as session:
-            errors = await session.scalars(select(LLMCall.error).where(LLMCall.run_id.in_(run_ids), LLMCall.status == LLMCallStatus.FAILED.value, LLMCall.error.is_not(None)))  # fmt: skip
-            for error in errors:
-                kind = named_type(error)
-                if kind is not None and issubclass(kind, _SYSTEMIC_LLM):
-                    return _failed(f"Gemini: {error}", classify_type(kind), runs=run_ids)
+            rows = (await session.execute(select(LLMCall.provider, LLMCall.status, LLMCall.error).where(LLMCall.run_id.in_(run_ids)))).all()  # fmt: skip
+        served = {provider for provider, status, _ in rows if status == LLMCallStatus.SUCCEEDED.value}  # fmt: skip
+        for provider, status, error in rows:
+            if status != LLMCallStatus.FAILED.value or not error:
+                continue
+            kind = named_type(error)
+            if kind is None or not issubclass(kind, _SYSTEMIC_LLM):
+                continue
+            if served - {provider}:  # another provider took over and wrote it
+                continue
+            return _failed(f"{provider}: {error}", classify_type(kind), runs=run_ids)
         return None
 
     @asynccontextmanager
@@ -455,6 +470,11 @@ class PipelineService:
         failed = {k: e for k, e in finished.items() if int(k) not in ok}
         warnings = list(progress.get("warnings") or []) + [f"article {k}: {e.get('error') or e['status']}" for k, e in failed.items()]  # fmt: skip
         summary = {**(progress.get("selection") or {}), "articles": articles, "generated": ok, "failed": sorted(int(k) for k in failed)}  # fmt: skip
+        summary["writers"] = {k: e["writer"] for k, e in finished.items() if e.get("writer")}
+        handovers = [f"article {k}: {note}" for k, e in finished.items() for note in e.get("writer_fallbacks") or []]  # fmt: skip
+        if handovers:
+            summary["writer_fallbacks"] = handovers
+            warnings = [*warnings, *handovers]
         runs_done = [int(e["run_id"]) for e in finished.values() if e.get("run_id")]
         if budget is not None:
             waiting = [a for a in articles if str(a) not in finished]
@@ -535,7 +555,10 @@ class PipelineService:
                 outcome = maybe
         except Exception as exc:
             return {"run_id": None, "status": ArticleStatus.FAILED.value, "error": f"{type(exc).__name__}: {exc}", "kind": classify(exc).value}  # fmt: skip
-        return {"run_id": outcome.run_id, "status": outcome.status.value, "error": outcome.error, "tokens": outcome.usage.total_tokens if outcome.usage else 0}  # fmt: skip
+        entry: dict[str, Any] = {"run_id": outcome.run_id, "status": outcome.status.value, "error": outcome.error, "tokens": outcome.usage.total_tokens if outcome.usage else 0, "writer": outcome.writer}  # fmt: skip
+        if outcome.fallbacks:  # never silent: the job summary names every handover
+            entry["writer_fallbacks"] = list(outcome.fallbacks)
+        return entry
 
     async def _quality(self, ctx: JobContext) -> StageResult:
         own = [int(a) for a in (self._progress(ctx, Stage.GENERATE).get("articles") or [])]

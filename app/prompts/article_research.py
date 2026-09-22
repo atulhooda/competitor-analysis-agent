@@ -5,6 +5,10 @@
 2. read (URL context): Gemini retrieves the candidate pages and extracts facts from them.
    The tool reports which URLs it actually retrieved; only those become sources, so a
    made-up or broken URL never reaches the article.
+
+``render_follow_up`` is the discover call again after too few pages could be read: the same
+output schema, the unanswered questions, and a push towards sources an automated reader can
+open.
 """
 
 from collections.abc import Sequence
@@ -132,6 +136,47 @@ def render_discover(brief: ArticleBrief, *, max_questions: int, max_sources: int
         "",
         f"Ask at most {max_questions} research question(s) and return at most {max_sources} "
         "source(s).",
+    ]
+    return "\n".join(lines)
+
+
+def render_follow_up(
+    brief: ArticleBrief,
+    *,
+    questions: Sequence[ResearchQuestion],
+    tried: Sequence[str],
+    max_sources: int,
+) -> str:
+    """A second search, after too few of the first pass's pages could be read."""
+    lines = [
+        "A first search for this article already ran. Too few of the pages it proposed could "
+        "actually be read, so the article still has no evidence for the questions below.",
+        "",
+        f"Article: {brief.working_title}",
+        f"- topic: {brief.topic}",
+        f"- target audience: {brief.target_audience}",
+        f"- search intent: {brief.search_intent.value}",
+        f"- primary angle: {brief.primary_angle}",
+        "",
+        f"Publisher (don't research it): {brief.company.name}: {brief.company.description}",
+        "Competitor domains (vendor marketing: never use as authorities): "
+        + (", ".join(brief.competitor_domains) or "none"),
+        "",
+        "Questions still without evidence:",
+        *[f"{q.id} | {q.question}" for q in questions],
+        "",
+        "Already tried (never propose these again):",
+        *[f"- {url}" for url in tried],
+        "",
+        "Search again, differently: other wording, other angles, and other kinds of source. "
+        "A page has to be readable by an automated reader to be of any use, so prefer an "
+        "HTML page over a PDF, an official summary, press release or explainer over a "
+        "database, portal or search-results page, and a report of a study over a paper "
+        "behind a login. Authority still comes first; a readable second-best source beats an "
+        "authoritative one nothing can open.",
+        "",
+        f"Ask no new questions. Return at most {max_sources} source(s), each with the exact "
+        "URL you saw in the search results.",
     ]
     return "\n".join(lines)
 

@@ -49,6 +49,7 @@ from app.domain.articles import (
     ArticleOrigin,
     ArticleStatus,
     ArticleStep,
+    ArticleWriter,
     SourceType,
     StepStatus,
     VersionKind,
@@ -64,6 +65,7 @@ class Article(TimestampMixin, Base):
     __table_args__ = (
         one_of("status", ArticleStatus),
         one_of("origin", ArticleOrigin),
+        one_of("writer", ArticleWriter),
         one_of("current_step", ArticleStep),
         one_of("failed_step", ArticleStep),
         Index("ix_articles_status_created_at", "status", "created_at"),
@@ -82,8 +84,12 @@ class Article(TimestampMixin, Base):
     assessment_id: Mapped[int] = mapped_column(ForeignKey("opportunity_assessments.id", ondelete="RESTRICT"))  # fmt: skip
     company_profile_id: Mapped[int] = mapped_column(ForeignKey("company_profiles.id", ondelete="RESTRICT"))  # fmt: skip
     attempt: Mapped[int]
-    # Who wrote it: the five Gemini steps, or a person whose file was imported.
+    # Who wrote it: the five generation steps, or a person whose file was imported.
     origin: Mapped[str] = mapped_column(String(16), default=ArticleOrigin.GENERATED.value, server_default=ArticleOrigin.GENERATED.value)  # fmt: skip
+    # Which LLM provider wrote it (gemini | claude). NULL for articles written before
+    # Claude existed and for imported ones. A run that falls back rewrites it, so this is
+    # always the provider that produced the article's current content.
+    writer: Mapped[str | None] = mapped_column(String(16))
     status: Mapped[str] = mapped_column(String(16))
     current_step: Mapped[str | None] = mapped_column(String(16))
     title: Mapped[str] = mapped_column(Text)
