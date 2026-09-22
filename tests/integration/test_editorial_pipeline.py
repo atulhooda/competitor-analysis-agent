@@ -72,6 +72,23 @@ async def test_each_origin_has_its_own_generation_allowance(rig: Rig) -> None:
     assert len(await rig.articles()) == 3
 
 
+async def test_one_run_writes_only_its_share_so_the_day_stays_spread(rig: Rig) -> None:
+    """MAX_ARTICLES_PER_RUN: with a schedule every two hours and one article per run, a run
+    takes one opportunity and leaves the rest of the day's allowance for the next run."""
+    await rig.clone_opportunity(score=70.0)
+    await rig.clone_opportunity(score=65.0)
+    settings: dict[str, Any] = {"pipeline_approve_opportunities": True, "max_articles_generated_per_day": 4, "max_articles_per_run": 1}  # fmt: skip
+    first = await rig.run(JobType.GENERATE_ARTICLES, **settings)
+    s = stage(first, "generate")
+    assert s.status is StageStatus.COMPLETED, s.warnings
+    assert s.summary["per_run"] == 1
+    assert len(s.summary["selected"]) == 1
+    assert len(await rig.articles()) == 1
+    second = await rig.run(JobType.GENERATE_ARTICLES, **settings)
+    assert len(stage(second, "generate").summary["selected"]) == 1
+    assert len(await rig.articles()) == 2  # one per run, not the whole day at once
+
+
 async def test_the_plan_shows_the_ideas_needed_and_each_opportunitys_origin(rig: Rig) -> None:
     settings: dict[str, Any] = {"pipeline_approve_opportunities": True, "max_editorial_articles_per_day": 2}  # fmt: skip
     before = await rig.run(JobType.FULL_PIPELINE, dry_run=True, **settings)

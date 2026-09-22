@@ -46,6 +46,7 @@ from app.core.timeutils import utcnow
 from app.db.locks import generation_limit_lock
 from app.db.models import Article, LLMCall, Run
 from app.db.pipeline_queries import (
+    OpportunityCandidate,
     PublishCandidate,
     active_competitors,
     opportunity_candidates,
@@ -487,12 +488,16 @@ class PipelineService:
             }  # fmt: skip
             if not any(remaining.values()) and not articles:
                 return StageResult(StageStatus.SKIPPED, selection, [f"the daily generation limits are reached ({used[competitors]} of {limits[competitors]} from competitors, {used[editorial]} of {limits[editorial]} editorial on {day}, {self._settings.scheduler_timezone})"])  # fmt: skip
-            chosen = []
+            per_run = self._settings.max_articles_per_run or None
+            chosen: list[OpportunityCandidate] = []
             for candidate in candidates:
+                if per_run is not None and len(chosen) >= per_run:
+                    break  # the rest waits for the next run: the day's posts stay spread out
                 origin = opportunity_origin(candidate.opportunity.key)
                 if remaining[origin] > 0:
                     remaining[origin] -= 1
                     chosen.append(candidate)
+            selection["per_run"] = per_run
             for candidate in chosen:
                 opportunity = candidate.opportunity
                 try:
@@ -620,6 +625,9 @@ class PipelineService:
         # most MAX_ARTICLES_PER_DAY of them.
         earlier = sum(1 for e in done.values() if e["status"] in _SENT)  # an interrupted attempt
         allowance = remaining if target is TargetStatus.PUBLISH else max(limit - earlier, 0)
+        if settings.max_articles_per_run:
+            allowance = min(allowance, max(settings.max_articles_per_run - earlier, 0))
+            summary["per_run"] = settings.max_articles_per_run
         if allowance == 0 and not done:
             return StageResult(StageStatus.SKIPPED, summary, [f"the daily publishing limit is reached ({used} of {limit} on {day}, {settings.scheduler_timezone}): the rest waits for a later run"])  # fmt: skip
         sent, streak, notes = 0, 0, []
