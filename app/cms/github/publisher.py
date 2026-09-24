@@ -77,6 +77,33 @@ MAX_LISTED_FILES = 200
 MAX_OPEN_PRS = 100
 _TAGS = re.compile(r"<[^>]+>")
 _LOC = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>")
+_POST_LINK = re.compile(r'href="/blog/([a-z0-9][a-z0-9-]*)/?"')
+# An inline style that makes an element invisible. A reveal animation that never fires
+# leaves exactly this on the element (framer-motion renders its initial state inline).
+_HIDING = re.compile(
+    r"(?<![\w-])(opacity\s*:\s*0(?:\.0+)?(?![\d.])|display\s*:\s*none|visibility\s*:\s*hidden)",
+    re.I,
+)
+
+
+def index_posts(page: str) -> set[str]:
+    """The post slugs a blog index links to."""
+    return set(_POST_LINK.findall(page))
+
+
+def hidden_by(page: str, element_id: str) -> str | None:
+    """The inline declaration hiding the element with ``element_id``, or None when it is
+    visible (or absent). Only the element's own opening tag is read."""
+    if not element_id:
+        return None
+    tag = re.search(rf'<[a-zA-Z][^>]*\bid="{re.escape(element_id)}"[^>]*>', page)
+    if tag is None:
+        return None
+    style = re.search(r'\bstyle="([^"]*)"', tag.group(0))
+    found = _HIDING.search(style.group(1)) if style else None
+    return " ".join(found.group(1).split()) if found else None
+
+
 _DATE_KEYS = ("publishedAt", "updatedAt")
 
 
@@ -560,9 +587,34 @@ class GitHubPublishingAdapter:
         problems = self._page_problems(response, url, title, headings, production=False)
         if problems:
             raise CMSDeploymentError(f"the preview of pull request #{pr['number']} doesn't serve the post: " + "; ".join(problems))  # fmt: skip
+        problems = await self._index_problems(base_url, slug)
+        if problems:
+            raise CMSDeploymentError(f"not merged: the preview of pull request #{pr['number']} would break the blog index: " + "; ".join(problems))  # fmt: skip
         self._verified_previews[sha] = base_url
         log.info("github.preview_verified", repo=self._repo, pr=pr["number"], url=url)
         return base_url
+
+    async def _index_problems(self, base_url: str, slug: str) -> list[str]:
+        """What is wrong with the blog index a merge would put live: the new post missing, a
+        post that is live today missing, or the post cards hidden. A publishing agent must
+        never keep adding posts to an index nobody can see."""
+        path = self._config.index_path
+        url = f"{base_url.rstrip('/')}{path}"
+        response = await self._site.fetch(url)
+        if response.status_code != 200:
+            return [f"{url} answered {response.status_code}"]
+        page = response.text or ""
+        listed = index_posts(page)
+        problems = []
+        if slug not in listed:
+            problems.append(f"it doesn't list /blog/{slug}")
+        if (hidden := hidden_by(page, self._config.index_container_id)) is not None:
+            problems.append(f"its post cards are hidden (#{self._config.index_container_id} has {hidden!r}): visitors would see an empty blog")  # fmt: skip
+        live = await self._site.fetch(f"{self._config.site_url}{path}")
+        if live.status_code == 200 and (lost := sorted(index_posts(live.text or "") - listed)):
+            shown = ", ".join(f"/blog/{s}" for s in lost[:5]) + (f" and {len(lost) - 5} more" if len(lost) > 5 else "")  # fmt: skip
+            problems.append(f"it no longer lists {len(lost)} post(s) that are live today ({shown})")
+        return problems
 
     async def _await_deployment(self, sha: str, *, production: bool, deadline: float) -> str | None:  # fmt: skip
         """The URL of the successful deployment of ``sha`` (from GitHub's deployments API,

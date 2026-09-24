@@ -100,6 +100,9 @@ class SiteConfig:
     cover_url_prefix: str = DEFAULT_COVER_URL_PREFIX
     categories: tuple[str, ...] = CATEGORIES
     query_paths: frozenset[str] = QUERY_PATHS
+    # The blog index a new post must appear on, and the element holding its post cards.
+    index_path: str = "/blog"
+    index_container_id: str = "blog-posts"
 
     @property
     def site_host(self) -> str:

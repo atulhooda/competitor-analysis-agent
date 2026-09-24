@@ -375,6 +375,50 @@ async def test_secrets_never_reach_the_ledger_or_the_pull_request(git: Git) -> N
     assert TOKEN not in haystack
 
 
+# ── the blog index: never publish onto an index nobody can see ───────────────
+
+
+async def test_a_preview_that_hides_the_blog_index_is_never_merged(git: Git) -> None:
+    """2026-09-24: the site's post grid faded in only once 15% of it was on screen. Past a
+    few dozen posts that never happens, every card stayed at opacity:0, and the blog looked
+    empty while the agent kept merging. The preview's index is now part of the gate."""
+    await git.approve()
+    git.gh.preview_index_style = "opacity:0;transform:translateY(24px)"
+    _, outcome = await git.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True)
+    assert outcome.run_status is RunStatus.FAILED
+    assert outcome.error is not None
+    assert "would break the blog index" in outcome.error
+    assert "post cards are hidden" in outcome.error
+    assert "opacity:0" in outcome.error
+    [pr] = git.gh.open_pulls()  # still open: nothing reached the site
+    assert pr.merged_at is None
+    assert git.gh.file(pr.head.removeprefix("blog/")) is None
+
+
+async def test_a_preview_index_that_loses_posts_is_never_merged(git: Git) -> None:
+    await git.approve()
+    git.gh.preview_index_drop = 1  # the build lost one live post: the new one hides the count
+    _, outcome = await git.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True)
+    assert outcome.run_status is RunStatus.FAILED
+    assert outcome.error is not None
+    assert "no longer lists 1 post(s) that are live today (/blog/existing-post)" in outcome.error
+    assert all(p.merged_at is None for p in git.gh.pulls.values())
+
+
+async def test_a_healthy_index_lets_the_post_through(git: Git) -> None:
+    await git.approve()
+    _, outcome = await git.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True)
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+    assert outcome.status is PublicationStatus.PUBLISHED
+
+
+async def test_the_hidden_cards_check_can_be_turned_off_for_a_site_without_that_element(git: Git) -> None:  # fmt: skip
+    await git.approve()
+    git.gh.preview_index_style = "opacity:0"
+    _, outcome = await git.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True, publish_index_container_id="")  # fmt: skip
+    assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
+
+
 # ── cover images ─────────────────────────────────────────────────────────────
 
 COVERS: dict[str, Any] = {"publish_cover_images": True}

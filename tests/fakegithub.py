@@ -76,6 +76,10 @@ class FakeGitHub:
     preview_outcome: str = "success"
     production_outcome: str = "success"
     preview_protected: bool = False
+    # The blog index of a preview: an inline style on its post grid (a reveal animation
+    # that never fires leaves "opacity:0" there), and posts it leaves out.
+    preview_index_style: str = ""
+    preview_index_drop: int = 0
     bypass_secret: str | None = None  # accepted in the x-vercel-protection-bypass header
     # Per action ("get_repo", "get_ref", "create_ref", "get_contents", "put_contents",
     # "list_pulls", "create_pull", "get_pull", "merge", "deployments", "site", "preview"):
@@ -419,7 +423,21 @@ class FakeGitHub:
 
     # ── the site and its previews ────────────────────────────────────────────
 
-    def _page(self, tree: dict[str, str], path: str, host: str) -> httpx.Response:
+    def _index(self, tree: dict[str, str], *, preview: bool) -> httpx.Response:
+        slugs = sorted(p.rsplit("/", 1)[-1].removesuffix(".mdx") for p, text in tree.items() if p.startswith(f"{CONTENT_DIR}/") and p.endswith(".mdx") and "draft: true" not in text)  # fmt: skip
+        if preview and self.preview_index_drop:  # posts that are live today, never the new one
+            live = {p.rsplit("/", 1)[-1].removesuffix(".mdx") for p in self.trees[BASE]}
+            dropped = [slug for slug in slugs if slug in live][: self.preview_index_drop]
+            slugs = [slug for slug in slugs if slug not in dropped]
+        style = (
+            f' style="{self.preview_index_style}"' if preview and self.preview_index_style else ""
+        )
+        cards = "".join(f'<a href="/blog/{slug}">{slug}</a>' for slug in slugs)
+        return httpx.Response(200, text=f'<html><title>Blog | Engageo</title><body><section id="blog-posts" aria-label="Blog articles"{style}>{cards}</section></body></html>')  # fmt: skip
+
+    def _page(self, tree: dict[str, str], path: str, host: str, *, preview: bool = False) -> httpx.Response:  # fmt: skip
+        if path.rstrip("/") == "/blog":
+            return self._index(tree, preview=preview)
         slug = path.removeprefix("/blog/").strip("/")
         text = tree.get(f"{CONTENT_DIR}/{slug}.mdx")
         if not path.startswith("/blog/") or text is None:
@@ -460,7 +478,7 @@ class FakeGitHub:
         deployment = next((d for d in self.deployments if d.url and httpx.URL(d.url).host == request.url.host), None)  # fmt: skip
         if deployment is None:
             return httpx.Response(404, text="DEPLOYMENT_NOT_FOUND")
-        return self._page(self.trees.get(deployment.branch, {}), request.url.path, f"https://{request.url.host}")  # fmt: skip
+        return self._page(self.trees.get(deployment.branch, {}), request.url.path, f"https://{request.url.host}", preview=True)  # fmt: skip
 
 
 def _yaml(text: str) -> dict[str, Any]:

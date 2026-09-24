@@ -260,6 +260,12 @@ class Settings(BaseSettings):
     pexels_api_key: SecretStr | None = None  # pexels.com/api, free; blank: covers are skipped
     cover_image_dir: str = "public/blog/covers"  # in the site's repository
     cover_image_url_prefix: str = "/blog/covers"  # what the frontmatter points at
+    # The blog's index page and the element that holds its post cards. Before a post is
+    # merged, the preview's index must list it, list no fewer posts than the live site, and
+    # not hide the cards (an inline opacity:0, display:none or visibility:hidden on that
+    # element). Empty PUBLISH_INDEX_CONTAINER_ID skips only the hidden-cards check.
+    publish_index_path: str = "/blog"
+    publish_index_container_id: str = "blog-posts"
     wordpress_base_url: str | None = None  # e.g. https://blog.example.com (no credentials)
     wordpress_username: str | None = None
     wordpress_application_password: SecretStr | None = None  # an Application Password

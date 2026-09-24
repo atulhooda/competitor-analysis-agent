@@ -1374,6 +1374,24 @@ files. The adapter ([app/cms/github/](app/cms/github/)) publishes the way a pers
 `articles publish <id> --dry-run` shows the exact MDX file, branch and pull request title
 without touching GitHub.
 
+### The blog index gate
+
+Before a post is merged, the agent loads the **blog index** on the pull request's preview
+deployment, not just the post's own page. The merge is refused, the pull request stays open
+and the run fails with the reason when the index:
+
+- doesn't list the new post;
+- no longer lists a post that is live today (a count would miss a build that loses one post,
+  because the new one makes up the number);
+- hides its post cards: an inline `opacity:0`, `display:none` or `visibility:hidden` on the
+  element `PUBLISH_INDEX_CONTAINER_ID` (default `blog-posts`).
+
+The last check exists because of a real incident (2026-09-24): the site's post grid faded in
+only once 15% of it was on screen, which stops happening past a few dozen posts. Every card
+stayed at `opacity:0` and the blog looked empty to visitors while the agent kept publishing.
+With the gate, a regression like that stops publishing and says why, instead of piling posts
+onto a page nobody can see. `PUBLISH_INDEX_PATH` (default `/blog`) names the index.
+
 ### Cover images
 
 Off by default (`PUBLISH_COVER_IMAGES=false`): with it off, nothing here runs and a post is

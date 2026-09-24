@@ -613,3 +613,37 @@ async def test_without_a_secret_a_protected_preview_names_the_setting(rig: Rig) 
     adapter = bypass_adapter(rig, None)
     with pytest.raises(CMSProtectedError, match="VERCEL_PROTECTION_BYPASS_SECRET"):
         await adapter.create_post(await payload_for(adapter, document()))
+
+
+# ── the blog index ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("style", "hidden"),
+    [
+        ("opacity:0;transform:translateY(24px)", "opacity:0"),  # the live failure, 2026-09-24
+        ("opacity: 0", "opacity: 0"),
+        ("opacity:0.0", "opacity:0.0"),
+        ("display:none", "display:none"),
+        ("visibility: hidden", "visibility: hidden"),
+        ("opacity:0.5", None),
+        ("opacity:1", None),
+        ("transform:none", None),
+        ("", None),
+    ],
+)
+def test_the_index_check_names_what_hides_the_post_cards(style: str, hidden: str | None) -> None:
+    from app.cms.github.publisher import hidden_by
+
+    page = f'<main><section id="blog-posts" aria-label="Blog articles" style="{style}"><a href="/blog/a">a</a></section></main>'  # fmt: skip
+    assert hidden_by(page, "blog-posts") == hidden
+
+
+def test_the_index_check_reads_only_the_named_element() -> None:
+    from app.cms.github.publisher import hidden_by, index_posts
+
+    page = '<div style="opacity:0">a hidden menu</div><section id="blog-posts"><a href="/blog/a">a</a><a href="/blog/b/">b</a><a href="/blog">all</a></section>'  # fmt: skip
+    assert hidden_by(page, "blog-posts") is None
+    assert hidden_by(page, "") is None
+    assert hidden_by(page, "no-such-id") is None
+    assert index_posts(page) == {"a", "b"}

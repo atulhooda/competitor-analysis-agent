@@ -52,6 +52,8 @@ def site_config(settings: Settings) -> SiteConfig:
         byline=settings.publish_byline,
         cover_dir=settings.cover_image_dir,
         cover_url_prefix=settings.cover_image_url_prefix,
+        index_path=settings.publish_index_path,
+        index_container_id=settings.publish_index_container_id,
     )
 
 
