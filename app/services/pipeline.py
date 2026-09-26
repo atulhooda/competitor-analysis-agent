@@ -33,12 +33,12 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.cms import LazyCMS
 from app.config import Settings
@@ -56,7 +56,7 @@ from app.db.pipeline_queries import (
 )
 from app.db.session import SessionFactory
 from app.domain.analysis import LLMCallStatus
-from app.domain.articles import VALIDATABLE_STATUSES, ArticleStatus
+from app.domain.articles import IN_PROGRESS_STATUSES, VALIDATABLE_STATUSES, ArticleStatus
 from app.domain.history import RunStatus, RunTrigger
 from app.domain.jobs import (
     CHECKPOINTS,
@@ -86,7 +86,13 @@ from app.scheduling.schedules import local_day
 from app.services.analysis import AnalysisService
 from app.services.approval_rules import authorization_problem, readiness_problems
 from app.services.articles import ArticleService
-from app.services.daily_limits import daily_counts, generated_on, generation_limit, published_on
+from app.services.daily_limits import (
+    daily_counts,
+    generated_on,
+    generation_limit,
+    paced_target,
+    published_on,
+)
 from app.services.editorial import EditorialService
 from app.services.jobs import JobContext, JobResult
 from app.services.llm_usage import tokens_used_since, utc_day_start
@@ -112,6 +118,7 @@ _SENT = {PublicationStatus.PUBLISHED.value, PublicationStatus.DRAFT_CREATED.valu
 _PUBLISH_FAILURE_STREAK = 2  # consecutive failed publications: the CMS is likely down
 _LOCK_WAIT_SECONDS = 60.0
 EDITORIAL_ROUNDS = 3  # Gemini calls one editorial top-up may make when its ideas fall short
+_STUCK_AFTER = timedelta(days=2)  # an article still being written after this won't be published
 _MAX_WARNINGS = 25
 
 
@@ -406,9 +413,13 @@ class PipelineService:
     def _editorial_needed(self, backlog: int, created: int = 0) -> int:
         """Editorial ideas still wanted: a full day's allowance in hand (not just what is left
         of today), so the first slots of a day, or a day after a failed top-up, still have
-        topics to write. At most EDITORIAL_TOPICS_PER_RUN per top-up."""
+        topics to write. A top-up starts once less than half of it is ready, so an hourly
+        schedule calls Gemini about twice a day. At most EDITORIAL_TOPICS_PER_RUN per top-up."""
         s = self._settings
-        return max(min(s.max_editorial_articles_per_day - backlog, s.editorial_topics_per_run - created), 0)  # fmt: skip
+        full = s.max_editorial_articles_per_day
+        if not created and backlog * 2 >= full:
+            return 0
+        return max(min(full - backlog, s.editorial_topics_per_run - created), 0)
 
     async def _editorial(self, ctx: JobContext) -> StageResult:
         """Top up the editorial backlog to a day's allowance. When the checks reject too many
@@ -543,6 +554,16 @@ class PipelineService:
             if not any(remaining.values()) and not articles:
                 return StageResult(StageStatus.SKIPPED, selection, [f"the daily generation limits are reached ({used[competitors]} of {limits[competitors]} from competitors, {used[editorial]} of {limits[editorial]} editorial on {day}, {self._settings.scheduler_timezone})"])  # fmt: skip
             per_run = self._settings.max_articles_per_run or None
+            if self._settings.publish_pacing:
+                async with self._sessions() as session:
+                    published = await published_on(session, day, self._settings)
+                    on_the_way = await self._on_the_way(session)
+                due = paced_target(self._now(), self._settings)
+                wanted = max(due - published - on_the_way, 0)
+                selection["pace"] = {"due": due, "published_today": published, "on_the_way": on_the_way, "wanted": wanted}  # fmt: skip
+                if wanted == 0 and not articles:
+                    return StageResult(StageStatus.SKIPPED, selection, [f"on pace: {published} post(s) published today and {on_the_way} on the way, for the {due} due by now (PUBLISH_PACING)"])  # fmt: skip
+                per_run = wanted if per_run is None else min(per_run, wanted)
             chosen: list[OpportunityCandidate] = []
             for candidate in candidates:
                 if per_run is not None and len(chosen) >= per_run:
@@ -573,6 +594,14 @@ class PipelineService:
             progress = {"articles": articles, "runs": runs, "warnings": warnings, "selection": selection, "selected": True}  # fmt: skip
             await self._save_progress(ctx, Stage.GENERATE, progress)
         return progress
+
+    async def _on_the_way(self, session: AsyncSession) -> int:
+        """Articles that will become posts without another being written: those being written
+        or validated (started recently: an older one is stuck), and ready ones the publish
+        stage would send. Failed and needs-review articles aren't: they get replaced."""
+        writing = await session.scalar(select(func.count(Article.id)).where(Article.status.in_([s.value for s in (*IN_PROGRESS_STATUSES, ArticleStatus.COMPLETED)]), Article.created_at >= self._now() - _STUCK_AFTER))  # fmt: skip
+        ready = await publish_candidates(session, site=self._s.cms.site or "", done=_DONE[self._publish_target()])  # fmt: skip
+        return int(writing or 0) + sum(1 for c in ready if _approval_state(c, self._settings) in ("approved", "auto"))  # fmt: skip
 
     async def _write_article(self, article_id: int, run_id: int | None, trigger: RunTrigger) -> dict[str, Any]:  # fmt: skip
         try:
@@ -685,7 +714,13 @@ class PipelineService:
         if settings.max_articles_per_run:
             allowance = min(allowance, max(settings.max_articles_per_run - earlier, 0))
             summary["per_run"] = settings.max_articles_per_run
+        due = paced_target(self._now(), settings) if settings.publish_pacing and target is TargetStatus.PUBLISH else None  # fmt: skip
+        if due is not None:
+            allowance = min(allowance, max(due - used, 0))
+            summary["due_by_now"] = due
         if allowance == 0 and not done:
+            if due is not None and used < limit:
+                return StageResult(StageStatus.SKIPPED, summary, [f"on pace: {used} of the {due} post(s) due by now are published (PUBLISH_PACING): the rest waits for a later run"])  # fmt: skip
             return StageResult(StageStatus.SKIPPED, summary, [f"the daily publishing limit is reached ({used} of {limit} on {day}, {settings.scheduler_timezone}): the rest waits for a later run"])  # fmt: skip
         sent, streak, notes = 0, 0, []
         for article_id in [a for a in eligible if str(a) not in done]:
@@ -810,6 +845,8 @@ class PipelineService:
             notes.append(f"PUBLISH_ALLOW_DIRECT_PUBLISH=false: posts are left as {target.value}s (they don't count toward MAX_ARTICLES_PER_DAY)")  # fmt: skip
         if spent := await self._budget_spent():
             notes.append(f"Gemini stages would be skipped: {spent}")
+        if settings.publish_pacing:
+            notes.append(f"PUBLISH_PACING=true: {paced_target(now, settings)} of today's {settings.max_articles_per_day} post(s) are due by now; generation writes only what is missing")  # fmt: skip
         editorial_needed = 0
         if Stage.EDITORIAL in stages and settings.max_editorial_articles_per_day:
             backlog = sum(1 for oc in candidates if opportunity_origin(oc.opportunity.key) is OpportunityOrigin.EDITORIAL)  # fmt: skip

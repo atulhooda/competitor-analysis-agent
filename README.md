@@ -752,7 +752,8 @@ company profile + what is already covered (opportunities, articles, your site's 
 In the pipeline, the `editorial` stage runs between `opportunities` and `generate` and keeps
 a full day's `MAX_EDITORIAL_ARTICLES_PER_DAY` of topics ready (at most
 `EDITORIAL_TOPICS_PER_RUN` per top-up), so tomorrow's first slots, or the slots after a
-failed top-up, still have something to write. When too many of Gemini's ideas fail the
+failed top-up, still have something to write. It calls Gemini only once less than half of
+that is left, so the stage can be scheduled hourly. When too many of Gemini's ideas fail the
 checks it asks again, up to three calls. While the pipeline approves opportunities itself it
 keeps only ideas scoring at least `PIPELINE_MIN_OPPORTUNITY_SCORE`: nobody would approve the
 others. Ideas still waiting count: with
@@ -1732,7 +1733,17 @@ midnight job). `0` means none, never unlimited.
 | `MAX_ARTICLES_PER_DAY` (1) | Successful public posts today. Not drafts, failed, blocked or deferred attempts | Inside Phase 7's publisher, in the transaction that starts the CMS change, under a lock. Two publishers racing for the last slot publish exactly one; the other waits for a later run with nothing sent |
 
 A publication made by hand isn't limited, but uses the day's allowance. Drafts don't use it;
-a run still sends at most `MAX_ARTICLES_PER_DAY` of them.
+a run still sends at most `MAX_ARTICLES_PER_DAY` of them. An article that failed before
+anything was billed (Gemini's credits ran out, say) doesn't use a generation allowance: it
+cost nothing, and an outage would otherwise use up the day.
+
+**Pacing (`PUBLISH_PACING=true`).** The day's `MAX_ARTICLES_PER_DAY` posts are released
+evenly from local midnight (8 a day: one more every three hours, all 8 from 21:00), and a run
+makes up whatever is missing: generation writes the posts due by now minus those published
+today and those on their way (being written, validated, or ready), so a missed run, a failed
+article or one held back by the quality gates is replaced the same day. The generation
+allowances become a ceiling on attempts; set them a little above `MAX_ARTICLES_PER_DAY`.
+Schedule the stages hourly: a run with nothing due makes no Gemini call.
 
 ### Selection
 

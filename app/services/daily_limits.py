@@ -5,7 +5,11 @@ local midnight without any counter or midnight job.
 - **Generated:** articles created today (by the pipeline or by hand), counted separately per
   opportunity origin: MAX_ARTICLES_GENERATED_PER_DAY for competitor opportunities and
   MAX_EDITORIAL_ARTICLES_PER_DAY for editorial topics. The pipeline checks both remainders
-  under one lock before it creates any article, so it never generates more.
+  under one lock before it creates any article, so it never generates more. An attempt that
+  failed before anything was billed (e.g. Gemini's credits ran out) doesn't count: it cost
+  nothing, and counting it would let an outage use up the day.
+- **Pace (PUBLISH_PACING):** how many of today's posts should be public by now, the day's
+  MAX_ARTICLES_PER_DAY released evenly from local midnight.
 - **Published:** successful public publications today, whoever made them. Drafts, failed,
   blocked, cancelled and queued publications don't count, with one exception: an automated
   publication that reserved today's allowance counts while it is unresolved (queued,
@@ -17,6 +21,7 @@ local midnight without any counter or midnight job.
   exceed the limit.
 """
 
+import math
 from datetime import date, datetime
 
 from sqlalchemy import ColumnElement, and_, exists, func, or_, select, text
@@ -79,10 +84,12 @@ async def reserve_publication_slot(session: AsyncSession, publication: Publicati
 
 
 async def generated_on(session: AsyncSession, day: date, settings: Settings, *, origin: OpportunityOrigin | None = None) -> int:  # fmt: skip
-    """Articles created on ``day``; with ``origin``, only those from that kind of opportunity
-    (each origin has its own daily allowance)."""
+    """Articles created on ``day``, except attempts that failed before anything was billed;
+    with ``origin``, only those from that kind of opportunity (each origin has its own daily
+    allowance)."""
     start, end = day_bounds(day, settings.scheduler_tz)
-    query = select(func.count(Article.id)).where(Article.created_at >= start, Article.created_at < end)  # fmt: skip
+    free = and_(Article.status == ArticleStatus.FAILED.value, Article.tokens_used == 0, Article.quality_tokens_used == 0)  # fmt: skip
+    query = select(func.count(Article.id)).where(Article.created_at >= start, Article.created_at < end, ~free)  # fmt: skip
     if origin is not None:
         editorial = Opportunity.key.startswith(EDITORIAL_KEY_PREFIX, autoescape=True)
         query = query.join(Opportunity, Opportunity.id == Article.opportunity_id).where(editorial if origin is OpportunityOrigin.EDITORIAL else ~editorial)  # fmt: skip
@@ -97,6 +104,17 @@ async def written_by_on(session: AsyncSession, day: date, settings: Settings, *,
     """
     start, end = day_bounds(day, settings.scheduler_tz)
     return int(await session.scalar(select(func.count(Article.id)).where(Article.created_at >= start, Article.created_at < end, Article.writer == writer)) or 0)  # fmt: skip
+
+
+def paced_target(now: datetime, settings: Settings) -> int:
+    """Posts due by ``now`` today with PUBLISH_PACING: MAX_ARTICLES_PER_DAY spread evenly
+    over the local day, the first at midnight (8/day: one more every three hours, all 8 from
+    21:00). Missed ones stay due, so a later run makes them up."""
+    limit = settings.max_articles_per_day
+    if limit <= 0:
+        return 0
+    start, end = day_bounds(local_day(now, settings.scheduler_tz), settings.scheduler_tz)
+    return min(limit, math.floor(limit * ((now - start) / (end - start))) + 1)
 
 
 def generation_limit(settings: Settings, origin: OpportunityOrigin) -> int:
@@ -132,4 +150,4 @@ async def daily_counts(session: AsyncSession, settings: Settings, now: datetime)
     )
 
 
-__all__ = ["daily_counts", "generated_on", "generation_limit", "published_on", "reserve_publication_slot", "written_by_on"]  # fmt: skip
+__all__ = ["daily_counts", "generated_on", "generation_limit", "paced_target", "published_on", "reserve_publication_slot", "written_by_on"]  # fmt: skip

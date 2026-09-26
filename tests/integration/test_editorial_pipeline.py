@@ -5,7 +5,7 @@ Real job machinery, real PostgreSQL, the fake Gemini. No network."""
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.db.models import Opportunity, OpportunityEvent
 from app.domain.jobs import JobStatus, JobType, JobView, StageStatus, StageView
@@ -95,6 +95,27 @@ async def test_a_full_day_stays_ready_after_todays_allowance_is_used(rig: Rig) -
     s = stage(job, "editorial")
     assert s.status is StageStatus.COMPLETED, s.warnings
     assert {k: s.summary[k] for k in ("remaining_today", "backlog_before", "requested", "created")} == {"remaining_today": 0, "backlog_before": 0, "requested": 1, "created": 1}  # fmt: skip
+
+
+async def drop(rig: Rig, ideas: list[Opportunity]) -> None:
+    """Take ideas out of the backlog (as if written or turned down)."""
+    async with rig.env.sessions() as session, session.begin():
+        await session.execute(update(Opportunity).where(Opportunity.id.in_([o.id for o in ideas])).values(status=OpportunityStatus.REJECTED.value))  # fmt: skip
+
+
+async def test_a_top_up_waits_until_less_than_half_a_day_is_ready(rig: Rig) -> None:
+    settings: dict[str, Any] = {"max_editorial_articles_per_day": 4}
+    await rig.run(JobType.EDITORIAL, **settings)
+    ideas = await editorial(rig)
+    assert len(ideas) == 4
+    await drop(rig, ideas[:2])  # half a day is still ready: no Gemini call yet
+    quiet = stage(await rig.run(JobType.EDITORIAL, **settings), "editorial")
+    assert (quiet.summary["backlog_before"], quiet.summary["requested"]) == (2, 0)
+    await drop(rig, ideas[2:3])
+    rig.env.fake.editorial_rounds = [[{"topic": "AI agent escalation metrics", "title": "Which Escalation Metrics Tell You an AI Agent Works"}, {"topic": "AI agent knowledge base", "title": "Building the Knowledge Base Your AI Agent Answers From"}, {"topic": "AI agent tone of voice", "title": "Giving Your AI Agent a Tone of Voice Customers Trust"}]]  # fmt: skip
+    refill = stage(await rig.run(JobType.EDITORIAL, **settings), "editorial")
+    assert {k: refill.summary[k] for k in ("backlog_before", "requested", "created", "backlog_after")} == {"backlog_before": 1, "requested": 3, "created": 3, "backlog_after": 4}  # fmt: skip
+    assert len(rig.env.fake.calls(EditorialIdeasOut)) == 2
 
 
 async def test_each_origin_has_its_own_generation_allowance(rig: Rig) -> None:

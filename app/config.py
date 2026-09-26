@@ -302,6 +302,13 @@ class Settings(BaseSettings):
     # allowances leave. A small number spreads the day's posts over several runs (a schedule
     # every two hours with 1 per run publishes one post every two hours).
     max_articles_per_run: int = Field(default=0, ge=0, le=50)
+    # Spread MAX_ARTICLES_PER_DAY evenly over the day and make up for anything missed: by any
+    # time of day the pipeline aims to have that share of the day's posts public. The generate
+    # stage writes what is missing (published today + articles still on their way), so a
+    # failed article or a missed run is replaced the same day, within the daily generation
+    # allowances (a ceiling on attempts). Schedule the stages often (hourly): a run with
+    # nothing due does nothing.
+    publish_pacing: bool = False
     max_concurrent_pipelines: int = Field(default=1, ge=1, le=4)
     job_stale_after_minutes: int = Field(default=60, ge=5, le=1_440)
     job_max_attempts: int = Field(default=3, ge=1, le=10)
