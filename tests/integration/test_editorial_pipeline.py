@@ -1,7 +1,7 @@
-"""Editorial topics in the autonomous pipeline: the editorial stage proposes just enough
-ideas for today's editorial allowance, never piles them up while they wait for a person,
-and each opportunity origin has its own generation allowance. Real job machinery, real
-PostgreSQL, the fake Gemini. No network."""
+"""Editorial topics in the autonomous pipeline: the editorial stage keeps a day's editorial
+allowance of topics ready, asks again when Gemini's ideas fall short, never piles them up
+while they wait for a person, and each opportunity origin has its own generation allowance.
+Real job machinery, real PostgreSQL, the fake Gemini. No network."""
 
 from typing import Any
 
@@ -14,6 +14,11 @@ from app.prompts.editorial import EditorialIdeasOut
 from app.services.daily_limits import daily_counts
 from tests.integration.test_pipeline import rig as rig
 from tests.scheduling import Rig
+
+OFF_TOPIC: list[dict[str, Any]] = [
+    {"topic": "Houseplant care", "title": "Houseplant Care for Busy Founders"},
+    {"topic": "AI agent pricing", "title": "How AI Agent Pricing Works"},  # excluded: Pricing
+]
 
 
 async def editorial(rig: Rig) -> list[Opportunity]:
@@ -46,6 +51,50 @@ async def test_the_stage_proposes_just_enough_and_never_piles_up_waiting_ideas(r
     assert (again.status, again.summary["backlog_before"], again.summary["requested"]) == (StageStatus.COMPLETED, 2, 0)  # fmt: skip
     assert len(rig.env.fake.calls(EditorialIdeasOut)) == 1  # no second Gemini call
     assert len(await editorial(rig)) == 2
+
+
+async def test_a_short_round_is_followed_by_another_until_the_day_is_covered(rig: Rig) -> None:  # fmt: skip
+    rig.env.fake.editorial_rounds = [OFF_TOPIC]  # the first call misses; the next is on topic
+    job = await rig.run(JobType.EDITORIAL, pipeline_approve_opportunities=True, max_editorial_articles_per_day=2)  # fmt: skip
+    s = stage(job, "editorial")
+    assert s.status is StageStatus.COMPLETED, s.warnings
+    assert {k: s.summary[k] for k in ("requested", "rounds", "created", "backlog_after")} == {"requested": 2, "rounds": 2, "created": 2, "backlog_after": 2}  # fmt: skip
+    assert s.summary["rejected"]["low_strategic_fit"] == 1
+    assert len(rig.env.fake.calls(EditorialIdeasOut)) == 2
+    assert len(await editorial(rig)) == 2
+
+
+async def test_the_top_up_stops_after_three_rounds_and_says_how_many_are_ready(rig: Rig) -> None:  # fmt: skip
+    rig.env.fake.editorial_pool = list(OFF_TOPIC)
+    job = await rig.run(JobType.EDITORIAL, pipeline_approve_opportunities=True, max_editorial_articles_per_day=2)  # fmt: skip
+    s = stage(job, "editorial")
+    assert s.status is StageStatus.COMPLETED_WITH_WARNINGS
+    assert (s.summary["rounds"], s.summary["created"]) == (3, 0)
+    assert s.warnings[0].startswith("0 of the 2 editorial topic(s) wanted are ready after 3 round(s)")  # fmt: skip
+    assert len(rig.env.fake.calls(EditorialIdeasOut)) == 3
+
+
+async def test_ideas_the_pipeline_would_never_write_are_not_kept(rig: Rig) -> None:
+    # "Support automation playbook" only touches the adjacent topic: 51 < 60.
+    job = await rig.run(JobType.EDITORIAL, pipeline_approve_opportunities=True, pipeline_min_opportunity_score=60, max_editorial_articles_per_day=2)  # fmt: skip
+    s = stage(job, "editorial")
+    assert s.status is StageStatus.COMPLETED, s.warnings
+    assert s.summary["rejected"] == {"excluded": 1, "below_min_score": 1}
+    assert sorted(o.topic_label for o in await editorial(rig)) == ["AI agent handoff", "Evaluating AI agents"]  # fmt: skip
+
+
+async def test_a_full_day_stays_ready_after_todays_allowance_is_used(rig: Rig) -> None:
+    """Tomorrow's first slots need topics too: the backlog is topped up to a day's allowance,
+    not to what is left of today."""
+    settings: dict[str, Any] = {"pipeline_approve_opportunities": True, "max_articles_generated_per_day": 0, "max_editorial_articles_per_day": 1}  # fmt: skip
+    await rig.run(JobType.EDITORIAL, **settings)
+    await rig.run(JobType.GENERATE_ARTICLES, **settings)
+    assert len(await rig.articles()) == 1
+    rig.env.fake.editorial_rounds = [[{"topic": "AI agent onboarding", "title": "An Onboarding Checklist for Your First AI Agent"}]]  # fmt: skip
+    job = await rig.run(JobType.EDITORIAL, **settings)
+    s = stage(job, "editorial")
+    assert s.status is StageStatus.COMPLETED, s.warnings
+    assert {k: s.summary[k] for k in ("remaining_today", "backlog_before", "requested", "created")} == {"remaining_today": 0, "backlog_before": 0, "requested": 1, "created": 1}  # fmt: skip
 
 
 async def test_each_origin_has_its_own_generation_allowance(rig: Rig) -> None:

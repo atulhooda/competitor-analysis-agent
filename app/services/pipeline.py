@@ -16,8 +16,9 @@ automation is intentionally deferred to Phase 9.
 - **Limits.** Two generation allowances apply before any article is created, one per
   opportunity origin: MAX_ARTICLES_GENERATED_PER_DAY (competitor opportunities) and
   MAX_EDITORIAL_ARTICLES_PER_DAY (editorial topics). The top opportunities of each are
-  selected under one lock. The editorial stage tops up the editorial backlog to today's
-  remaining editorial allowance first (MAX_EDITORIAL_ARTICLES_PER_DAY=0, the default: off).
+  selected under one lock. The editorial stage keeps a day's editorial allowance of topics
+  ready, asking Gemini again when too many of its ideas fail the checks
+  (MAX_EDITORIAL_ARTICLES_PER_DAY=0, the default: off).
   MAX_ARTICLES_PER_DAY is enforced by Phase 7's publisher itself, atomically, right before a
   post goes public.
 - **Safety.** Only Phase 7's PublishingService talks to the CMS, and only for ready articles
@@ -110,6 +111,7 @@ _DONE = {
 _SENT = {PublicationStatus.PUBLISHED.value, PublicationStatus.DRAFT_CREATED.value}
 _PUBLISH_FAILURE_STREAK = 2  # consecutive failed publications: the CMS is likely down
 _LOCK_WAIT_SECONDS = 60.0
+EDITORIAL_ROUNDS = 3  # Gemini calls one editorial top-up may make when its ideas fall short
 _MAX_WARNINGS = 25
 
 
@@ -401,38 +403,70 @@ class PipelineService:
         status = StageStatus.COMPLETED_WITH_WARNINGS if warnings else StageStatus.COMPLETED
         return StageResult(status, summary, warnings, [outcome.run_id])
 
+    def _editorial_needed(self, backlog: int, created: int = 0) -> int:
+        """Editorial ideas still wanted: a full day's allowance in hand (not just what is left
+        of today), so the first slots of a day, or a day after a failed top-up, still have
+        topics to write. At most EDITORIAL_TOPICS_PER_RUN per top-up."""
+        s = self._settings
+        return max(min(s.max_editorial_articles_per_day - backlog, s.editorial_topics_per_run - created), 0)  # fmt: skip
+
     async def _editorial(self, ctx: JobContext) -> StageResult:
-        """Top up the editorial backlog: propose just enough ideas that today's remaining
-        editorial allowance has opportunities to write. A retried stage recounts first, so
-        ideas saved by an earlier attempt aren't proposed twice."""
+        """Top up the editorial backlog to a day's allowance. When the checks reject too many
+        of Gemini's ideas, it asks again, up to EDITORIAL_ROUNDS calls. A retried stage
+        recounts first, so ideas saved by an earlier attempt aren't proposed twice."""
         limit = self._settings.max_editorial_articles_per_day
         if limit == 0:
             return StageResult(StageStatus.SKIPPED, {"limit": 0}, ["MAX_EDITORIAL_ARTICLES_PER_DAY=0: no editorial topics are proposed"])  # fmt: skip
         async with self._sessions() as session:
             today = await daily_counts(session, self._settings, self._now())
         backlog = await self._s.editorial.backlog()
-        needed = min(max(today.editorial_remaining - backlog, 0), self._settings.editorial_topics_per_run)  # fmt: skip
+        needed = self._editorial_needed(backlog)
         summary: dict[str, Any] = {"limit": limit, "generated_today": today.editorial_generated, "remaining_today": today.editorial_remaining, "backlog_before": backlog, "requested": needed}  # fmt: skip
         if needed == 0:
             return StageResult(StageStatus.COMPLETED, {**summary, "created": 0})
-        if spent := await self._budget_spent():
-            return StageResult(StageStatus.SKIPPED_DUE_TO_BUDGET, summary, [spent])
         if not self._s.llm.configured:
             return StageResult(StageStatus.SKIPPED, summary, ["GEMINI_API_KEY is not set: editorial topics need Gemini"])  # fmt: skip
-        try:
-            outcome = await self._s.editorial.propose(trigger=self._trigger(ctx), count=needed)
-        except Exception as exc:
-            return _failed(f"{type(exc).__name__}: {exc}", classify(exc))
-        if outcome.status is RunStatus.FAILED:
-            return _failed(outcome.error or "editorial proposal failed", classify_text(outcome.error) or ErrorKind.TRANSIENT, runs=[outcome.run_id])  # fmt: skip
-        s = outcome.summary
-        created = s.created if s else 0
-        summary.update({"proposed": s.proposed if s else 0, "created": created, "rejected": s.rejected if s else {}, "expired": s.expired if s else 0, "opportunities": [i.opportunity_id for i in outcome.created]})  # fmt: skip
-        warnings = [f"created {created} of the {needed} editorial topic(s) needed: the others were duplicates, excluded or off-topic"] if created < needed else []  # fmt: skip
-        if s is not None and s.site_error:
-            warnings.append(f"your site's posts weren't checked: {s.site_error}")
+        # Only ideas this pipeline can approve itself: nobody else would write the others.
+        min_score = self._settings.pipeline_min_opportunity_score if self._settings.pipeline_approve_opportunities else None  # fmt: skip
+        runs: list[int] = []
+        created: list[int] = []
+        rejected: dict[str, int] = {}
+        warnings: list[str] = []
+        proposed = expired = 0
+        while needed and len(runs) < EDITORIAL_ROUNDS:
+            if spent := await self._budget_spent():
+                if not runs:
+                    return StageResult(StageStatus.SKIPPED_DUE_TO_BUDGET, summary, [spent])
+                warnings.append(spent)
+                break
+            try:
+                outcome = await self._s.editorial.propose(trigger=self._trigger(ctx), count=needed, min_score=min_score)  # fmt: skip
+            except Exception as exc:
+                if not created:
+                    return _failed(f"{type(exc).__name__}: {exc}", classify(exc), runs=runs)
+                warnings.append(f"round {len(runs) + 1} failed: {type(exc).__name__}: {exc}")
+                break
+            runs.append(outcome.run_id)
+            if outcome.status is RunStatus.FAILED:
+                if not created:
+                    return _failed(outcome.error or "editorial proposal failed", classify_text(outcome.error) or ErrorKind.TRANSIENT, runs=runs)  # fmt: skip
+                warnings.append(f"round {len(runs)} failed: {outcome.error}")
+                break
+            s = outcome.summary
+            if s is not None:
+                proposed, expired = proposed + s.proposed, expired + s.expired
+                for category, n in s.rejected.items():
+                    rejected[category] = rejected.get(category, 0) + n
+                if s.site_error and not any(w.startswith("your site's") for w in warnings):
+                    warnings.append(f"your site's posts weren't checked: {s.site_error}")
+            created += [i.opportunity_id for i in outcome.created if i.opportunity_id is not None]
+            backlog = await self._s.editorial.backlog()
+            needed = self._editorial_needed(backlog, len(created))
+        summary.update({"proposed": proposed, "created": len(created), "rejected": rejected, "expired": expired, "opportunities": created, "rounds": len(runs), "backlog_after": backlog})  # fmt: skip
+        if needed:
+            warnings.insert(0, f"{backlog} of the {limit} editorial topic(s) wanted are ready after {len(runs)} round(s): Gemini's other ideas were duplicates, excluded, off-topic or scored too low")  # fmt: skip
         status = StageStatus.COMPLETED_WITH_WARNINGS if warnings else StageStatus.COMPLETED
-        return StageResult(status, summary, warnings, [outcome.run_id])
+        return StageResult(status, summary, warnings, runs)
 
     def _generation_limits(self) -> dict[OpportunityOrigin, int]:
         return {origin: generation_limit(self._settings, origin) for origin in OpportunityOrigin}
@@ -779,7 +813,7 @@ class PipelineService:
         editorial_needed = 0
         if Stage.EDITORIAL in stages and settings.max_editorial_articles_per_day:
             backlog = sum(1 for oc in candidates if opportunity_origin(oc.opportunity.key) is OpportunityOrigin.EDITORIAL)  # fmt: skip
-            editorial_needed = min(max(today.editorial_remaining - backlog, 0), settings.editorial_topics_per_run)  # fmt: skip
+            editorial_needed = self._editorial_needed(backlog)
         return PipelinePlan(
             generated_at=now,
             job_type=job_type,

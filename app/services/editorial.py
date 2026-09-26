@@ -15,7 +15,8 @@ Pipeline (one proposal run at a time, advisory-locked)::
 
 Scores never come from Gemini: an idea's score is its strategic fit to your profile x 100,
 so an idea on a core topic clears PIPELINE_MIN_OPPORTUNITY_SCORE and one that only touches
-an adjacent topic waits for a person. Gemini names the profile topic each idea serves; the
+an adjacent topic waits for a person. The pipeline's own top-up (``min_score``) keeps only
+ideas it can approve itself: nobody else would, so one below that minimum is never written. Gemini names the profile topic each idea serves; the
 claim counts only when the idea's own words back it (see ``served_topic``). Editorial opportunities are reconciled only here:
 competitor opportunity runs never expire, rescore or re-interpret them. They expire after
 the scoring configuration's ``expires_after_days`` if nobody approves them.
@@ -113,6 +114,7 @@ class EditorialRunAlreadyActiveError(EditorialError, TransientError):
 class ProposalOptions:
     count: int  # ideas to keep (the model is asked for a few more)
     dry_run: bool = False  # show the ideas without saving any opportunity (still one call)
+    min_score: float | None = None  # keep only ideas scoring at least this
 
     def as_params(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -170,7 +172,7 @@ def _digest(data: Any) -> str:
 
 
 def _category(reason: str) -> str:
-    for prefix, category in (("excluded", "excluded"), ("strategic fit", "low_strategic_fit"), ("already", "duplicate"), ("near-duplicate", "duplicate"), ("numbers", "unverified"), ("beyond", "over_cap")):  # fmt: skip
+    for prefix, category in (("excluded", "excluded"), ("strategic fit", "low_strategic_fit"), ("score", "below_min_score"), ("already", "duplicate"), ("near-duplicate", "duplicate"), ("numbers", "unverified"), ("beyond", "over_cap")):  # fmt: skip
         if reason.startswith(prefix):
             return category
     return "other"
@@ -212,16 +214,16 @@ class EditorialService:
 
     # ── runs ─────────────────────────────────────────────────────────────────
 
-    async def propose(self, *, trigger: RunTrigger, count: int | None = None, dry_run: bool = False) -> ProposalOutcome:  # fmt: skip
-        run_id = await self.create_run(trigger=trigger, count=count, dry_run=dry_run)
+    async def propose(self, *, trigger: RunTrigger, count: int | None = None, dry_run: bool = False, min_score: float | None = None) -> ProposalOutcome:  # fmt: skip
+        run_id = await self.create_run(trigger=trigger, count=count, dry_run=dry_run, min_score=min_score)  # fmt: skip
         return await self.execute(run_id)
 
-    async def create_run(self, *, trigger: RunTrigger, count: int | None = None, dry_run: bool = False) -> int:  # fmt: skip
+    async def create_run(self, *, trigger: RunTrigger, count: int | None = None, dry_run: bool = False, min_score: float | None = None) -> int:  # fmt: skip
         """Queue a proposal run. Raises without Gemini, without a company profile, or while
         another proposal run is active."""
         if not self._llm.configured:
             raise LLMConfigurationError("GEMINI_API_KEY is not set: editorial topics need Gemini")
-        options = ProposalOptions(count=min(max(count or self._settings.editorial_topics_per_run, 1), MAX_ASKED), dry_run=dry_run)  # fmt: skip
+        options = ProposalOptions(count=min(max(count or self._settings.editorial_topics_per_run, 1), MAX_ASKED), dry_run=dry_run, min_score=min_score)  # fmt: skip
         self.scoring_config()  # fail fast on an invalid scoring file
         async with self._sessions() as session, session.begin():
             if await latest_company_profile(session) is None:
@@ -279,7 +281,7 @@ class EditorialService:
                     items=summary.asked,
                 )
                 summary.proposed = len(response.data.ideas)
-                ideas = select_ideas(response.data.ideas, company=company, config=config, covered=covered, allowed=numbers_in("\n".join(lines)), keep=options.count)  # fmt: skip
+                ideas = select_ideas(response.data.ideas, company=company, config=config, covered=covered, allowed=numbers_in("\n".join(lines)), keep=options.count, min_score=options.min_score)  # fmt: skip
                 for idea in ideas:
                     summary.unverified_sentences_removed += idea.unverified_sentences_removed
                     if idea.rejected:
@@ -455,16 +457,20 @@ def select_ideas(
     covered: _Covered,
     allowed: set[str],
     keep: int,
+    min_score: float | None = None,
 ) -> list[EditorialIdea]:
     """Check every idea, then keep the best ``keep`` by strategic fit (ties: the model's
-    order). Returns every idea, the rejected ones with the reason."""
+    order). Returns every idea, the rejected ones with the reason. ``min_score``: the score
+    the pipeline approves from; an idea below it would never be written."""
     checked: list[EditorialIdea] = []
     accepted: list[tuple[str, ...]] = []
     seen_keys: set[str] = set()
     for out in ideas:
         idea = check_idea(out, company=company, config=config, allowed=allowed)
         if idea.rejected is None:
-            if idea.key in covered.keys or idea.key in seen_keys:
+            if min_score is not None and idea.score < min_score:
+                idea.rejected = f"score {idea.score} is below PIPELINE_MIN_OPPORTUNITY_SCORE {min_score:g}: the pipeline would never write it"  # fmt: skip
+            elif idea.key in covered.keys or idea.key in seen_keys:
                 idea.rejected = f"already proposed: {covered.keys.get(idea.key) or 'earlier in this run'}"  # fmt: skip
             elif (twin := _twin(idea, [*covered.entries, *accepted])) is not None:
                 idea.rejected = f"near-duplicate of '{twin}'"

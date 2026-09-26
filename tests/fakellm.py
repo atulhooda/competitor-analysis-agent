@@ -188,6 +188,9 @@ class FakeLLM:
     # Editorial topics: the ideas to answer with, in order (the first N asked for), and
     # whether their text cites numbers that aren't in the company profile.
     editorial_pool: list[dict[str, Any]] = field(default_factory=lambda: list(EDITORIAL_POOL))
+    editorial_rounds: list[list[dict[str, Any]]] = field(
+        default_factory=list
+    )  # a pool per call, then editorial_pool
     editorial_numbers: bool = False
     # Cover images: every prompt the image model was given, what it draws, and exceptions
     # raised by the next image calls, in order (None = draw normally).
@@ -289,7 +292,11 @@ class FakeLLM:
         elif schema is OpportunityInterpretationOut:
             data = _opportunities(request.prompt, self.fabricate_numbers, self.omit_topics)
         elif schema is EditorialIdeasOut:
-            data = _editorial(request.prompt, self.editorial_pool, self.editorial_numbers)
+            data = _editorial(
+                request.prompt,
+                self.editorial_rounds.pop(0) if self.editorial_rounds else self.editorial_pool,
+                self.editorial_numbers,
+            )
         elif schema is DiscoverOut:
             data, grounding = self._discover(request.prompt)
         elif schema is ReadOut:

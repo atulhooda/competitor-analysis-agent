@@ -60,7 +60,7 @@ class Stage(StrEnum):
     SCAN = "scan"
     ANALYZE = "analyze"
     OPPORTUNITIES = "opportunities"
-    EDITORIAL = "editorial"  # top up the editorial topic backlog for today's allowance
+    EDITORIAL = "editorial"  # keep a day's allowance of editorial topics ready
     GENERATE = "generate"
     QUALITY = "quality"
     APPROVAL = "approval"

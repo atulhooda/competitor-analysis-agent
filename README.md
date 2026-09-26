@@ -749,9 +749,13 @@ company profile + what is already covered (opportunities, articles, your site's 
   any. Every idea, kept or rejected with the reason, is kept in the run's summary
   (`GET /api/v1/editorial/runs/{id}`).
 
-In the pipeline, the `editorial` stage runs between `opportunities` and `generate` and
-proposes just enough ideas that today's `MAX_EDITORIAL_ARTICLES_PER_DAY` has opportunities to
-write (at most `EDITORIAL_TOPICS_PER_RUN`). Ideas still waiting count: with
+In the pipeline, the `editorial` stage runs between `opportunities` and `generate` and keeps
+a full day's `MAX_EDITORIAL_ARTICLES_PER_DAY` of topics ready (at most
+`EDITORIAL_TOPICS_PER_RUN` per top-up), so tomorrow's first slots, or the slots after a
+failed top-up, still have something to write. When too many of Gemini's ideas fail the
+checks it asks again, up to three calls. While the pipeline approves opportunities itself it
+keeps only ideas scoring at least `PIPELINE_MIN_OPPORTUNITY_SCORE`: nobody would approve the
+others. Ideas still waiting count: with
 `PIPELINE_APPROVE_OPPORTUNITIES=false` they wait for you, and the stage proposes nothing more
 until they are approved, rejected or expired. `MAX_EDITORIAL_ARTICLES_PER_DAY=0`, the
 default, turns the stage off.
