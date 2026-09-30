@@ -5,7 +5,7 @@ import pytest
 
 from app.domain.articles import SourceType
 from app.llm import RetrievedURL
-from app.services.research import classify, match_retrievals, safe_public_url
+from app.services.research import classify, match_retrievals, safe_public_url, unreadable_domains
 
 
 async def public(host: str) -> list[str]:
@@ -83,3 +83,26 @@ def test_retrievals_are_matched_exactly_or_through_a_redirect() -> None:
     assert matched["https://ok.example/page"] == ("https://ok.example/page", "success")
     assert matched["https://gone.example/x"][1] == "paywall"
     assert match_retrievals(["https://never.example/"], [])["https://never.example/"][1] == "not_retrieved"  # fmt: skip
+
+
+def test_a_site_the_url_tool_rarely_reads_is_unreadable() -> None:
+    def tries(url: str, read: int, failed: int) -> list[tuple[str, str, str | None]]:
+        return [(url, "retrieved", "S1 (read in call 1)")] * read + [(url, "not_retrieved", "URL context status: error")] * failed  # fmt: skip
+
+    rejected = ("https://open.example.org/p", "not_retrieved", "the page-reading request was rejected")  # fmt: skip
+    not_sent = ("https://open.example.org/p", "skipped", "over ARTICLE_RESEARCH_MAX_SOURCES")
+    no_facts = ("https://open.example.org/p", "not_retrieved", "retrieved, but no relevant facts")
+    unread = ("https://mgma.example.com/x", "not_retrieved", "retrieved, but the model couldn't read it")  # fmt: skip
+    history = [
+        *tries("https://www.ncbi.nlm.nih.gov/books/1", 0, 6),  # never read
+        *tries("https://pmc.ncbi.nlm.nih.gov/articles/2", 2, 6),  # read a quarter of the time
+        *tries("https://gov.example.in/a", 0, 4),  # too few tries to judge
+        unread,
+        *tries("https://mgma.example.com/x", 0, 4),
+        # A refused call or a page never sent says nothing about the site; a page read
+        # without useful facts was read.
+        *[rejected] * 9,
+        *[not_sent] * 9,
+        *[no_facts] * 5,
+    ]
+    assert unreadable_domains(history) == ["ncbi.nlm.nih.gov", "mgma.example.com"]

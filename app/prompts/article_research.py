@@ -19,7 +19,7 @@ from pydantic import AfterValidator, BaseModel, BeforeValidator, Field
 from app.domain.articles import ArticleBrief, ResearchQuestion, SourceType
 from app.prompts.fields import cap, lenient_enum, optional_text, texts, truncate
 
-VERSION = "article-research/1"
+VERSION = "article-research/2"
 MAX_FACTS_PER_PAGE = 5
 
 DISCOVER_SYSTEM = """\
@@ -119,7 +119,14 @@ def read_max_output_tokens(pages: int) -> int:
     return 2_000 + 1_500 * pages
 
 
-def render_discover(brief: ArticleBrief, *, max_questions: int, max_sources: int) -> str:
+def _avoid(sites: Sequence[str]) -> list[str]:
+    """Sites whose pages the automated reader keeps failing to open."""
+    if not sites:
+        return []
+    return ["Sites the automated page reader can't open (never propose pages on them; find the evidence elsewhere): " + ", ".join(sites), ""]  # fmt: skip
+
+
+def render_discover(brief: ArticleBrief, *, max_questions: int, max_sources: int, avoid: Sequence[str] = ()) -> str:  # fmt: skip
     lines = [
         f"Article: {brief.working_title}",
         f"- topic: {brief.topic}",
@@ -134,6 +141,7 @@ def render_discover(brief: ArticleBrief, *, max_questions: int, max_sources: int
         "Competitor domains (vendor marketing: never use as authorities): "
         + (", ".join(brief.competitor_domains) or "none"),
         "",
+        *_avoid(avoid),
         f"Ask at most {max_questions} research question(s) and return at most {max_sources} "
         "source(s).",
     ]
@@ -146,6 +154,7 @@ def render_follow_up(
     questions: Sequence[ResearchQuestion],
     tried: Sequence[str],
     max_sources: int,
+    avoid: Sequence[str] = (),
 ) -> str:
     """A second search, after too few of the first pass's pages could be read."""
     lines = [
@@ -168,6 +177,7 @@ def render_follow_up(
         "Already tried (never propose these again):",
         *[f"- {url}" for url in tried],
         "",
+        *_avoid(avoid),
         "Search again, differently: other wording, other angles, and other kinds of source. "
         "A page has to be readable by an automated reader to be of any use, so prefer an "
         "HTML page over a PDF, an official summary, press release or explainer over a "

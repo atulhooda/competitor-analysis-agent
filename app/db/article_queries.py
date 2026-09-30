@@ -4,7 +4,7 @@ and the CLI."""
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -291,6 +291,21 @@ async def research_notes(session: AsyncSession, article_id: int) -> list[str]:
     return [str(note) for note in notes] if isinstance(notes, list) else []
 
 
+async def research_candidates_since(session: AsyncSession, since: datetime) -> list[tuple[str, str, str | None]]:  # fmt: skip
+    """(url, outcome, reason) of every page research considered since ``since``, from the
+    research steps' saved results, failed ones included."""
+    rows = await session.execute(
+        text(
+            "SELECT c->>'url', c->>'outcome', c->>'reason' FROM article_steps s,"
+            " jsonb_array_elements(CASE WHEN jsonb_typeof(s.output->'candidates') = 'array'"
+            " THEN s.output->'candidates' ELSE '[]'::jsonb END) c"
+            " WHERE s.step = 'research' AND s.started_at >= :since"
+        ),
+        {"since": since},
+    )
+    return [(str(url), str(outcome), reason) for url, outcome, reason in rows if url and outcome]
+
+
 async def list_versions(session: AsyncSession, article_id: int) -> list[VersionSummary] | None:
     article = await session.get(Article, article_id)
     if article is None:
@@ -346,5 +361,6 @@ __all__ = [
     "list_articles",
     "list_steps",
     "list_versions",
+    "research_candidates_since",
     "summary",
 ]

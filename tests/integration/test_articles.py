@@ -47,6 +47,7 @@ from app.prompts.article_draft import ArticleContentOut
 from app.prompts.article_edit import EditOut
 from app.prompts.article_outline import OutlineOut
 from app.prompts.article_research import DiscoverOut, ReadOut
+from app.services import research as research_service
 from app.services.articles import (
     ArticleBudgetExhaustedError,
     ArticleConflictError,
@@ -149,7 +150,7 @@ async def test_an_approved_opportunity_becomes_a_researched_cited_edited_article
     assert (article.opportunity_id, article.assessment_id) == (opportunity.id, opportunity.current_assessment_id)  # fmt: skip
     assert article.status == ArticleStatus.COMPLETED.value
     assert [(s.step, s.status) for s in steps] == [(s, "succeeded") for s in ("brief", "research", "outline", "draft", "edit")]  # fmt: skip
-    assert {s.step: s.prompt_version for s in steps} == {"brief": "article-brief/1", "research": "article-research/1", "outline": "article-outline/1", "draft": "article-draft/1", "edit": "article-edit/1"}  # fmt: skip
+    assert {s.step: s.prompt_version for s in steps} == {"brief": "article-brief/1", "research": "article-research/2", "outline": "article-outline/1", "draft": "article-draft/1", "edit": "article-edit/1"}  # fmt: skip
     assert all(s.model == "gemini-3.8-flash" for s in steps if s.step != "brief")
     assert [(v.kind, v.number) for v in versions] == [("outline", 1), ("draft", 1), ("final", 1)]
     assert article.final_version_id == versions[-1].id
@@ -453,7 +454,7 @@ REJECTED = LLMRequestRejectedError(
 async def test_a_rejected_page_reading_request_costs_only_its_own_pages(world: World) -> None:
     # Gemini refuses the whole read call for some sets of URLs, billing nothing. That must
     # cost those pages and nothing else: research carries on and the article is written.
-    world.fake.fail_schema = {ReadOut: [REJECTED]}
+    world.fake.fail_schema = {ReadOut: [REJECTED, REJECTED]}  # refused again when resent
     world.fake.follow_up = list(FOLLOW_UP)
 
     result, outcome = await world.generate()
@@ -472,8 +473,47 @@ async def test_a_rejected_page_reading_request_costs_only_its_own_pages(world: W
     assert research.calls == {"discover": 2, "read": 2}
 
 
+async def test_a_page_reading_request_refused_once_is_sent_again(world: World) -> None:
+    world.fake.fail_schema = {ReadOut: [REJECTED]}  # accepted on the second attempt
+
+    result, outcome = await world.generate()
+
+    assert outcome.status is ArticleStatus.COMPLETED, outcome.error
+    async with world.env.sessions() as session:
+        article = await session.get_one(Article, result.article_id)
+        step = await session.get_one(ArticleStepRun, article.research_step_id)
+    research = ResearchResult.model_validate(step.output)
+    assert {s.url for s in research.sources} == RETRIEVED  # no page was lost
+    assert not any(c.reason == "the page-reading request was rejected" for c in research.candidates)
+    assert any("sent once more" in n for n in research.notes)
+    assert research.calls == {"discover": 1, "read": 1}  # one call, sent twice
+
+
+async def test_a_site_the_url_tool_keeps_failing_on_is_skipped_and_avoided(world: World, monkeypatch: pytest.MonkeyPatch) -> None:  # fmt: skip
+    monkeypatch.setattr(research_service, "UNREADABLE_MIN_TRIES", 1)
+    service = world.service()
+    first, _ = await world.generate()  # fabricated.example.org can't be read
+    await service.cancel(first.article_id, note="write it again")
+    world.fake.requests.clear()
+
+    second, outcome = await service.generate(world.opportunity_id, trigger=RunTrigger.CLI, regenerate=True)  # fmt: skip
+
+    assert outcome is not None
+    assert outcome.status is ArticleStatus.COMPLETED, outcome.error
+    async with world.env.sessions() as session:
+        article = await session.get_one(Article, second.article_id)
+        step = await session.get_one(ArticleStepRun, article.research_step_id)
+    research = ResearchResult.model_validate(step.output)
+    outcome_of = {c.url: (c.outcome, c.reason) for c in research.candidates}
+    assert outcome_of["https://fabricated.example.org/made-up-study"] == ("skipped", "the URL tool rarely reads this site (recent research)")  # fmt: skip
+    [discover] = world.fake.calls(DiscoverOut)
+    assert "never propose pages on them; find the evidence elsewhere): fabricated.example.org" in discover.prompt  # fmt: skip
+    read_urls = {u for r in world.fake.calls(ReadOut) for u in re.findall(r"^U\d+ \| (\S+)$", r.prompt, re.MULTILINE)}  # fmt: skip
+    assert "https://fabricated.example.org/made-up-study" not in read_urls
+
+
 async def test_research_fails_alone_when_every_page_reading_request_is_rejected(world: World) -> None:  # fmt: skip
-    world.fake.fail_schema = {ReadOut: [REJECTED, REJECTED]}
+    world.fake.fail_schema = {ReadOut: [REJECTED] * 4}  # each call refused, and again when resent
     world.fake.follow_up = list(FOLLOW_UP)
 
     result, outcome = await world.generate()

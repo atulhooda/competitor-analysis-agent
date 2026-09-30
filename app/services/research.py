@@ -22,6 +22,14 @@ URLs, 404s, login walls, and 1, 4, 8, 16, 20 and 24 URLs in one call) found no U
 that provokes it reliably - the same call was accepted on one attempt and refused on the
 next - so nothing extra is screened out. Such a refusal costs its own pages and no more.
 
+A refused read call is sent once more before its pages are given up (a refusal bills
+nothing, and the same call is often accepted on the next attempt).
+
+Sites the URL tool keeps failing on (``unreadable_domains``: at least UNREADABLE_MIN_TRIES
+pages tried in the last UNREADABLE_WINDOW_DAYS days, fewer than UNREADABLE_MAX_SHARE of them
+read) are skipped at screening, and the search is told to find its evidence elsewhere. The
+record is recent research only, so a site that is skipped ages out of it and is tried again.
+
 Discovery, screening and reading run again (once) when the first pass ends with fewer than
 ARTICLE_RESEARCH_MIN_SOURCES usable sources: the second search asks the unanswered questions
 differently and asks for source types that can actually be read. The two passes share one
@@ -29,7 +37,8 @@ token budget and one page-reading budget, and the minimum is never lowered.
 """
 
 import math
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, Self
@@ -70,6 +79,11 @@ MAX_FACTS = 40
 MAX_EXCERPT = 1_000
 MAX_DISCOVERY_PASSES = 2  # the first search, and one more when it came up short
 MAX_TRIED_IN_PROMPT = 20  # URLs the follow-up search is told not to propose again
+UNREADABLE_WINDOW_DAYS = 30  # how far back the URL tool's record of a site goes
+UNREADABLE_MIN_TRIES = 5  # pages of a site tried before it can be judged
+UNREADABLE_MAX_SHARE = 0.2  # a site whose pages were read less often than this is skipped
+MAX_AVOIDED_IN_PROMPT = 40  # unreadable sites the search is told about
+_READER_FAILURES = ("URL context status:", "retrieved, but the model couldn't read it")
 
 
 class ResearchFailedError(PermanentError):
@@ -225,6 +239,25 @@ def match_retrievals(requested: Sequence[str], results: Sequence[RetrievedURL]) 
     return out
 
 
+def unreadable_domains(candidates: Iterable[tuple[str, str, str | None]]) -> list[str]:
+    """Sites the URL tool rarely manages to read, from earlier research: (url, outcome,
+    reason) of each candidate page. A page counts when the tool tried it: read (with or
+    without useful facts), or failed to retrieve or read it. A refused call, a page never
+    sent, or a rejected URL says nothing about the site. Most-tried first."""
+    tried: Counter[str] = Counter()
+    read: Counter[str] = Counter()
+    for url, outcome, reason in candidates:
+        reason = reason or ""
+        readable = outcome == "retrieved" or reason == "retrieved, but no relevant facts"
+        if not readable and not reason.startswith(_READER_FAILURES):
+            continue
+        site = domain_of(url)
+        if site:
+            tried[site] += 1
+            read[site] += readable
+    return [site for site, n in tried.most_common() if n >= UNREADABLE_MIN_TRIES and read[site] < UNREADABLE_MAX_SHARE * n]  # fmt: skip
+
+
 async def research(
     llm: BudgetedLLM,
     brief: ArticleBrief,
@@ -232,6 +265,7 @@ async def research(
     *,
     resolver: Resolver,
     company_domain: str | None,
+    unreadable: Collection[str] = (),
 ) -> ResearchResult:
     """Research for ``brief``. Raises ``ResearchFailedError`` with fewer than
     ``config.min_sources`` usable sources; LLM budget and availability errors propagate.
@@ -242,9 +276,10 @@ async def research(
     in other words and asks for other kinds of source. Both passes share one token budget
     (``ARTICLE_RESEARCH_MAX_TOKENS``) and one page-reading budget
     (``ARTICLE_RESEARCH_MAX_URL_CONTEXT_CALLS``): the second pass reads what the first left
-    unspent, never more.
+    unspent, never more. Pages on ``unreadable`` sites (``unreadable_domains``) are skipped.
     """
     start = llm.usage.total_tokens
+    avoid = sorted(unreadable)[:MAX_AVOIDED_IN_PROMPT]
     notes: list[str] = []
     calls = {"discover": 0, "read": 0}
     dispositions: list[CandidateDisposition] = []
@@ -289,7 +324,11 @@ async def research(
                 return
             calls["read"] += 1
             try:
-                read = await llm.structured(request, prompt.ReadOut, purpose=LLMPurpose.ARTICLE_RESEARCH, prompt_version=prompt.VERSION)  # fmt: skip
+                try:
+                    read = await llm.structured(request, prompt.ReadOut, purpose=LLMPurpose.ARTICLE_RESEARCH, prompt_version=prompt.VERSION)  # fmt: skip
+                except LLMRequestRejectedError as first:
+                    notes.append(f"page-reading call {calls['read']} was rejected by Gemini and sent once more ({first})")  # fmt: skip
+                    read = await llm.structured(request, prompt.ReadOut, purpose=LLMPurpose.ARTICLE_RESEARCH, prompt_version=prompt.VERSION)  # fmt: skip
             except LLMRequestRejectedError as exc:
                 # Gemini refused this call over what was in it (nothing was billed). Another
                 # set of URLs can still be read, and the article can still be written from
@@ -329,7 +368,7 @@ async def research(
             notes.append(f"a second search would have had no page-reading call left (ARTICLE_RESEARCH_MAX_URL_CONTEXT_CALLS={config.max_url_context_calls})")  # fmt: skip
             break
         if pass_number == 1:
-            asked = prompt.render_discover(brief, max_questions=config.max_queries, max_sources=config.max_sources)  # fmt: skip
+            asked = prompt.render_discover(brief, max_questions=config.max_queries, max_sources=config.max_sources, avoid=avoid)  # fmt: skip
             search = LLMRequest(
                 prompt=asked,
                 system=prompt.DISCOVER_SYSTEM,
@@ -341,7 +380,7 @@ async def research(
         else:
             answered = {q for r in reads for f in r.page.facts for q in f.question_ids}
             open_questions = [q for q in questions if q.id not in answered] or questions
-            asked = prompt.render_follow_up(brief, questions=open_questions, tried=tried[:MAX_TRIED_IN_PROMPT], max_sources=room)  # fmt: skip
+            asked = prompt.render_follow_up(brief, questions=open_questions, tried=tried[:MAX_TRIED_IN_PROMPT], max_sources=room, avoid=avoid)  # fmt: skip
             search = LLMRequest(
                 prompt=asked,
                 system=prompt.DISCOVER_SYSTEM,
@@ -372,6 +411,9 @@ async def research(
                 dispositions.append(CandidateDisposition(url=c.url[:500], title=c.title, source_type=kind, outcome="rejected", reason=reason))  # fmt: skip
             elif url in seen:
                 dispositions.append(CandidateDisposition(url=url, title=c.title, source_type=kind, outcome="skipped", reason="duplicate of another candidate"))  # fmt: skip
+            elif domain_of(url) in unreadable:
+                seen.add(url)
+                dispositions.append(CandidateDisposition(url=url, title=c.title, source_type=kind, outcome="skipped", reason="the URL tool rarely reads this site (recent research)"))  # fmt: skip
             else:
                 seen.add(url)
                 accepted.append(_Candidate(url, c.title, c.publisher, kind, rank))

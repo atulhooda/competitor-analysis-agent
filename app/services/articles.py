@@ -25,7 +25,7 @@ import asyncio
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import structlog
@@ -37,6 +37,7 @@ from app.config import GEMINI, Settings
 from app.core.errors import AppError, PermanentError, TransientError
 from app.core.timeutils import utcnow
 from app.crawling.netguard import Resolver, system_resolver
+from app.db.article_queries import research_candidates_since
 from app.db.locks import article_lock
 from app.db.models import (
     Article,
@@ -100,7 +101,13 @@ from app.services.checkpoints import fail_running_steps, find_checkpoint, new_ru
 from app.services.daily_limits import written_by_on
 from app.services.llm_usage import BudgetedLLM, RunUsage
 from app.services.opportunities import OpportunityNotFoundError
-from app.services.research import ResearchConfig, ResearchFailedError, research
+from app.services.research import (
+    UNREADABLE_WINDOW_DAYS,
+    ResearchConfig,
+    ResearchFailedError,
+    research,
+    unreadable_domains,
+)
 from app.services.runs import fail_abandoned_runs, finish_run, run_slot_free
 
 log = structlog.get_logger(__name__)
@@ -563,7 +570,9 @@ class ArticleService:
     async def _generate(self, step: ArticleStep, chain: _Chain, llm: BudgetedLLM, writer: str = GEMINI) -> ResearchResult | tuple[ArticleOutline, list[ContentIssue], str] | Written:  # fmt: skip
         if step is ArticleStep.RESEARCH:
             website = chain.brief.company.website
-            return await research(llm, chain.brief, ResearchConfig.from_settings(self._settings, writer), resolver=self._resolver, company_domain=domain_of(website) if website else None)  # fmt: skip
+            async with self._sessions() as session:
+                seen = await research_candidates_since(session, self._now() - timedelta(days=UNREADABLE_WINDOW_DAYS))  # fmt: skip
+            return await research(llm, chain.brief, ResearchConfig.from_settings(self._settings, writer), resolver=self._resolver, company_domain=domain_of(website) if website else None, unreadable=frozenset(unreadable_domains(seen)))  # fmt: skip
         config = WritingConfig.from_settings(self._settings, writer)
         if chain.research is None:
             raise RuntimeError("the writing steps need research")
