@@ -424,6 +424,8 @@ def compose_pair(document: RenderedDocument, *, marker: str, config: SiteConfig,
         raise ValueError(f"no usable slug from {document.slug!r}")
     title = " ".join(document.title.split())
     suffix = config.meta_title_suffix
+    if suffix and not suffix[0].isspace():  # an env var may lose its leading space
+        suffix = " " + suffix
     meta_title = _fit(document.meta_title or title, META_TITLE_RANGE[1] - len(suffix)) + suffix
     description = _fit(document.excerpt, META_DESCRIPTION_RANGE[1])
     body, kept, dropped = filter_internal_links(document.body_markdown, config, allowed_paths)

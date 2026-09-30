@@ -456,3 +456,5 @@ def test_a_long_title_is_cut_to_fit_the_meta_title_with_its_suffix() -> None:
     assert len(meta) <= 80
     assert meta.endswith(" | Skin Essence Pune")
     assert not meta.removesuffix(" | Skin Essence Pune").endswith((" ", ":", ","))
+    unspaced = compose_pair(document(title="Laser Hair Removal Guide", meta_title="Laser Hair Removal Guide", body_markdown="Intro.\n\n## One\n\nText.\n"), marker="0" * 32, config=SiteConfig(**{**config.__dict__, "meta_title_suffix": "| Skin Essence Pune"}), allowed_paths={"/"}, published_on=date(2026, 9, 16))  # fmt: skip
+    assert unspaced.frontmatter["metaTitle"] == "Laser Hair Removal Guide | Skin Essence Pune"
