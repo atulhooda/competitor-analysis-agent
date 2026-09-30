@@ -58,14 +58,19 @@ from app.cms.errors import (
 )
 from app.cms.github.client import GitHubClient
 from app.cms.github.mdx import (
+    JSON_PAIR,
     MDXDocument,
     SiteConfig,
     compose,
+    compose_pair,
     frontmatter_text,
+    pair_json,
+    parse_fields,
     pr_body,
     site_slug,
     split_frontmatter,
     validate,
+    validate_pair,
 )
 from app.domain.publishing import CMSPostStatus, RenderedDocument, TargetStatus
 
@@ -73,6 +78,8 @@ log = structlog.get_logger(__name__)
 
 # Site pages an article may link to even when the sitemap can't be read.
 DEFAULT_SITE_PATHS = frozenset({"/", "/blog", "/services", "/clinics", "/contact", "/pricing", "/how-it-works", "/about", "/experience-engageo"})  # fmt: skip
+# Another site's pages are only known from its sitemap: without it, just these.
+MINIMAL_SITE_PATHS = frozenset({"/", "/blog", "/contact"})
 MAX_LISTED_FILES = 200
 MAX_OPEN_PRS = 100
 _TAGS = re.compile(r"<[^>]+>")
@@ -120,8 +127,14 @@ def parse_external_id(value: str) -> tuple[str, str]:
     return kind, rest
 
 
-def same_document(a: str, b: str) -> bool:
-    """The same article file, dates aside (a follow-up keeps the original publishedAt)."""
+def same_document(a: str, b: str, layout: str = "frontmatter") -> bool:
+    """The same article file, dates aside (a follow-up keeps the original publishedAt). A
+    json_pair post is its JSON, whose ``agentBody`` stands for the body file."""
+    if layout == JSON_PAIR:
+        ja, jb = parse_fields(a, JSON_PAIR), parse_fields(b, JSON_PAIR)
+        if ja is None or jb is None:
+            return a.strip() == b.strip()
+        return {k: v for k, v in ja.items() if k != "date"} == {k: v for k, v in jb.items() if k != "date"}  # fmt: skip
     fa, ba = split_frontmatter(a)
     fb, bb = split_frontmatter(b)
     if fa is None or fb is None:
@@ -198,6 +211,10 @@ class GitHubPublishingAdapter:
         self._today = today or (lambda: now().date())
         self._allowed_paths: set[str] | None = None
         self._verified_previews: dict[str, str] = {}  # head sha → preview URL
+        self._layout = config.layout
+        self._pair = config.layout == JSON_PAIR
+        self._suffix = ".json" if self._pair else ".mdx"
+        self._default_paths = MINIMAL_SITE_PATHS if self._pair else DEFAULT_SITE_PATHS
 
     @property
     def site(self) -> str:
@@ -225,7 +242,7 @@ class GitHubPublishingAdapter:
         if listing is not None and not isinstance(listing, list):
             return CMSCheck(True, True, False, False, False, name, f"{self._config.content_dir} isn't a directory on {self._base}")  # fmt: skip
         entries: list[Any] = listing or []  # a missing directory is created with the first post
-        posts = sum(1 for e in entries if isinstance(e, dict) and str(e.get("name", "")).endswith((".mdx", ".md")))  # fmt: skip
+        posts = sum(1 for e in entries if isinstance(e, dict) and str(e.get("name", "")).endswith((".json",) if self._pair else (".mdx", ".md")))  # fmt: skip
         paths = await self._load_site_paths(entries)
         detail = f"{posts} post(s) in {self._config.content_dir}; the token has {'write' if push else 'read-only'} access"  # fmt: skip
         if not push:
@@ -257,9 +274,9 @@ class GitHubPublishingAdapter:
             listing = await self._gh.get_optional(f"repos/{self._repo}/contents/{self._config.content_dir}", {"ref": self._base})  # fmt: skip
             for entry in (listing if isinstance(listing, list) else [])[:MAX_LISTED_FILES]:
                 name = str(entry.get("name", ""))
-                if not name.endswith(".mdx"):
+                if not name.endswith(self._suffix):
                     continue
-                main = await self._main_post(name.removesuffix(".mdx"))
+                main = await self._main_post(name.removesuffix(self._suffix))
                 if main is not None and self.owns(main, marker):
                     posts.append(main)
         return posts
@@ -290,11 +307,15 @@ class GitHubPublishingAdapter:
         return TermResolution(TermRef(chosen, chosen), tuple(TermRef(t, t) for t in site_tags(tags)), notes=(note,) if note else ())  # fmt: skip
 
     def build_payload(self, document: RenderedDocument, *, status: TargetStatus, terms: TermResolution, marker: str) -> dict[str, Any]:  # fmt: skip
-        allowed = self._allowed_paths if self._allowed_paths is not None else set(DEFAULT_SITE_PATHS)  # fmt: skip
-        mdx = compose(document, marker=marker, config=self._config, allowed_paths=allowed, published_on=self._today())  # fmt: skip
-        problems = validate(mdx.text, marker=marker)
+        allowed = self._allowed_paths if self._allowed_paths is not None else set(self._default_paths)  # fmt: skip
+        if self._pair:
+            mdx = compose_pair(document, marker=marker, config=self._config, allowed_paths=allowed, published_on=self._today())  # fmt: skip
+            problems = validate_pair(mdx.text, mdx.body_text or "", marker=marker)
+        else:
+            mdx = compose(document, marker=marker, config=self._config, allowed_paths=allowed, published_on=self._today())  # fmt: skip
+            problems = validate(mdx.text, marker=marker)
         if problems:
-            raise CMSValidationError("the generated MDX can't be published safely: " + "; ".join(problems))  # fmt: skip
+            raise CMSValidationError("the generated post can't be published safely: " + "; ".join(problems))  # fmt: skip
         notes = list(mdx.notes)
         if self._allowed_paths is None:
             notes.append("internal links were checked against the default site pages only (the sitemap wasn't read)")  # fmt: skip
@@ -302,7 +323,11 @@ class GitHubPublishingAdapter:
         if mdx.cover_path and document.cover is not None and document.article_id and document.version_id:  # fmt: skip
             # Where the picture goes and how to ask for it: never the bytes (this payload is
             # hashed, stored on every attempt and printed by dry runs).
-            cover = {"path": mdx.cover_path, "url": mdx.frontmatter["coverImage"], "article_id": document.article_id, "version_id": document.version_id, "mime": document.cover.mime, "sha256": document.cover.sha256, "alt": document.cover.alt}  # fmt: skip
+            url = (
+                mdx.frontmatter["heroImage"]["src"] if self._pair else mdx.frontmatter["coverImage"]
+            )
+            cover = {"path": mdx.cover_path, "url": url, "article_id": document.article_id, "version_id": document.version_id, "mime": document.cover.mime, "sha256": document.cover.sha256, "alt": document.cover.alt}  # fmt: skip
+        body = mdx.body_text if self._pair else mdx.text[len(frontmatter_text(mdx.frontmatter)) + 1 :]  # fmt: skip
         return {
             "slug": mdx.slug,
             "path": mdx.path,
@@ -311,7 +336,8 @@ class GitHubPublishingAdapter:
             "status": status.value,
             "cover": cover,
             "frontmatter": dict(mdx.frontmatter),
-            "body": mdx.text[len(frontmatter_text(mdx.frontmatter)) + 1 :],
+            "body": body,
+            "body_path": mdx.body_path,
             "content": mdx.text,
             "commit_message": f"Add blog post: {mdx.title}",
             "pr_title": f"Add blog post: {mdx.title}",
@@ -324,7 +350,7 @@ class GitHubPublishingAdapter:
         }
 
     def owns(self, post: CMSPost, marker: str) -> bool:
-        fields = split_frontmatter(post.content or "")[0] or {}
+        fields = parse_fields(post.content or "", self._layout) or {}
         return fields.get("agentPublication") == marker
 
     def verify(self, post: CMSPost, payload: dict[str, Any], *, status: TargetStatus, marker: str) -> tuple[list[str], list[str]]:  # fmt: skip
@@ -338,7 +364,7 @@ class GitHubPublishingAdapter:
             problems.append(f"{post.external_id} is {post.status.value}, not {expected.value}")
         if post.slug != payload["slug"]:
             problems.append(f"{post.external_id} has slug '{post.slug}', not '{payload['slug']}'")
-        if not same_document(post.content or "", str(payload["content"])):
+        if not same_document(post.content or "", str(payload["content"]), self._layout):
             problems.append(f"{post.external_id}'s file differs from what was sent")
         if expected is CMSPostStatus.PUBLISHED and not post.url:
             problems.append(f"{post.external_id} has no live URL")
@@ -352,6 +378,7 @@ class GitHubPublishingAdapter:
         branch, path = str(payload["branch"]), str(payload["path"])
         await self._ensure_branch(branch)
         await self._ensure_cover(branch, payload)
+        await self._ensure_body(branch, payload)
         await self._ensure_file(branch, path, str(payload["content"]), str(payload["commit_message"]))  # fmt: skip
         pr = await self._ensure_pr(branch, str(payload["pr_title"]), str(payload["pr_body"]))
         if pr is None:  # nothing to propose: the base branch already holds this file
@@ -371,11 +398,13 @@ class GitHubPublishingAdapter:
                 raise CMSConflictError(f"pull request #{value} was closed without being merged: reopen it, or delete branch {pr['head']['ref']} to start over")  # fmt: skip
             head_branch = str(pr["head"]["ref"])
             await self._ensure_cover(head_branch, payload)
+            await self._ensure_body(head_branch, payload)
             await self._ensure_file(head_branch, path, str(payload["content"]), str(payload["commit_message"]))  # fmt: skip
             pr = await self._gh.get(f"repos/{self._repo}/pulls/{value}")
             return await self._from_pr(pr, payload)
         if kind == "branch":
             await self._ensure_cover(value, payload)
+            await self._ensure_body(value, payload)
             await self._ensure_file(value, path, str(payload["content"]), str(payload["commit_message"]))  # fmt: skip
             pr = await self._ensure_pr(value, str(payload["pr_title"]), str(payload["pr_body"]))
             if pr is None:
@@ -385,7 +414,7 @@ class GitHubPublishingAdapter:
         file = await self._read(path, self._base)
         if file is None:
             raise CMSNotFoundError(f"{path} is no longer on {self._base}")
-        if same_document(file[0], str(payload["content"])):
+        if same_document(file[0], str(payload["content"]), self._layout):
             return await self._published(payload, merged_sha=None)
         return await self._follow_up(file[0], payload)
 
@@ -422,21 +451,27 @@ class GitHubPublishingAdapter:
         file = await self._read(str(payload["path"]), self._base)
         if file is None:
             raise CMSConflictError(f"pull request #{pr['number']} is merged but {payload['path']} isn't on {self._base}")  # fmt: skip
-        if same_document(file[0], str(payload["content"])):
+        if same_document(file[0], str(payload["content"]), self._layout):
             return await self._published(payload, merged_sha=str(pr.get("merge_commit_sha") or "") or None, pr=pr)  # fmt: skip
         return await self._follow_up(file[0], payload)
 
     async def _follow_up(self, current: str, payload: dict[str, Any]) -> CMSPost:
         """A changed version of a post that is already on the base branch: a new pull
-        request from the same branch, keeping the original publishedAt."""
-        fields = split_frontmatter(current)[0] or {}
-        original = str(fields.get("publishedAt") or payload["frontmatter"]["publishedAt"])
-        updated = {**payload["frontmatter"], "publishedAt": original[:10], "updatedAt": self._today().isoformat()}  # fmt: skip
-        text = frontmatter_text(updated) + "\n" + str(payload["body"])
+        request from the same branch, keeping the original publishedAt (json_pair: date)."""
+        fields = parse_fields(current, self._layout) or {}
+        if self._pair:
+            original = str(fields.get("date") or payload["frontmatter"]["date"])
+            updated = {**payload["frontmatter"], "date": original[:10]}
+            text = pair_json(updated)
+        else:
+            original = str(fields.get("publishedAt") or payload["frontmatter"]["publishedAt"])
+            updated = {**payload["frontmatter"], "publishedAt": original[:10], "updatedAt": self._today().isoformat()}  # fmt: skip
+            text = frontmatter_text(updated) + "\n" + str(payload["body"])
         follow = {**payload, "content": text, "frontmatter": updated, "commit_message": f"Update blog post: {payload['title']}", "pr_title": f"Update blog post: {payload['title']}"}  # fmt: skip
         branch = str(payload["branch"])
         await self._ensure_branch(branch)
         await self._ensure_cover(branch, follow)
+        await self._ensure_body(branch, follow)
         await self._ensure_file(branch, str(payload["path"]), text, str(follow["commit_message"]))
         pr = await self._ensure_pr(branch, str(follow["pr_title"]), str(payload["pr_body"]))
         if pr is None:
@@ -450,7 +485,7 @@ class GitHubPublishingAdapter:
         file = await self._read(path, self._base)
         if file is None:
             raise CMSConflictError(f"{path} isn't on {self._base} after the merge")
-        fields, _ = split_frontmatter(file[0])
+        fields = parse_fields(file[0], self._layout)
         if not fields or fields.get("agentPublication") != marker:
             raise CMSConflictError(f"{path} on {self._base} isn't this publication's file (marker differs)")  # fmt: skip
         deadline = self._clock() + self._deploy_timeout
@@ -518,6 +553,12 @@ class GitHubPublishingAdapter:
         data = found[1]
         await self._gh.put(f"repos/{self._repo}/contents/{path}", {"message": f"Add cover image: {payload['title']}", "content": base64.b64encode(data).decode(), "branch": branch})  # fmt: skip
         log.info("github.cover", repo=self._repo, branch=branch, path=path, bytes=len(data))
+
+    async def _ensure_body(self, branch: str, payload: dict[str, Any]) -> None:
+        """json_pair: the body file, written before the JSON that names its digest (the site
+        imports it by slug), and only when it differs."""
+        if payload.get("body_path"):
+            await self._ensure_file(branch, str(payload["body_path"]), str(payload["body"]), f"{payload['commit_message']} (body)")  # fmt: skip
 
     async def _ensure_file(self, branch: str, path: str, content: str, message: str) -> None:
         current = await self._read(path, branch)
@@ -674,17 +715,17 @@ class GitHubPublishingAdapter:
         if production:
             if f'rel="canonical" href="{url}"' not in text and f"href=\"{url}\" rel=\"canonical\"" not in text and f'rel="canonical" href="{url}/"' not in text:  # fmt: skip
                 problems.append("the canonical URL isn't the expected one")
-            if "article:published_time" not in text:
+            if self._config.published_marker and self._config.published_marker not in text:
                 problems.append("no published metadata")
         if host and host != (urlsplit(str(response.url)).hostname or host):
             problems.append("served from another host")
         return problems
 
     async def _load_site_paths(self, listing: list[Any]) -> set[str]:
-        paths = set(DEFAULT_SITE_PATHS)
+        paths = set(self._default_paths)
         for entry in listing[:MAX_LISTED_FILES]:
             name = str(entry.get("name", "")) if isinstance(entry, dict) else ""
-            if name.endswith((".mdx", ".md")):
+            if name.endswith((".json",) if self._pair else (".mdx", ".md")):
                 paths.add(f"/blog/{name.rsplit('.', 1)[0]}")
         try:
             response = await self._site.fetch(f"{self._config.site_url}/sitemap.xml")
@@ -726,12 +767,12 @@ class GitHubPublishingAdapter:
         return external_id("pr", str(merged["number"])) if merged else external_id("main", slug)
 
     def _post(self, text: str, external: str, status: CMSPostStatus, slug: str, *, url: str | None = None, edit_url: str | None = None) -> CMSPost:  # fmt: skip
-        fields, _ = split_frontmatter(text)
+        fields = parse_fields(text, self._layout)
         title = str((fields or {}).get("title") or "")
         return CMSPost(external_id=external, status=status, slug=slug, url=url, edit_url=edit_url, title=title, content=text)  # fmt: skip
 
     def _path(self, slug: str) -> str:
-        return f"{self._config.content_dir}/{slug}.mdx"
+        return f"{self._config.content_dir}/{slug}{self._suffix}"
 
     def _branch(self, slug: str) -> str:
         return f"{self._config.branch_prefix}{slug}"
@@ -742,6 +783,7 @@ class GitHubPublishingAdapter:
 
 __all__ = [
     "DEFAULT_SITE_PATHS",
+    "MINIMAL_SITE_PATHS",
     "GitHubPublishingAdapter",
     "MDXDocument",
     "SiteClient",

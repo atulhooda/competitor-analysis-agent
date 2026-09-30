@@ -132,3 +132,36 @@ launchctl unload -w ~/Library/LaunchAgents/com.engageo.content-agent.plist
 They would not corrupt anything — every job is claimed atomically and the daily limits are
 enforced under a lock — but they would compete for the same allowances against two different
 databases, which makes the counts confusing.
+
+## A client's blog
+
+A client gets its own worker in the same project: its own Railway service, its own database
+on the same Postgres server, its own profile and limits. Nothing is shared but the Gemini and
+Pexels keys (referenced from the `content-agent` service, never copied), so a client's posts
+can't reach another site and each database counts only its own spend.
+
+The first client is **Skin Essence** (`skinessence-agent`, database `skinessence`,
+repository `atulhooda/skinessencewebsiteredesign`, https://www.skinessence2017.com). Its site
+keeps each post as `content/blog/<slug>.json` + `<slug>.mdx`, so it runs
+`PUBLISH_LAYOUT=json_pair`. Its profile and its own site's scan list are in
+`config/clients/`.
+
+1. Through a temporary TCP proxy (see "Move the existing data across"): `CREATE DATABASE
+   skinessence;`, then with `DATABASE_URL` pointing at it run `uv run alembic upgrade head`,
+   `uv run python -m app company import config/clients/skinessence.yaml`,
+   `uv run python -m app competitors import --file config/clients/skinessence-site.yaml` and
+   `uv run python -m app scan skin-essence` (no LLM: its pages become internal-link targets).
+2. `railway add --service skinessence-agent`, set its variables (below) and
+   `railway up --service skinessence-agent --detach`.
+3. A fine-grained GitHub token for that repository only (Contents and Pull requests
+   read/write, Deployments and Commit statuses read) goes in its `GITHUB_TOKEN`, set in the
+   Railway dashboard.
+
+Its variables differ from Engageo's in: `DATABASE_URL` (the `skinessence` database),
+`GITHUB_REPO`, `GITHUB_CONTENT_DIR=content/blog`, `PUBLISH_LAYOUT=json_pair`,
+`PUBLISH_SITE_URL`, `PUBLISH_META_TITLE_SUFFIX= | Skin Essence Pune`,
+`PUBLISH_AUTHOR_NAME=Skin Essence Editorial Team`, `PUBLISH_LIVE_PUBLISHED_MARKER=datePublished`,
+`COVER_IMAGE_DIR=public/images/blog`, `COVER_IMAGE_URL_PREFIX=/images/blog`,
+`QUALITY_BANNED_PHRASES` (the words the clinic never uses), `MAX_ARTICLES_PER_DAY=1`,
+`MAX_EDITORIAL_ARTICLES_PER_DAY=2`, `EDITORIAL_TOPICS_PER_RUN=4`, a weekly `SCAN_SCHEDULE`
+and a generation schedule from 09:00, so the day's post goes out in the morning.

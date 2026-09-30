@@ -647,3 +647,97 @@ def test_the_index_check_reads_only_the_named_element() -> None:
     assert hidden_by(page, "") is None
     assert hidden_by(page, "no-such-id") is None
     assert index_posts(page) == {"a", "b"}
+
+
+# ── the json_pair layout (a <slug>.json next to its <slug>.mdx body) ─────────
+
+PAIR_SLUG = "ai-receptionist-costs-2026"
+
+
+def pair_adapter(rig: Rig, *, covers: Covers | None = None) -> GitHubPublishingAdapter:
+    rig.gh.layout = "json_pair"
+    rig.gh.extra_pages = ["/treatments/laser-hair-removal", "/concerns/unwanted-hair"]
+    client = GitHubClient(API, REPO, SecretStr(TOKEN), timeout=5, max_retries=1, user_agent="test-agent", sleep=rig.clock.sleep, backoff=0.1)  # fmt: skip
+    site = SiteClient(timeout=5, user_agent="test-agent")
+    pair = config(layout="json_pair", meta_title_suffix=" | Skin Essence Pune", published_marker="datePublished", author_name="Skin Essence Editorial Team", cover_dir="public/images/blog", cover_url_prefix="/images/blog", index_container_id="")  # fmt: skip
+    return GitHubPublishingAdapter(client, site, base_branch=BASE, config=pair, deploy_timeout=100.0, deploy_poll=5.0, sleep=rig.clock.sleep, clock=rig.clock, today=lambda: date(2026, 9, 16), covers=covers)  # fmt: skip
+
+
+def clinic_document(**overrides: Any) -> RenderedDocument:
+    values: dict[str, Any] = {
+        "body_markdown": "Most patients ask about sessions first ([laser hair removal](/treatments/laser-hair-removal)).\n\n## What it costs\n\nA breakdown.\n\n## What it saves\n\nTime, and [unwanted hair](/concerns/unwanted-hair) comes back finer.\n",
+        "excerpt": "What laser hair removal involves on Indian skin: how many sessions, what it feels like and what to expect after, from an MD dermatologist's clinic.",
+    }  # fmt: skip
+    return document(**{**values, **overrides})
+
+
+async def test_a_json_pair_post_is_its_fields_and_a_body_the_site_validates(rig: Rig) -> None:
+    import json
+
+    adapter = pair_adapter(rig)
+    payload = await payload_for(adapter, clinic_document(cover=cover()))
+    fields = json.loads(payload["content"])
+    assert (payload["path"], payload["body_path"]) == (f"{CONTENT_DIR}/{PAIR_SLUG}.json", f"{CONTENT_DIR}/{PAIR_SLUG}.mdx")  # fmt: skip
+    assert fields["slug"] == PAIR_SLUG
+    assert fields["metaTitle"] == "AI receptionist costs | Skin Essence Pune"
+    assert 50 <= len(fields["metaDescription"]) <= 155
+    assert (fields["date"], fields["author"]) == ("2026-09-16", "Skin Essence Editorial Team")
+    assert fields["heroImage"] == {"src": f"/images/blog/{PAIR_SLUG}.png", "alt": cover().alt, "width": 1536, "height": 864}  # fmt: skip
+    assert (fields["relatedTreatments"], fields["relatedConcerns"]) == (["laser-hair-removal"], ["unwanted-hair"])  # fmt: skip
+    assert (fields["agentPublication"], fields["agentSource"]) == (MARKER, "competitor-analysis-agent")  # fmt: skip
+    body = payload["body"]
+    assert "(/treatments/laser-hair-removal)" in body
+    assert "BlogCTA" not in body  # the page renders its own call to action and byline
+    assert not body.startswith("---")
+    assert payload["cover"]["path"] == f"public/images/blog/{PAIR_SLUG}.png"
+    assert "Related treatments: laser-hair-removal" in payload["pr_body"]
+
+
+async def test_a_json_pair_post_without_a_cover_borrows_its_treatments_picture(rig: Rig) -> None:
+    import json
+
+    payload = await payload_for(pair_adapter(rig), clinic_document())
+    assert json.loads(payload["content"])["heroImage"] == {"src": "/images/treatments/laser-hair-removal.webp", "alt": clinic_document().title, "width": 1200, "height": 900}  # fmt: skip
+    assert any("uses the picture of /treatments/laser-hair-removal" in n for n in payload["notes"])
+
+
+async def test_a_json_pair_post_with_no_picture_at_all_is_never_sent(rig: Rig) -> None:
+    adapter = pair_adapter(rig)
+    with pytest.raises(CMSValidationError, match="heroImage is required"):
+        await payload_for(adapter, document())  # no cover, no treatment linked
+
+
+async def test_publishing_a_json_pair_post_commits_both_files_and_verifies_it_live(rig: Rig) -> None:  # fmt: skip
+    covers = Covers()
+    adapter = pair_adapter(rig, covers=covers)
+    publish = await payload_for(adapter, clinic_document(cover=cover()), TargetStatus.PUBLISH)
+    post = await adapter.create_post(publish)
+    assert post.status is CMSPostStatus.PUBLISHED
+    assert post.url == f"{SITE}/blog/{PAIR_SLUG}"
+    assert rig.gh.file(PAIR_SLUG, suffix=".json") == publish["content"]
+    assert rig.gh.file(PAIR_SLUG, suffix=".mdx") == publish["body"]
+    assert rig.gh.image(f"public/images/blog/{PAIR_SLUG}.png") == COVER_BYTES
+    assert adapter.verify(post, publish, status=TargetStatus.PUBLISH, marker=MARKER)[0] == []
+    assert [p.external_id for p in await adapter.find_posts(marker=MARKER)] == [post.external_id]
+    before = len(rig.gh.mutations)
+    again = await adapter.update_post(post.external_id, publish)  # a retry changes nothing
+    assert again.status is CMSPostStatus.PUBLISHED
+    assert len(rig.gh.mutations) == before
+    assert len(covers.asked) == 1
+
+
+async def test_a_changed_json_pair_body_is_a_follow_up_that_keeps_the_date(rig: Rig) -> None:
+    import json
+
+    adapter = pair_adapter(rig, covers=Covers())
+    first = await adapter.create_post(await payload_for(adapter, clinic_document(cover=cover()), TargetStatus.PUBLISH))  # fmt: skip
+    rig_today = date(2026, 9, 20)
+    adapter._today = lambda: rig_today
+    changed_doc = clinic_document(cover=cover(), body_markdown=clinic_document().body_markdown + "\nA new paragraph.\n")  # fmt: skip
+    changed = await payload_for(adapter, changed_doc, TargetStatus.PUBLISH)
+    second = await adapter.update_post(first.external_id, changed)
+    assert second.status is CMSPostStatus.PUBLISHED
+    fields = json.loads(rig.gh.file(PAIR_SLUG, suffix=".json") or "{}")
+    assert fields["date"] == "2026-09-16"  # the original date
+    assert (rig.gh.file(PAIR_SLUG, suffix=".mdx") or "").rstrip().endswith("A new paragraph.")
+    assert rig.gh.pulls[max(rig.gh.pulls)].title.startswith("Update blog post:")

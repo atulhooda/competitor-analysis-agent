@@ -54,6 +54,9 @@ def site_config(settings: Settings) -> SiteConfig:
         cover_url_prefix=settings.cover_image_url_prefix,
         index_path=settings.publish_index_path,
         index_container_id=settings.publish_index_container_id,
+        layout=settings.publish_layout,
+        meta_title_suffix=settings.publish_meta_title_suffix,
+        published_marker=settings.publish_live_published_marker,
     )
 
 

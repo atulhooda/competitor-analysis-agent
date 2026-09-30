@@ -24,8 +24,18 @@ Discovered from the repository and kept here, not in the core:
   parses back to exactly what was meant, no line is an ESM statement, no ``{``, ``}`` or
   ``<`` survives outside the one component we emit, and that component is well-formed.
   The site's own build (the preview deployment) is the last gate.
+
+A second layout, ``json_pair`` (the skin-essence repository), keeps a post's fields in
+``<slug>.json`` and only its body in ``<slug>.mdx``: the site checks the JSON against its own
+schema at build time (``metaTitle`` 10-80 characters, ``metaDescription`` 50-155, an ISO
+``date``, a ``heroImage`` with its size) and renders the title, byline, related treatments
+and concerns and its call to action itself, so the body carries none of them. The JSON
+holds the ownership keys (``agentPublication``, ``agentSource``) and ``agentBody``, the
+body file's SHA-256, so the one file that is looked up says whether the other changed.
 """
 
+import hashlib
+import json
 import re
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
@@ -78,6 +88,17 @@ _ESM_LINE = re.compile(r"^(import|export)\s", re.MULTILINE)
 _JSX_OPEN = re.compile(r"<(?=[A-Za-z/])")
 _MARKER = re.compile(r"^[0-9a-f]{32}$")
 
+FRONTMATTER, JSON_PAIR = "frontmatter", "json_pair"
+# json_pair: the site's field order, then the agent's own keys (its schema drops unknown keys).
+PAIR_ORDER = ("slug", "title", "metaTitle", "metaDescription", "date", "excerpt", "author", "reviewedBy", "readingMinutes", "heroImage", "relatedTreatments", "relatedConcerns", "agentPublication", "agentSource", "agentBody")  # fmt: skip
+# Internal links to these sections become the post's related cards (field → path prefix).
+PAIR_RELATED = (("relatedTreatments", "/treatments/"), ("relatedConcerns", "/concerns/"))
+MAX_RELATED = 3
+META_TITLE_RANGE, META_DESCRIPTION_RANGE = (10, 80), (50, 155)
+# A post without a cover borrows the picture of its first related treatment.
+TREATMENT_IMAGE, TREATMENT_IMAGE_SIZE = "/images/treatments/{slug}.webp", (1200, 900)
+_PAIR_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
 
 @dataclass(frozen=True)
 class SiteConfig:
@@ -103,6 +124,10 @@ class SiteConfig:
     # The blog index a new post must appear on, and the element holding its post cards.
     index_path: str = "/blog"
     index_container_id: str = "blog-posts"
+    layout: str = FRONTMATTER  # or JSON_PAIR
+    meta_title_suffix: str = ""  # json_pair: " | Skin Essence Pune"
+    # What the live post must carry to count as published.
+    published_marker: str = "article:published_time"
 
     @property
     def site_host(self) -> str:
@@ -123,6 +148,8 @@ class MDXDocument:
     dropped_links: tuple[str, ...] = ()
     notes: tuple[str, ...] = field(default_factory=tuple)
     cover_path: str | None = None  # the image file in the repository, when there is a cover
+    body_path: str | None = None  # json_pair: the body file next to the JSON
+    body_text: str | None = None
 
 
 # ── the pieces ───────────────────────────────────────────────────────────────
@@ -346,6 +373,161 @@ def compose(document: RenderedDocument, *, marker: str, config: SiteConfig, allo
     )
 
 
+def body_digest(body: str) -> str:
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def pair_json(fields: dict[str, Any]) -> str:
+    """The post's JSON in the repository's style: two-space indent, the site's key order."""
+    ordered = {k: fields[k] for k in PAIR_ORDER if k in fields}
+    ordered.update({k: v for k, v in fields.items() if k not in ordered})
+    return json.dumps(ordered, indent=2, ensure_ascii=False) + "\n"
+
+
+def parse_fields(text: str, layout: str = FRONTMATTER) -> dict[str, Any] | None:
+    """A post file's fields: its frontmatter, or (json_pair) its JSON object."""
+    if layout != JSON_PAIR:
+        return split_frontmatter(text)[0]
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _fit(text: str, limit: int) -> str:
+    """``text`` cut at a word boundary to at most ``limit`` characters."""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    cut = text[: limit + 1].rsplit(" ", 1)[0] if " " in text[:limit] else text[:limit]
+    return cut.rstrip(" ,;:-\u2013\u2014")  # and en/em dashes
+
+
+def pair_related(paths: Iterable[str]) -> dict[str, list[str]]:
+    """Linked treatment and concern pages, as the slugs the post's related cards take."""
+    related: dict[str, list[str]] = {name: [] for name, _ in PAIR_RELATED}
+    for path in paths:
+        for name, prefix in PAIR_RELATED:
+            slug = path[len(prefix) :] if path.startswith(prefix) else ""
+            if slug and _PAIR_SLUG.match(slug) and slug not in related[name] and len(related[name]) < MAX_RELATED:  # fmt: skip
+                related[name].append(slug)
+    return related
+
+
+def compose_pair(document: RenderedDocument, *, marker: str, config: SiteConfig, allowed_paths: Collection[str], published_on: date) -> MDXDocument:  # fmt: skip
+    """The JSON and the MDX body of one article version (the json_pair layout)."""
+    if not _MARKER.match(marker):
+        raise ValueError("the publication marker must be 32 hex characters")
+    slug = site_slug(document.slug)
+    if not slug:
+        raise ValueError(f"no usable slug from {document.slug!r}")
+    title = " ".join(document.title.split())
+    suffix = config.meta_title_suffix
+    meta_title = _fit(document.meta_title or title, META_TITLE_RANGE[1] - len(suffix)) + suffix
+    description = _fit(document.excerpt, META_DESCRIPTION_RANGE[1])
+    body, kept, dropped = filter_internal_links(document.body_markdown, config, allowed_paths)
+    suggested = [p for link in document.links if link.kind == "internal" and (p := site_path(link.url, config, allowed_paths))]  # fmt: skip
+    related = pair_related([*kept, *suggested])
+    body_text = body.strip() + "\n"
+    notes = [f"internal link left out (not on the site): {url}" for url in dropped]
+    cover_path: str | None = None
+    hero: dict[str, Any] | None = None
+    if document.cover is not None and document.cover.width and document.cover.height:
+        suffix_ext = cover_extension(document.cover.filename, document.cover.mime)
+        cover_path = f"{config.cover_dir}/{slug}{suffix_ext}"
+        hero = {"src": f"{config.cover_url_prefix}/{slug}{suffix_ext}", "alt": " ".join((document.cover.alt or title).split()), "width": document.cover.width, "height": document.cover.height}  # fmt: skip
+    elif related["relatedTreatments"]:
+        first = related["relatedTreatments"][0]
+        width, height = TREATMENT_IMAGE_SIZE
+        hero = {"src": TREATMENT_IMAGE.format(slug=first), "alt": title, "width": width, "height": height}  # fmt: skip
+        notes.append(f"no cover photo: the post uses the picture of /treatments/{first}")
+    fields: dict[str, Any] = {
+        "slug": slug,
+        "title": title,
+        "metaTitle": meta_title,
+        "metaDescription": description,
+        "date": published_on.isoformat(),
+        "excerpt": " ".join(document.excerpt.split()),
+        "author": config.author_name,
+        "readingMinutes": reading_minutes(body_text),
+        **({"heroImage": hero} if hero else {}),
+        **related,
+        "agentPublication": marker,
+        "agentSource": AGENT_SOURCE,
+        "agentBody": body_digest(body_text),
+    }
+    return MDXDocument(
+        slug=slug,
+        path=f"{config.content_dir}/{slug}.json",
+        branch=f"{config.branch_prefix}{slug}",
+        title=title,
+        frontmatter=fields,
+        text=pair_json(fields),
+        reading_minutes=fields["readingMinutes"],
+        expected_url=f"{config.site_url}/blog/{slug}",
+        internal_links=tuple(dict.fromkeys(kept)),
+        dropped_links=tuple(dropped),
+        notes=tuple(notes),
+        cover_path=cover_path,
+        body_path=f"{config.content_dir}/{slug}.mdx",
+        body_text=body_text,
+    )
+
+
+def validate_pair(text: str, body: str, *, marker: str) -> list[str]:
+    """Why the JSON or the body could break the site's build or the contract (the site's
+    own schema, checked here first); empty when they can't."""
+    fields = parse_fields(text, JSON_PAIR)
+    if fields is None:
+        return ["the post's JSON doesn't parse to an object"]
+    problems: list[str] = []
+    for key in ("slug", "title", "metaTitle", "metaDescription", "date", "excerpt", "author"):
+        if not isinstance(fields.get(key), str) or not fields[key].strip():
+            problems.append(f"json: {key} must be a non-empty string")
+    if isinstance(fields.get("slug"), str) and not _PAIR_SLUG.match(fields["slug"]):
+        problems.append("json: slug must be lowercase kebab-case")
+    for key, (low, high) in (("metaTitle", META_TITLE_RANGE), ("metaDescription", META_DESCRIPTION_RANGE)):  # fmt: skip
+        value = fields.get(key)
+        if isinstance(value, str) and not low <= len(value) <= high:
+            problems.append(
+                f"json: {key} is {len(value)} characters (the site allows {low}-{high})"
+            )
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(fields.get("date") or "")):
+        problems.append("json: date must be YYYY-MM-DD")
+    hero = fields.get("heroImage")
+    if not isinstance(hero, dict):
+        problems.append("json: heroImage is required (no cover photo, and no related treatment to borrow a picture from)")  # fmt: skip
+    else:
+        if not isinstance(hero.get("src"), str) or not hero["src"].startswith("/") or any(c.isspace() for c in hero["src"]):  # fmt: skip
+            problems.append("json: heroImage.src must be a site-absolute path")
+        if not isinstance(hero.get("alt"), str):
+            problems.append("json: heroImage.alt must be a string")
+        for key in ("width", "height"):
+            value = hero.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                problems.append(f"json: heroImage.{key} must be a positive integer")
+    for name, _ in PAIR_RELATED:
+        value = fields.get(name, [])
+        if not isinstance(value, list) or not all(isinstance(s, str) and _PAIR_SLUG.match(s) for s in value):  # fmt: skip
+            problems.append(f"json: {name} must be a list of slugs")
+    if fields.get("agentPublication") != marker:
+        problems.append("json: agentPublication must be this publication's marker")
+    if fields.get("agentBody") != body_digest(body):
+        problems.append("json: agentBody doesn't match the body file")
+    if body.startswith("---"):
+        problems.append("body: starts with a frontmatter fence (the site would render it)")
+    if _ESM_LINE.search(body):
+        problems.append("body: a line starts with import/export (MDX would treat it as code)")
+    if "{" in body or "}" in body:
+        problems.append("body: a brace (MDX would evaluate it)")
+    if _JSX_OPEN.search(body):
+        problems.append("body: a '<' before a letter (MDX would read a tag)")
+    if re.search(r"^# ", body, re.MULTILINE):
+        problems.append("body: an H1 (the site renders the title)")
+    return problems
+
+
 def validate(text: str, *, marker: str, allowed_components: Collection[str] = ("BlogCTA",)) -> list[str]:  # fmt: skip
     """Why the file could break the site's build or the contract; empty when it can't."""
     problems: list[str] = []
@@ -440,7 +622,9 @@ def pr_body(document: RenderedDocument, mdx: MDXDocument, *, generated_at: datet
         f"**{mdx.title}**",
         "",
         f"- Slug: `{mdx.slug}` → {mdx.expected_url}",
-        f"- Category: {mdx.frontmatter['category']} · Tags: {', '.join(mdx.frontmatter['tags']) or '—'}",
+        f"- Category: {mdx.frontmatter['category']} · Tags: {', '.join(mdx.frontmatter['tags']) or '—'}"
+        if "category" in mdx.frontmatter
+        else f"- Related treatments: {', '.join(mdx.frontmatter.get('relatedTreatments') or []) or '—'} · concerns: {', '.join(mdx.frontmatter.get('relatedConcerns') or []) or '—'}",
         f"- Quality score: {document.quality_score:.1f}/100"
         if document.quality_score is not None
         else (
@@ -488,14 +672,21 @@ __all__ = [
     "DEFAULT_CATEGORY",
     "DEFAULT_COVER_DIR",
     "DEFAULT_COVER_URL_PREFIX",
+    "FRONTMATTER",
+    "JSON_PAIR",
     "MDXDocument",
     "SiteConfig",
+    "body_digest",
     "compose",
+    "compose_pair",
     "cover_credit",
     "cover_extension",
     "cta_block",
     "filter_internal_links",
     "frontmatter_text",
+    "pair_json",
+    "pair_related",
+    "parse_fields",
     "pr_body",
     "reading_minutes",
     "site_category",
@@ -504,4 +695,5 @@ __all__ = [
     "site_tags",
     "split_frontmatter",
     "validate",
+    "validate_pair",
 ]

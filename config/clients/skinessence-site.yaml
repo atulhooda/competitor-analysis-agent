@@ -1,0 +1,12 @@
+# Skin Essence's own site, scanned (no LLM) so its treatment, concern, technology and blog
+# pages become internal-link candidates and originality comparisons for its articles. Nothing
+# here is analyzed: this deployment runs no competitor analysis.
+#
+#   DATABASE_URL=<this client's database> uv run python -m app competitors import --file config/clients/skinessence-site.yaml
+competitors:
+  - slug: skin-essence
+    name: Skin Essence (own site)
+    website: https://www.skinessence2017.com
+    sitemaps:
+      - https://www.skinessence2017.com/sitemap.xml
+    include_patterns: ["/treatments/", "/concerns/", "/technology/", "/blog/"]

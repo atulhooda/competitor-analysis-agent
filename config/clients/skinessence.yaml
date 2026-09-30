@@ -1,0 +1,104 @@
+# Skin Essence company profile: a client of Engageo, published by its own deployment of the
+# agent (see deploy/RAILWAY.md). Every fact here is taken from the clinic's own site content
+# (github.com/atulhooda/skinessencewebsiteredesign: content/site.json, doctors/, locations/,
+# treatments/, concerns/), which is itself limited to what the client verified. Anything the
+# client hasn't confirmed (prices, opening hours, machine names per location) stays out.
+#
+#   DATABASE_URL=<this client's database> uv run python -m app company import config/clients/skinessence.yaml
+#
+# The site's content rules (content/README.md) are in `tone` and `excluded_topics`; the words
+# it never uses are also enforced in code (QUALITY_BANNED_PHRASES on this deployment).
+company:
+  name: Skin Essence
+  website: https://www.skinessence2017.com
+  description: 'Skin Essence is an advanced skin, hair, laser and cosmetic clinic in Kalyani Nagar, Pune,
+    with a second clinic in Ahmedabad, led by Dr. Daksha Patel, MBBS, MD (Skin & VD), a dermatologist
+    and cosmetologist with 17+ years of experience in dermatology and cosmetology who has treated over
+    3,00,000 patients and performed more than 10,000 cosmetic treatments. The clinic offers medical
+    dermatology and cosmetic treatments for women, men and children: laser hair reduction, skin glow,
+    skin tightening, acne and scar treatment, pigmentation and melasma treatment, fat reduction, hair
+    regrowth (PRP and hair transplant), anti-ageing (Botox and dermal fillers), peels, laser toning,
+    tattoo removal and mole and wart removal, each planned by the dermatologist around the patient''s
+    skin type and goals.'
+  products:
+  - name: Laser Hair Reduction
+    description: Laser hair removal planned for Indian skin tones, for women and men, face and body.
+  - name: Acne and Acne Scar Treatment
+    description: Medical acne treatment and procedures for acne scars.
+  - name: Pigmentation and Melasma Treatment
+    description: Treatment of pigmentation, melasma and uneven skin tone, including chemical peels and laser toning.
+  - name: Skin Glow and Skin Tightening
+    description: Skin glow treatments, Korean and signature peels, bridal skin care and skin tightening.
+  - name: Anti-Ageing Treatment
+    description: Botox, dermal fillers and other anti-ageing treatments for wrinkles and fine lines.
+  - name: Hair Regrowth
+    description: Hair loss treatment, PRP hair treatment and hair transplant.
+  - name: Fat Reduction
+    description: Non-surgical fat reduction.
+  - name: Tattoo, Mole and Wart Removal
+    description: Laser tattoo removal and mole and wart removal.
+  - name: Paediatric and Medical Dermatology
+    description: Skin problems in children and general medical dermatology, seen by an MD dermatologist.
+  target_audiences:
+  - women and men in Pune
+  - patients in Kalyani Nagar, Viman Nagar and Koregaon Park
+  - people with Indian skin tones
+  - brides and grooms
+  - parents of children with skin problems
+  - patients in Ahmedabad
+  core_topics:
+  - laser hair removal
+  - acne treatment
+  - acne scar treatment
+  - pigmentation treatment
+  - melasma treatment
+  - chemical peels
+  - laser toning
+  - skin glow treatment
+  - skin tightening
+  - anti-ageing treatment
+  - Botox
+  - dermal fillers
+  - hair loss treatment
+  - PRP hair treatment
+  - hair transplant
+  - fat reduction
+  - tattoo removal
+  - mole and wart removal
+  - paediatric dermatology
+  - bridal skin care
+  adjacent_topics:
+  - acne
+  - dark circles
+  - open pores
+  - stretch marks
+  - hair fall
+  - unwanted hair
+  - wrinkles and fine lines
+  - dull skin
+  - sun protection for Indian skin
+  - skincare routines recommended by dermatologists
+  - choosing a dermatologist
+  - preparing for a skin or laser treatment
+  - aftercare after cosmetic procedures
+  excluded_topics:
+  - treatment prices and packages
+  - discounts and offers
+  - before and after photos
+  - guaranteed results
+  - prescription medicines and dosages
+  - home remedies
+  - other clinics and doctors
+  - skin cancer diagnosis
+  preferred_formats:
+  - guide
+  - article
+  - listicle
+  - comparison
+  positioning: MD Dermatologist in Kalyani Nagar, Pune
+  differentiators:
+  - Led by Dr. Daksha Patel, MBBS, MD (Skin & VD), with 17+ years of experience in dermatology and cosmetology
+  - Every treatment plan is made by the dermatologist for the patient's skin type and goals, not read off a fixed chart
+  - Treats women, men and children, with medical dermatology alongside cosmetic treatments
+  - Clinics in Kalyani Nagar, Pune and in Ahmedabad
+  tone: 'Calm, honest and practical: the clinic explaining things to a patient in plain Indian English. Only verified facts; never invent prices, machines, timings or statistics. State sessions and downtime honestly, and what a treatment can''t do. Never say permanent, 100% safe, guaranteed or best in Pune, and never promise results. Mention Kalyani Nagar, Pune two or three times. Advise seeing a dermatologist over self-treating; never recommend a prescription medicine or dose.'

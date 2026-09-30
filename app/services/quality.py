@@ -437,6 +437,11 @@ class QualityService:
                     "seo": seo_hash,
                     "min_words": self._settings.article_min_words,
                     "labels": sorted(labels),
+                    **(
+                        {"banned": list(self._settings.banned_phrases)}
+                        if self._settings.banned_phrases
+                        else {}
+                    ),
                 }
             ),
             prompt_version=None,
@@ -449,6 +454,7 @@ class QualityService:
                     seo,
                     min_words=self._settings.article_min_words,
                     labels=labels,
+                    banned=self._settings.banned_phrases,
                 )
             ),
             load=QualityMetrics.model_validate,

@@ -22,6 +22,7 @@ The component values (0-1) feed the combined score:
 
 import re
 import statistics
+from collections.abc import Sequence
 
 from app.domain.articles import ArticleContent, BlockType, SectionKind
 from app.domain.quality import FactCheckReport, OriginalityReport, QualityMetrics, SEOReport
@@ -75,6 +76,22 @@ def readability(content: ArticleContent) -> dict[str, float]:
     }
 
 
+def banned_phrase_problems(content: ArticleContent, banned: Sequence[str]) -> list[str]:
+    """Each banned phrase (QUALITY_BANNED_PHRASES) the article uses, and where: whole
+    words, any case, in the title, the headings or the text."""
+    places = [("the title", content.title)]
+    for s, section in enumerate(content.sections):
+        places.append((f"section {s + 1}'s heading", section.heading or ""))
+    places += [(f"section {s + 1}", strip_markers(text)) for s, _, _, text in text_blocks(content)]
+    problems = []
+    for phrase in banned:
+        pattern = re.compile(rf"(?<![\w]){re.escape(phrase)}(?![\w])", re.IGNORECASE)
+        where = list(dict.fromkeys(place for place, text in places if pattern.search(text)))
+        if where:
+            problems.append(f'uses "{phrase}", which this site never says: rephrase it without that claim ({", ".join(where[:4])})')  # fmt: skip
+    return problems
+
+
 def compute(
     content: ArticleContent,
     fact_check: FactCheckReport,
@@ -83,13 +100,14 @@ def compute(
     *,
     min_words: int,
     labels: set[str],
+    banned: Sequence[str] = (),
 ) -> QualityMetrics:
     headings = seo.package.headings
     paragraphs = [b for s in content.sections for b in s.blocks if b.type is BlockType.PARAGRAPH]  # fmt: skip
     paragraph_words = [len(_WORD.findall(strip_markers(b.text or ""))) for b in paragraphs]
     words = sum(len(_WORD.findall(strip_markers(t))) for *_, t in text_blocks(content))
     sentences = sum(len([x for x in split_sentences(strip_markers(t)) if x.strip()]) for *_, t in text_blocks(content))  # fmt: skip
-    problems = structural_problems(content, min_words=min_words, labels=labels)
+    problems = structural_problems(content, min_words=min_words, labels=labels) + banned_phrase_problems(content, banned)  # fmt: skip
     structure = {
         "has_title": bool(content.title.strip()),
         "h1_count": headings.h1_count,

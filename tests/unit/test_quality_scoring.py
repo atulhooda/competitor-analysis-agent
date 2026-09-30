@@ -291,3 +291,12 @@ def test_findings_are_fenced_as_data() -> None:
     assert block.count("</review_findings>") == 1  # the one in the excerpt is defused
     assert "I1 | priority 1 | contradicted_claim (section 2) [S1]: contradicted" in block
     assert "Editor's request: Add an example" in block
+
+
+def test_a_banned_phrase_fails_the_content_gate_and_says_where() -> None:
+    banned = ("guaranteed", "best in Pune", "small teams")
+    m = compute(content(), fact_check(supported=2), originality(), seo(), min_words=20, labels={"S1"}, banned=banned)  # fmt: skip
+    found = [p for p in m.structural_problems if p.startswith("uses ")]
+    assert found == ['uses "small teams", which this site never says: rephrase it without that claim (section 1)']  # fmt: skip
+    clean = compute(content(), fact_check(supported=2), originality(), seo(), min_words=20, labels={"S1"}, banned=("guarantee",))  # fmt: skip
+    assert not [p for p in clean.structural_problems if p.startswith("uses ")]  # whole words only

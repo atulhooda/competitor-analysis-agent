@@ -188,6 +188,10 @@ class Settings(BaseSettings):
     quality_max_tokens: int = Field(default=300_000, ge=10_000)
     quality_max_revisions: int = Field(default=2, ge=0, le=5)  # automatic, per edited version
     quality_min_score: float = Field(default=70.0, ge=0, le=100)
+    # Words or phrases an article must never use, comma-separated (case-insensitive, whole
+    # words), e.g. a clinic's "guaranteed, permanent, 100% safe". One found fails the
+    # content_valid gate, and the revision is asked to rephrase it.
+    quality_banned_phrases: str = ""
     quality_max_contradicted: int = Field(default=0, ge=0)
     quality_max_unsupported_ratio: float = Field(default=0.1, ge=0, le=1)
     quality_max_uncited_claims: int = Field(default=3, ge=0)
@@ -233,6 +237,12 @@ class Settings(BaseSettings):
     )
     github_base_branch: str = "main"
     github_content_dir: str = "src/content/blog"  # one <slug>.mdx per post
+    # How a post is laid out in the repository. frontmatter: one <slug>.mdx with YAML
+    # frontmatter (engageo-website). json_pair: <slug>.json (the post's fields) next to
+    # <slug>.mdx (only the body), both validated by the site's build (skin-essence).
+    publish_layout: Literal["frontmatter", "json_pair"] = "frontmatter"
+    # json_pair: appended to the title for the page's <title> (e.g. " | Skin Essence Pune").
+    publish_meta_title_suffix: str = ""
     github_branch_prefix: str = "blog/"  # the branch of a post: blog/<slug>
     github_api_url: str = "https://api.github.com"
     github_deploy_timeout_seconds: int = Field(default=900, ge=30, le=3_600)  # waiting for Vercel
@@ -266,6 +276,9 @@ class Settings(BaseSettings):
     # element). Empty PUBLISH_INDEX_CONTAINER_ID skips only the hidden-cards check.
     publish_index_path: str = "/blog"
     publish_index_container_id: str = "blog-posts"
+    # What the live post page must carry to count as published (its publication date's
+    # markup): the Open Graph tag, or e.g. "datePublished" for a site that only has JSON-LD.
+    publish_live_published_marker: str = "article:published_time"
     wordpress_base_url: str | None = None  # e.g. https://blog.example.com (no credentials)
     wordpress_username: str | None = None
     wordpress_application_password: SecretStr | None = None  # an Application Password
@@ -461,6 +474,11 @@ class Settings(BaseSettings):
         if self.job_retry_base_seconds > self.job_retry_max_seconds:
             raise ValueError("JOB_RETRY_BASE_SECONDS must not exceed JOB_RETRY_MAX_SECONDS")
         return self
+
+    @property
+    def banned_phrases(self) -> tuple[str, ...]:
+        """QUALITY_BANNED_PHRASES as a list: trimmed, blanks dropped, each once."""
+        return tuple(dict.fromkeys(" ".join(p.split()) for p in self.quality_banned_phrases.split(",") if p.strip()))  # fmt: skip
 
     @property
     def scheduler_tz(self) -> ZoneInfo:

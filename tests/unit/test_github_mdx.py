@@ -11,12 +11,18 @@ import yaml
 from app.cms.github.mdx import (
     AUTOMATIC_CATEGORIES,
     CATEGORIES,
+    JSON_PAIR,
     SiteConfig,
+    body_digest,
     compose,
+    compose_pair,
     cover_credit,
     filter_internal_links,
     frontmatter_text,
     jsx_attr,
+    pair_json,
+    pair_related,
+    parse_fields,
     pr_body,
     reading_minutes,
     site_category,
@@ -24,6 +30,7 @@ from app.cms.github.mdx import (
     site_tags,
     split_frontmatter,
     validate,
+    validate_pair,
 )
 from app.domain.articles import ArticleContent, BlockType, ContentBlock, ContentSection, SectionKind
 from app.domain.publishing import (
@@ -391,3 +398,61 @@ def test_the_pull_request_description_carries_provenance_and_no_secret() -> None
     assert MARKER not in body  # the marker stays in the file, not the description
     assert "token" not in body.lower()
     assert "GEMINI" not in body
+
+
+def _pair(**overrides: object) -> tuple[str, str]:
+    fields: dict[str, object] = {
+        "slug": "laser-hair-removal-guide", "title": "Laser Hair Removal on Indian Skin", "metaTitle": "Laser Hair Removal on Indian Skin | Skin Essence Pune",
+        "metaDescription": "Which lasers suit Indian skin, how many sessions you need and what to expect, from a clinic in Pune.",
+        "date": "2026-09-16", "excerpt": "What to know.", "author": "Skin Essence Editorial Team",
+        "heroImage": {"src": "/images/blog/laser.jpg", "alt": "A laser session", "width": 1200, "height": 800},
+        "relatedTreatments": ["laser-hair-removal"], "relatedConcerns": [], "agentPublication": "0" * 32,
+    }  # fmt: skip
+    body = str(overrides.pop("body", "Intro.\n\n## Sessions\n\nSix to eight.\n"))
+    fields.update(overrides)
+    fields.setdefault("agentBody", body_digest(body))
+    return pair_json(fields), body
+
+
+def test_a_well_formed_json_pair_passes_the_sites_schema() -> None:
+    text, body = _pair()
+    assert validate_pair(text, body, marker="0" * 32) == []
+    assert parse_fields(text, JSON_PAIR)["slug"] == "laser-hair-removal-guide"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "problem"),
+    [
+        ({"metaTitle": "x" * 81}, "metaTitle is 81 characters"),
+        ({"metaDescription": "Too short."}, "metaDescription is 10 characters"),
+        ({"date": "16 Sep 2026"}, "date must be YYYY-MM-DD"),
+        ({"heroImage": None}, "heroImage is required"),
+        (
+            {"heroImage": {"src": "/a.jpg", "alt": "", "width": "1200", "height": 800}},
+            "heroImage.width",
+        ),
+        ({"relatedTreatments": ["Laser Hair"]}, "relatedTreatments must be a list of slugs"),
+        ({"agentBody": "f" * 64}, "agentBody doesn't match"),
+        ({"body": "Costs {price}.\n"}, "a brace"),
+        ({"body": "# Title\n\nText.\n"}, "an H1"),
+        ({"body": "<Script />\n"}, "a '<' before a letter"),
+    ],
+)
+def test_the_json_pair_checks_catch_what_would_break_the_build(overrides: dict[str, object], problem: str) -> None:  # fmt: skip
+    text, body = _pair(**overrides)
+    assert any(problem in p for p in validate_pair(text, body, marker="0" * 32))
+
+
+def test_only_treatment_and_concern_links_become_related_cards() -> None:
+    related = pair_related(["/treatments/botox", "/blog/other", "/concerns/acne", "/treatments/botox", "/treatments/a", "/treatments/b", "/treatments/c"])  # fmt: skip
+    assert related == {"relatedTreatments": ["botox", "a", "b"], "relatedConcerns": ["acne"]}
+
+
+def test_a_long_title_is_cut_to_fit_the_meta_title_with_its_suffix() -> None:
+    config = SiteConfig(site_url="https://www.skinessence2017.com", content_dir="content/blog", branch_prefix="blog/", author_name="Skin Essence Editorial Team", author_role="", author_initials="SE", author_linkedin=None, cta_title="", cta_body="", cta_label="", cta_href="/", byline="", layout=JSON_PAIR, meta_title_suffix=" | Skin Essence Pune")  # fmt: skip
+    long = "Laser Hair Removal on Indian Skin: Sessions, Pain, Aftercare, Costs and Every Question Patients Ask"  # fmt: skip
+    mdx = compose_pair(document(title=long, meta_title=long, body_markdown="Intro.\n\n## One\n\nText.\n"), marker="0" * 32, config=config, allowed_paths={"/"}, published_on=date(2026, 9, 16))  # fmt: skip
+    meta = mdx.frontmatter["metaTitle"]
+    assert len(meta) <= 80
+    assert meta.endswith(" | Skin Essence Pune")
+    assert not meta.removesuffix(" | Skin Essence Pune").endswith((" ", ":", ","))

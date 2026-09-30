@@ -81,6 +81,10 @@ class FakeGitHub:
     preview_index_style: str = ""
     preview_index_drop: int = 0
     bypass_secret: str | None = None  # accepted in the x-vercel-protection-bypass header
+    # How the site stores a post: "frontmatter" (<slug>.mdx) or "json_pair" (<slug>.json with
+    # its fields, <slug>.mdx with its body; the page carries its date as JSON-LD only).
+    layout: str = "frontmatter"
+    extra_pages: list[str] = field(default_factory=list)  # more paths in the sitemap
     # Per action ("get_repo", "get_ref", "create_ref", "get_contents", "put_contents",
     # "list_pulls", "create_pull", "get_pull", "merge", "deployments", "site", "preview"):
     # failures to inject, in order: an HTTP status, "timeout" (nothing happened), "lost"
@@ -114,8 +118,12 @@ class FakeGitHub:
     def open_pulls(self) -> list[FakePullRequest]:
         return [p for p in self.pulls.values() if p.state == "open"]
 
-    def file(self, slug: str, *, branch: str = BASE) -> str | None:
-        return self.trees.get(branch, {}).get(f"{CONTENT_DIR}/{slug}.mdx")
+    def file(self, slug: str, *, branch: str = BASE, suffix: str = ".mdx") -> str | None:
+        return self.trees.get(branch, {}).get(f"{CONTENT_DIR}/{slug}{suffix}")
+
+    @property
+    def _post_suffix(self) -> str:
+        return ".json" if self.layout == "json_pair" else ".mdx"
 
     def image(self, path: str, *, branch: str = BASE) -> bytes | None:
         return self.blobs.get(branch, {}).get(path)
@@ -424,9 +432,10 @@ class FakeGitHub:
     # ── the site and its previews ────────────────────────────────────────────
 
     def _index(self, tree: dict[str, str], *, preview: bool) -> httpx.Response:
-        slugs = sorted(p.rsplit("/", 1)[-1].removesuffix(".mdx") for p, text in tree.items() if p.startswith(f"{CONTENT_DIR}/") and p.endswith(".mdx") and "draft: true" not in text)  # fmt: skip
+        suffix = self._post_suffix
+        slugs = sorted(p.rsplit("/", 1)[-1].removesuffix(suffix) for p, text in tree.items() if p.startswith(f"{CONTENT_DIR}/") and p.endswith(suffix) and "draft: true" not in text)  # fmt: skip
         if preview and self.preview_index_drop:  # posts that are live today, never the new one
-            live = {p.rsplit("/", 1)[-1].removesuffix(".mdx") for p in self.trees[BASE]}
+            live = {p.rsplit("/", 1)[-1].removesuffix(suffix) for p in self.trees[BASE] if p.endswith(suffix)}  # fmt: skip
             dropped = [slug for slug in slugs if slug in live][: self.preview_index_drop]
             slugs = [slug for slug in slugs if slug not in dropped]
         style = (
@@ -439,6 +448,8 @@ class FakeGitHub:
         if path.rstrip("/") == "/blog":
             return self._index(tree, preview=preview)
         slug = path.removeprefix("/blog/").strip("/")
+        if self.layout == "json_pair":
+            return self._pair_page(tree, path, slug, host)
         text = tree.get(f"{CONTENT_DIR}/{slug}.mdx")
         if not path.startswith("/blog/") or text is None:
             return httpx.Response(404, text="<html><title>404</title><body>Not found</body></html>")
@@ -456,6 +467,25 @@ class FakeGitHub:
         )
         return httpx.Response(200, text=page)
 
+    def _pair_page(self, tree: dict[str, str], path: str, slug: str, host: str) -> httpx.Response:  # fmt: skip
+        """A json_pair post: its fields from the JSON, its headings from the body file. A
+        JSON without its body is a failed build: the page isn't there."""
+        import json
+
+        meta, body = tree.get(f"{CONTENT_DIR}/{slug}.json"), tree.get(f"{CONTENT_DIR}/{slug}.mdx")
+        if not path.startswith("/blog/") or meta is None or body is None:
+            return httpx.Response(404, text="<html><title>404</title><body>Not found</body></html>")
+        fields = json.loads(meta)
+        headings = "".join(f"<h2>{html.escape(line[3:])}</h2>" for line in body.splitlines() if line.startswith("## "))  # fmt: skip
+        ld = json.dumps({"@type": "BlogPosting", "headline": fields.get("title"), "datePublished": fields.get("date")})  # fmt: skip
+        page = (
+            f"<html><head><title>{html.escape(str(fields.get('metaTitle', '')))}</title>"
+            f'<link rel="canonical" href="{host}/blog/{slug}"/>'
+            f'<script type="application/ld+json">{ld}</script></head>'
+            f"<body><h1>{html.escape(str(fields.get('title', '')))}</h1><article>{headings}</article></body></html>"
+        )
+        return httpx.Response(200, text=page)
+
     def _site(self, request: httpx.Request) -> httpx.Response:
         self.calls.append((request.method, f"site:{request.url.path}"))
         self.requests.append(request)
@@ -463,7 +493,8 @@ class FakeGitHub:
         if failure is not None:
             return self._failure(failure, request)
         if request.url.path == "/sitemap.xml":
-            locs = [f"{SITE}/", f"{SITE}/services", f"{SITE}/clinics", f"{SITE}/contact", f"{SITE}/pricing", f"{SITE}/blog"] + [f"{SITE}/blog/{p.rsplit('/', 1)[-1].removesuffix('.mdx')}" for p in self.trees[BASE]]  # fmt: skip
+            suffix = self._post_suffix
+            locs = [f"{SITE}/", f"{SITE}/services", f"{SITE}/clinics", f"{SITE}/contact", f"{SITE}/pricing", f"{SITE}/blog"] + [f"{SITE}{p}" for p in self.extra_pages] + [f"{SITE}/blog/{p.rsplit('/', 1)[-1].removesuffix(suffix)}" for p in self.trees[BASE] if p.endswith(suffix)]  # fmt: skip
             return httpx.Response(200, text="<urlset>" + "".join(f"<url><loc>{u}</loc></url>" for u in locs) + "</urlset>")  # fmt: skip
         return self._page(self.trees[BASE], request.url.path, SITE)
 
