@@ -119,6 +119,14 @@ def read_max_output_tokens(pages: int) -> int:
     return 2_000 + 1_500 * pages
 
 
+def _market(brief: ArticleBrief) -> list[str]:
+    """Who the article is for: evidence about them comes first."""
+    m = brief.company.market
+    if m is None:
+        return []
+    return [f"Readers are in {m.country}: prefer evidence about {m.country} (its regulators, professional bodies, studies of people there, its publications) where it exists; global sources are fine for general facts.", ""]  # fmt: skip
+
+
 def _avoid(sites: Sequence[str]) -> list[str]:
     """Sites whose pages the automated reader keeps failing to open."""
     if not sites:
@@ -141,6 +149,7 @@ def render_discover(brief: ArticleBrief, *, max_questions: int, max_sources: int
         "Competitor domains (vendor marketing: never use as authorities): "
         + (", ".join(brief.competitor_domains) or "none"),
         "",
+        *_market(brief),
         *_avoid(avoid),
         f"Ask at most {max_questions} research question(s) and return at most {max_sources} "
         "source(s).",
@@ -177,6 +186,7 @@ def render_follow_up(
         "Already tried (never propose these again):",
         *[f"- {url}" for url in tried],
         "",
+        *_market(brief),
         *_avoid(avoid),
         "Search again, differently: other wording, other angles, and other kinds of source. "
         "A page has to be readable by an automated reader to be of any use, so prefer an "

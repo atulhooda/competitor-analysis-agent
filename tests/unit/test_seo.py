@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from app.domain.articles import ArticleBrief, ArticleContent, SourceType
+from app.domain.company import CompanyMarket
 from app.prompts.seo import FAQOut, ImageOut, LinkChoiceOut, SEOOut
 from app.services.article_brief import build_brief
 from app.services.seo import (
@@ -292,3 +293,46 @@ def test_the_inputs_fingerprint_follows_the_stored_data() -> None:
     assert inputs().fingerprint() == inputs().fingerprint()
     assert inputs().fingerprint() != inputs(competitor_keywords=("other",)).fingerprint()
     assert inputs().fingerprint() != inputs(internal_pages=()).fingerprint()
+
+
+# ── the market ───────────────────────────────────────────────────────────────
+
+PUNE = CompanyMarket(country="India", demonym="Indian", places=["Pune", "Kalyani Nagar"])
+
+
+def market_inputs(market: CompanyMarket = PUNE) -> SEOInputs:
+    b = brief()
+    return inputs(brief=b.model_copy(update={"company": b.company.model_copy(update={"market": market})}))  # fmt: skip
+
+
+def test_the_top_keywords_get_variants_for_the_readers_places() -> None:
+    plain = {c.keyword.lower() for c in keyword_candidates(inputs(), article())}
+    candidates = {c.keyword.lower(): c for c in keyword_candidates(market_inputs(), article())}
+    added = set(candidates) - plain
+    assert "ai agents in pune" in added
+    assert "ai agents in kalyani nagar" in added
+    assert all(candidates[k].sources == ["target market"] for k in added)
+    country = {c.keyword.lower() for c in keyword_candidates(market_inputs(CompanyMarket(country="India")), article())}  # fmt: skip
+    assert "ai agents in india" in country
+
+
+def test_a_place_the_article_names_scores_its_variant_higher() -> None:
+    named = article(title="AI agents for founders in Pune: a practical guide")
+    scores = {c.keyword.lower(): c.score for c in keyword_candidates(market_inputs(), named)}
+    assert scores["ai agents in pune"] > scores["ai agents in kalyani nagar"]
+
+
+def test_the_meta_must_name_the_market_when_there_is_one() -> None:
+    data = market_inputs()
+    content = article()
+    candidates = keyword_candidates(data, content)
+    internal = internal_candidates(data.internal_pages, data, content)
+
+    def check(**overrides: Any) -> Any:
+        report = assemble(out(**overrides), candidates, internal, external_candidates(data.sources), category_options(data), content, CONFIG, market_names=PUNE.names)  # fmt: skip
+        return next(c for c in report.checks if c.name == "market_in_meta")
+
+    assert not check().passed
+    assert check(meta_description="How Indian founders can use AI agents for support without losing trust, with a clear human handoff and weekly review.").passed  # fmt: skip
+    assert check(meta_title="AI agents for founders in Pune").passed
+    assert all(c.name != "market_in_meta" for c in build().checks)  # no market: no check

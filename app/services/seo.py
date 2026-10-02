@@ -14,6 +14,9 @@ code validates the result and runs the checks.
   with numbers absent from the article, categories outside the options.
 - Deterministic checks (lengths, keyword placement, heading hierarchy, keyword density:
   repetition is flagged as stuffing, never rewarded) give the SEO score.
+- A market (the company profile's country and places) adds place-qualified variants of the
+  top candidates ("<keyword> in Pune", "<keyword> in India"), which score higher when the
+  article already names the place, and a check that the meta title or description names it.
 """
 
 import re
@@ -25,6 +28,7 @@ from typing import Any, Self
 from app.config import Settings
 from app.domain.analysis import LLMPurpose
 from app.domain.articles import ArticleBrief, ArticleContent, BlockType, SectionKind, SourceType
+from app.domain.company import CompanyMarket
 from app.domain.quality import (
     FAQItem,
     HeadingAnalysis,
@@ -45,6 +49,8 @@ from app.services.numbers import numbers_in
 from app.services.relevance import stems
 
 MAX_CANDIDATES = 20
+MARKET_VARIANTS_OF = 3  # top candidates that get place-qualified variants
+MARKET_PLACES = 2  # places (or the country) each gets a variant for
 MAX_INTERNAL = 10
 MAX_LINKS = 5
 ALT_TEXT_MAX = 125
@@ -121,6 +127,12 @@ def contains_keyword(text: str, keyword: str) -> bool:
     return bool(wanted) and wanted <= _stems(text)
 
 
+def names_market(text: str, names: Sequence[str]) -> bool:
+    """The text names one of the market's places, its country or its people ("Indian")."""
+    words = _stems(text)
+    return any(_stems(name) and _stems(name) <= words for name in names)
+
+
 def heading_analysis(content: ArticleContent) -> HeadingAnalysis:
     h1 = content.title.strip() or None
     h2 = [s.heading.strip() for s in content.sections if s.heading and s.heading.strip()]
@@ -177,6 +189,13 @@ def keyword_candidates(inputs: SEOInputs, content: ArticleContent) -> list[Keywo
         add(keyword, 1 + 0.25 * min(count - 1, 4), "competitor keyword")
     for topic in inputs.company_topics:
         add(topic, 1, "company topic")
+    market = inputs.brief.company.market
+    if market is not None:
+        places = market.places[:MARKET_PLACES] or [market.country]
+        for key in sorted(weights, key=lambda k: -weights[k])[:MARKET_VARIANTS_OF]:
+            if not names_market(forms[key], market.names):
+                for place in places:
+                    add(f"{forms[key]} in {place}", weights[key] - 0.5, "target market")
     title = content.title
     h2 = " ".join(s.heading or "" for s in content.sections)
     body_tokens = _WORD.findall(" ".join(strip_markers(t) for *_, t in text_blocks(content)).lower())  # fmt: skip
@@ -263,6 +282,7 @@ async def build_seo(llm: BudgetedLLM, inputs: SEOInputs, content: ArticleContent
             intent=inputs.brief.search_intent.value,
             angle=inputs.brief.primary_angle,
             company=inputs.brief.company.name,
+            market=market_text(inputs.brief.company.market),
             article=to_markdown(content),
             keywords=[
                 f"K{i} | {c.keyword} | score {c.score} | from: {', '.join(c.sources)}"
@@ -281,7 +301,14 @@ async def build_seo(llm: BudgetedLLM, inputs: SEOInputs, content: ArticleContent
         reasoning_effort=config.reasoning_effort,
     )
     response = await llm.structured(request, prompt.SEOOut, purpose=LLMPurpose.SEO_PACKAGE, prompt_version=prompt.VERSION)  # fmt: skip
-    return assemble(response.data, candidates, internal, external, categories, content, config)
+    names = inputs.brief.company.market.names if inputs.brief.company.market else ()
+    return assemble(response.data, candidates, internal, external, categories, content, config, market_names=names)  # fmt: skip
+
+
+def market_text(market: CompanyMarket | None) -> str | None:
+    if market is None:
+        return None
+    return market.country + (f" (above all {', '.join(market.places)})" if market.places else "")
 
 
 def assemble(
@@ -292,6 +319,8 @@ def assemble(
     categories: Sequence[str],
     content: ArticleContent,
     config: SEOConfig,
+    *,
+    market_names: Sequence[str] = (),
 ) -> SEOReport:
     """Validate the model's package against what it was offered, then check it."""
     notes: list[str] = []
@@ -368,7 +397,7 @@ def assemble(
         tags=tags[:8],
         image=image,
     )
-    checks, density, missing = seo_checks(package, content, config, has_sources=bool(external))
+    checks, density, missing = seo_checks(package, content, config, has_sources=bool(external), market_names=market_names)  # fmt: skip
     score = round(sum(c.passed for c in checks) / len(checks), 4) if checks else 0.0
     return SEOReport(package=package, candidates=list(candidates), checks=checks, score=score, keyword_density=density, mandatory_missing=missing, notes=notes)  # fmt: skip
 
@@ -387,7 +416,7 @@ def _links(choices: Sequence[prompt.LinkChoiceOut], offered: dict[str, tuple[str
     return links[:MAX_LINKS]
 
 
-def seo_checks(package: SEOPackage, content: ArticleContent, config: SEOConfig, *, has_sources: bool) -> tuple[list[SEOCheck], float, list[str]]:  # fmt: skip
+def seo_checks(package: SEOPackage, content: ArticleContent, config: SEOConfig, *, has_sources: bool, market_names: Sequence[str] = ()) -> tuple[list[SEOCheck], float, list[str]]:  # fmt: skip
     keyword = package.primary_keyword
     intro = " ".join(strip_markers(b.text or " ".join(b.items)) for s in content.sections if s.kind is SectionKind.INTRODUCTION for b in s.blocks)  # fmt: skip
     density = keyword_density(content, keyword) if keyword else 0.0
@@ -453,5 +482,8 @@ def seo_checks(package: SEOPackage, content: ArticleContent, config: SEOConfig, 
     ]
     if has_sources:
         checks.append(SEOCheck(name="external_links", passed=bool(package.external_links), detail=f"{len(package.external_links)} link(s)"))  # fmt: skip
+    if market_names:
+        named = names_market(package.meta_title, market_names) or names_market(package.meta_description, market_names)  # fmt: skip
+        checks.append(SEOCheck(name="market_in_meta", passed=named, detail=f"the meta title or description names {' / '.join(market_names[:3])}" if named else f"neither the meta title nor the description names {' / '.join(market_names[:3])}"))  # fmt: skip
     missing = [name for name, value in (("primary_keyword", keyword), ("meta_title", package.meta_title), ("meta_description", package.meta_description), ("slug", package.slug)) if not value.strip()]  # fmt: skip
     return checks, density, missing

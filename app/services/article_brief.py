@@ -28,7 +28,7 @@ from app.domain.articles import ArticleBrief, BriefCompany, BriefEvidence
 from app.domain.company import CompanyProfile
 from app.domain.opportunities import EvidenceKind, GapType, InterpretationStatus
 
-BRIEF_VERSION = "article-brief/1"
+BRIEF_VERSION = "article-brief/2"
 MAX_KEY_POINTS = 8
 MAX_EVIDENCE = 8
 _INTERPRETED = (InterpretationStatus.OK.value, InterpretationStatus.REUSED.value)
@@ -223,6 +223,7 @@ def build_brief(inputs: BriefInputs) -> ArticleBrief:
             positioning=company.positioning,
             differentiators=list(company.differentiators),
             tone=company.tone,
+            market=company.market,
         ),
         things_to_avoid=avoid,
         competitor_domains=sorted(set(inputs.competitor_domains)),

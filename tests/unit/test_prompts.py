@@ -362,7 +362,7 @@ def test_read_prompt_lists_questions_and_pages() -> None:
 
 
 def test_phase6_prompts_are_versioned() -> None:
-    assert (fact_check.VERSION, seo.VERSION, quality_judge.VERSION, revision.VERSION) == ("fact-check/1", "seo/1", "quality-judge/1", "article-revision/2")  # fmt: skip
+    assert (fact_check.VERSION, seo.VERSION, quality_judge.VERSION, revision.VERSION) == ("fact-check/1", "seo/2", "quality-judge/1", "article-revision/2")  # fmt: skip
 
 
 def test_the_fact_checker_judges_only_from_the_source() -> None:

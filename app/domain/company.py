@@ -34,6 +34,31 @@ class CompanyProduct(BaseModel):
     description: str | None = Field(default=None, max_length=1_000)
 
 
+class CompanyMarket(BaseModel):
+    """Where the readers are: the country, and the places in it, that articles are written
+    and titled for. A search engine ranks a page for the readers whose searches it answers in
+    their own terms (their places, spelling, laws and currency); an article written for
+    nowhere in particular ranks for everyone, mostly elsewhere."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    country: str = Field(min_length=1, max_length=80, description="e.g. India")
+    demonym: str | None = Field(default=None, max_length=40, description="e.g. Indian")
+    places: list[str] = Field(default_factory=list, max_length=20, description="Cities or localities to name where readers search with them")  # fmt: skip
+    language: str | None = Field(default=None, max_length=200, description="e.g. Indian English (British spelling)")  # fmt: skip
+    currency: str | None = Field(default=None, max_length=100, description="e.g. ₹ (INR)")
+
+    @field_validator("places")
+    @classmethod
+    def _clean_places(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(" ".join(v.split()) for v in values if v.strip()))
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """Every word that ties a page to the market: the places, the country, its people."""
+        return tuple(dict.fromkeys([*self.places, self.country, *([self.demonym] if self.demonym else [])]))  # fmt: skip
+
+
 class CompanyProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -55,6 +80,7 @@ class CompanyProfile(BaseModel):
     positioning: str | None = Field(default=None, max_length=2_000)
     differentiators: list[str] = Field(default_factory=list, max_length=20)
     tone: str | None = Field(default=None, max_length=500, description="Voice for later phases")
+    market: CompanyMarket | None = Field(default=None, description="Who the articles are for: none means no particular country")  # fmt: skip
 
     @field_validator("products", mode="before")
     @classmethod
@@ -75,7 +101,8 @@ class CompanyProfile(BaseModel):
         return cleaned
 
     def _digest(self, fields: tuple[str, ...] | None = None) -> str:
-        data = self.model_dump(mode="json", include=set(fields) if fields else None)
+        # No market: the same digest as before the field existed (stored versions match).
+        data = self.model_dump(mode="json", include=set(fields) if fields else None, exclude={"market"} if self.market is None else None)  # fmt: skip
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
     @property

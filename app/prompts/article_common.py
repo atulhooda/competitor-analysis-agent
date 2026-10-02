@@ -16,6 +16,7 @@ from app.domain.articles import (
     OutlineSection,
     ResearchResult,
 )
+from app.domain.company import CompanyMarket
 
 RESEARCH_TAG = "untrusted_research"
 COMPETITOR_TAG = "competitor_context"
@@ -80,7 +81,26 @@ def company_block(brief: ArticleBrief) -> str:
         f"- differentiators: {'; '.join(c.differentiators) or 'none specified'}",
         f"- tone of voice: {c.tone or 'not specified: clear, direct and professional'}",
     ]
+    if c.market is not None:
+        lines += ["", *market_block(c.market)]
     return "\n".join(lines)
+
+
+def market_block(m: CompanyMarket) -> list[str]:
+    """Who the article is for. Search engines rank a page for readers whose searches it
+    answers in their own terms, so it is written and titled for them."""
+    where = m.country + (f", above all {', '.join(m.places)}" if m.places else "")
+    language = m.language or "the English used there"
+    money = m.currency or "the local currency"
+    places = f" or a place ({', '.join(m.places)})" if m.places else ""
+    return [
+        f"Readers: people in {where}. Write for them:",
+        f"- {language}; {money} for any money (only figures the sources give)",
+        f"- examples, institutions, laws and situations from {m.country}; never present "
+        "another country's laws, insurance, currency or institutions as if they applied",
+        f"- the title and the introduction name the country{places} where readers there "
+        "would search with it",
+    ]
 
 
 def research_block(research: ResearchResult, max_chars: int) -> str:

@@ -16,6 +16,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from app.domain.analysis import ContentFormat, SearchIntent
+from app.domain.company import CompanyMarket
 
 
 class ArticleOrigin(StrEnum):
@@ -260,6 +261,7 @@ class BriefCompany(BaseModel):
     positioning: str | None
     differentiators: list[str]
     tone: str | None
+    market: CompanyMarket | None = None  # who the article is for (country, places)
 
 
 class ArticleBrief(BaseModel):

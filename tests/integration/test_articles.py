@@ -150,7 +150,7 @@ async def test_an_approved_opportunity_becomes_a_researched_cited_edited_article
     assert (article.opportunity_id, article.assessment_id) == (opportunity.id, opportunity.current_assessment_id)  # fmt: skip
     assert article.status == ArticleStatus.COMPLETED.value
     assert [(s.step, s.status) for s in steps] == [(s, "succeeded") for s in ("brief", "research", "outline", "draft", "edit")]  # fmt: skip
-    assert {s.step: s.prompt_version for s in steps} == {"brief": "article-brief/1", "research": "article-research/2", "outline": "article-outline/1", "draft": "article-draft/1", "edit": "article-edit/1"}  # fmt: skip
+    assert {s.step: s.prompt_version for s in steps} == {"brief": "article-brief/2", "research": "article-research/2", "outline": "article-outline/1", "draft": "article-draft/1", "edit": "article-edit/1"}  # fmt: skip
     assert all(s.model == "gemini-3.8-flash" for s in steps if s.step != "brief")
     assert [(v.kind, v.number) for v in versions] == [("outline", 1), ("draft", 1), ("final", 1)]
     assert article.final_version_id == versions[-1].id

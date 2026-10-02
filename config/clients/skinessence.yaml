@@ -102,3 +102,12 @@ company:
   - Treats women, men and children, with medical dermatology alongside cosmetic treatments
   - Clinics in Kalyani Nagar, Pune and in Ahmedabad
   tone: 'Calm, honest and practical: the clinic explaining things to a patient in plain Indian English. Only verified facts; never invent prices, machines, timings or statistics. State sessions and downtime honestly, and what a treatment can''t do. Never say permanent, 100% safe, guaranteed or best in Pune, and never promise results. Mention Kalyani Nagar, Pune two or three times. Advise seeing a dermatologist over self-treating; never recommend a prescription medicine or dose.'
+  # Who the articles are for: patients in Pune, near the Kalyani Nagar clinic.
+  market:
+    country: India
+    demonym: Indian
+    places:
+    - Pune
+    - Kalyani Nagar
+    language: Indian English with British spelling (colour, centre, programme)
+    currency: ₹ (INR)

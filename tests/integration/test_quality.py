@@ -336,14 +336,14 @@ def _ran(outcome: QualityOutcome) -> set[str]:
 async def test_an_seo_prompt_change_redoes_only_what_depends_on_seo(world: World, monkeypatch: pytest.MonkeyPatch) -> None:  # fmt: skip
     await world.validate()
     world.fake.requests.clear()
-    monkeypatch.setattr("app.prompts.seo.VERSION", "seo/2")
+    monkeypatch.setattr("app.prompts.seo.VERSION", "seo/test-1")
 
     same = await world.validate()
 
     assert _ran(same) == {"seo"}  # the same package: nothing downstream changes
     assert world.counts() == {"SEOOut": 1}
     world.fake.requests.clear()
-    monkeypatch.setattr("app.prompts.seo.VERSION", "seo/3")
+    monkeypatch.setattr("app.prompts.seo.VERSION", "seo/test-2")
     world.fake.seo_overrides = {"meta_title": "AI agents: what founders should know"}
 
     changed = await world.validate()

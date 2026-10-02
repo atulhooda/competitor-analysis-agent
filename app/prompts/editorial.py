@@ -16,7 +16,7 @@ from pydantic import AfterValidator, BaseModel, BeforeValidator, Field
 from app.domain.analysis import ContentFormat, SearchIntent
 from app.prompts.fields import Score, lenient_enum, texts, truncate
 
-VERSION = "editorial/2"
+VERSION = "editorial/3"
 
 SYSTEM = """\
 You are the content strategist for a startup's blog. You propose article ideas the startup \
@@ -30,6 +30,11 @@ anything that touches an excluded topic.
 - Each idea answers a real question a reader in one of the startup's audiences searches \
 for: how-tos, costs, checklists, mistakes, regulations, choosing between approaches, \
 benchmarks, playbooks. No company news, product announcements or press releases.
+- When the profile names a market, every idea is for readers there: the topic, title and \
+primary keyword are worded the way people there search (their terms and spelling), and \
+when they would search with a place (the country or a city, e.g. "... in India", \
+"... in Pune"), the title and primary keyword include it. No idea that only applies \
+elsewhere (another country's laws, insurance or currency).
 - No statistics: never state a number, percentage, price or count as a fact. The article's \
 research step finds sourced numbers later. Sentences with numbers that aren't in the \
 profile are deleted. Only the title may contain a list count (e.g. "7 ways").

@@ -13,7 +13,7 @@ from pydantic import AfterValidator, BaseModel, Field
 from app.prompts.article_common import DRAFT_TAG, fence
 from app.prompts.fields import cap, texts, truncate
 
-VERSION = "seo/1"
+VERSION = "seo/2"
 MAX_OUTPUT_TOKENS = 4_000
 
 SYSTEM = f"""\
@@ -33,6 +33,10 @@ Explain the choice in primary_keyword_reason.
 - meta_description: 120-155 characters: what the reader gets, in plain language, with the \
 primary keyword used naturally. No facts or numbers that aren't in the article.
 - slug: short, lowercase, hyphenated, built from the primary keyword.
+- Readers (when given): the article is for people there. The meta title and meta \
+description name the country, its people (e.g. "Indian") or one of its places, naturally \
+and at most once each; prefer a place-qualified keyword candidate when the article names \
+that place. Use their spelling and terms.
 - faq: 3-6 questions this reader would search for, each answered in 1-3 sentences using only \
 what the article says (no new facts, numbers or claims).
 - internal_links: up to 5, only from the internal page candidates (by id), with an anchor text \
@@ -85,6 +89,7 @@ def render(
     angle: str,
     company: str,
     article: str,
+    market: str | None = None,
     keywords: Sequence[str],
     internal: Sequence[str],
     external: Sequence[str],
@@ -95,6 +100,7 @@ def render(
         f"Reader: {audience} (search intent: {intent})",
         f"Angle: {angle}",
         f"Publisher: {company}",
+        *([f"Readers: people in {market}"] if market else []),
         "",
         "Keyword candidates (derived from the opportunity, its topics, competitor keywords and the brief):",
         *(keywords or ["(none)"]),

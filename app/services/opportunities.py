@@ -50,7 +50,7 @@ from app.db.models import (
 )
 from app.db.session import SessionFactory
 from app.domain.analysis import LLMPurpose, TopicStatus
-from app.domain.company import CompanyProfile
+from app.domain.company import CompanyMarket, CompanyProfile
 from app.domain.history import RunStatus, RunTrigger
 from app.domain.opportunities import (
     ALLOWED_TRANSITIONS,
@@ -189,7 +189,16 @@ def company_lines(company: CompanyProfile) -> list[str]:
             lines.append(f"- {label}: {'; '.join(values)}")
     if company.positioning:
         lines.append(f"- positioning: {company.positioning}")
+    if company.market:
+        lines.append(f"- market: {market_line(company.market)}")
     return [neutralize(line) for line in lines]
+
+
+def market_line(market: CompanyMarket) -> str:
+    """The market as the models see it: who the readers are, and in what terms."""
+    text = f"readers in {market.country}" + (f", above all in {', '.join(market.places)}" if market.places else "")  # fmt: skip
+    extras = [x for x in (f"language: {market.language}" if market.language else None, f"money in {market.currency}" if market.currency else None) if x]  # fmt: skip
+    return text + (f" ({'; '.join(extras)})" if extras else "")
 
 
 def _category(reason: str) -> str:
