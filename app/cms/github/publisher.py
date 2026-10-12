@@ -82,7 +82,6 @@ DEFAULT_SITE_PATHS = frozenset({"/", "/blog", "/services", "/clinics", "/contact
 MINIMAL_SITE_PATHS = frozenset({"/", "/blog", "/contact"})
 MAX_LISTED_FILES = 200
 MAX_OPEN_PRS = 100
-CATCH_UP_SECONDS = 120.0  # waiting for GitHub to update a branch that fell behind
 _TAGS = re.compile(r"<[^>]+>")
 _LOC = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>")
 _POST_LINK = re.compile(r'href="/blog/([a-z0-9][a-z0-9-]*)/?"')
@@ -398,6 +397,7 @@ class GitHubPublishingAdapter:
             if pr.get("state") != "open":
                 raise CMSConflictError(f"pull request #{value} was closed without being merged: reopen it, or delete branch {pr['head']['ref']} to start over")  # fmt: skip
             head_branch = str(pr["head"]["ref"])
+            await self._fresh_branch(head_branch, str(pr["head"]["sha"]))
             await self._ensure_cover(head_branch, payload)
             await self._ensure_body(head_branch, payload)
             await self._ensure_file(head_branch, path, str(payload["content"]), str(payload["commit_message"]))  # fmt: skip
@@ -517,11 +517,16 @@ class GitHubPublishingAdapter:
         return str(ref["object"]["sha"])
 
     async def _fresh_branch(self, branch: str, head: str) -> str:
-        """A branch left behind by an earlier squash merge holds commits the base branch's
-        history doesn't, so anything written on it now can't be merged back ("merge
-        conflicts"). With no pull request open on it, it is taken back to the base branch
-        first; with one open, it is left exactly as it is — that branch is under review."""
-        if await self._open_pr(branch) is not None:
+        """A post's branch that the base branch has moved past is taken back to the base
+        branch, and the caller writes the post's files onto it again as new commits.
+
+        Left behind by an earlier squash merge, it holds commits the base branch's history
+        doesn't ("merge conflicts"). Behind with its pull request still open, its preview is
+        the site as it was when the branch was made, without the posts published since, so
+        the blog index check refuses it on every run. A merge of the base branch into it
+        (GitHub's update-branch) doesn't help: Vercel builds no preview for that commit.
+        Only the agent's own branches are reset, and the agent rewrites every file it owns."""
+        if not branch.startswith(self._config.branch_prefix):
             return head
         comparison = await self._gh.get(f"repos/{self._repo}/compare/{self._base}...{branch}")
         status = str(comparison.get("status") or "")
@@ -616,29 +621,7 @@ class GitHubPublishingAdapter:
 
     # ── deployments and pages ────────────────────────────────────────────────
 
-    async def _catch_up(self, pr: dict[str, Any]) -> dict[str, Any]:
-        """An open pull request whose branch is behind the base branch: its preview is the
-        site as it was when the branch was made, without the posts published since, so the
-        blog index check would refuse it on every run. The base branch is merged into it
-        (GitHub's update-branch) and the new head is returned, for a fresh preview."""
-        branch = str(pr["head"]["ref"])
-        if not branch.startswith(self._config.branch_prefix):
-            return pr
-        comparison = await self._gh.get(f"repos/{self._repo}/compare/{self._base}...{branch}")
-        if int(comparison.get("behind_by") or 0) == 0:
-            return pr
-        old = str(pr["head"]["sha"])
-        await self._gh.put(f"repos/{self._repo}/pulls/{pr['number']}/update-branch", {"expected_head_sha": old})  # fmt: skip
-        log.info("github.branch_updated", repo=self._repo, pr=pr["number"], behind_by=comparison.get("behind_by"))  # fmt: skip
-        deadline = self._clock() + CATCH_UP_SECONDS
-        while True:  # GitHub updates the branch asynchronously
-            fresh = dict(await self._gh.get(f"repos/{self._repo}/pulls/{pr['number']}"))
-            if str(fresh["head"]["sha"]) != old or self._clock() >= deadline:
-                return fresh
-            await self._sleep(self._deploy_poll)
-
     async def _verify_preview(self, pr: dict[str, Any], slug: str, title: str, headings: list[str]) -> str:  # fmt: skip
-        pr = await self._catch_up(pr)
         sha = str(pr["head"]["sha"])
         if sha in self._verified_previews:
             return self._verified_previews[sha]

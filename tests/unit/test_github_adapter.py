@@ -745,8 +745,8 @@ async def test_a_changed_json_pair_body_is_a_follow_up_that_keeps_the_date(rig: 
 
 async def test_a_pull_request_left_behind_by_newer_posts_is_brought_up_to_date(rig: Rig) -> None:
     """Its preview is the site as it was when the branch was made: without the posts
-    published since, the blog index check refuses it on every run, until the branch is
-    updated from the base branch."""
+    published since, the blog index check refuses it on every run. The branch is taken back
+    to the base branch and the post written onto it again, which gives a fresh preview."""
     adapter = rig.adapter()
     waiting = await adapter.create_post(await payload_for(adapter, document()))  # its PR stays open
     later = document(title="WhatsApp Reminders That Patients Read", slug="whatsapp-reminders", body_markdown="Reminders work.\n\n## When to send\n\nThe day before.\n\n## What to say\n\nKeep it short.\n", headings=["When to send", "What to say"])  # fmt: skip
@@ -754,7 +754,10 @@ async def test_a_pull_request_left_behind_by_newer_posts_is_brought_up_to_date(r
     assert rig.gh.file("whatsapp-reminders") is not None
     post = await adapter.update_post(waiting.external_id, await payload_for(adapter, document(), TargetStatus.PUBLISH))  # fmt: skip
     assert post.status is CMSPostStatus.PUBLISHED
-    assert any(c[1].endswith("/update-branch") for c in rig.gh.calls)
+    assert any(c[0] == "PATCH" and c[1].endswith("/git/refs/heads/blog/ai-receptionist-costs-2026") for c in rig.gh.calls)  # reset to main  # fmt: skip
+    assert not any(
+        c[1].endswith("/update-branch") for c in rig.gh.calls
+    )  # Vercel builds no preview for that
     assert rig.gh.file("whatsapp-reminders") is not None  # still live after the merge
     assert rig.gh.file("ai-receptionist-costs-2026") is not None
 
@@ -762,4 +765,4 @@ async def test_a_pull_request_left_behind_by_newer_posts_is_brought_up_to_date(r
 async def test_a_pull_request_that_is_up_to_date_is_not_touched(rig: Rig) -> None:
     adapter = rig.adapter()
     await adapter.create_post(await payload_for(adapter, document(), TargetStatus.PUBLISH))
-    assert not any(c[1].endswith("/update-branch") for c in rig.gh.calls)
+    assert not any(c[0] == "PATCH" for c in rig.gh.calls)  # nothing to reset
