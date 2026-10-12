@@ -82,6 +82,7 @@ DEFAULT_SITE_PATHS = frozenset({"/", "/blog", "/services", "/clinics", "/contact
 MINIMAL_SITE_PATHS = frozenset({"/", "/blog", "/contact"})
 MAX_LISTED_FILES = 200
 MAX_OPEN_PRS = 100
+CATCH_UP_SECONDS = 120.0  # waiting for GitHub to update a branch that fell behind
 _TAGS = re.compile(r"<[^>]+>")
 _LOC = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>")
 _POST_LINK = re.compile(r'href="/blog/([a-z0-9][a-z0-9-]*)/?"')
@@ -615,7 +616,29 @@ class GitHubPublishingAdapter:
 
     # ── deployments and pages ────────────────────────────────────────────────
 
+    async def _catch_up(self, pr: dict[str, Any]) -> dict[str, Any]:
+        """An open pull request whose branch is behind the base branch: its preview is the
+        site as it was when the branch was made, without the posts published since, so the
+        blog index check would refuse it on every run. The base branch is merged into it
+        (GitHub's update-branch) and the new head is returned, for a fresh preview."""
+        branch = str(pr["head"]["ref"])
+        if not branch.startswith(self._config.branch_prefix):
+            return pr
+        comparison = await self._gh.get(f"repos/{self._repo}/compare/{self._base}...{branch}")
+        if int(comparison.get("behind_by") or 0) == 0:
+            return pr
+        old = str(pr["head"]["sha"])
+        await self._gh.put(f"repos/{self._repo}/pulls/{pr['number']}/update-branch", {"expected_head_sha": old})  # fmt: skip
+        log.info("github.branch_updated", repo=self._repo, pr=pr["number"], behind_by=comparison.get("behind_by"))  # fmt: skip
+        deadline = self._clock() + CATCH_UP_SECONDS
+        while True:  # GitHub updates the branch asynchronously
+            fresh = dict(await self._gh.get(f"repos/{self._repo}/pulls/{pr['number']}"))
+            if str(fresh["head"]["sha"]) != old or self._clock() >= deadline:
+                return fresh
+            await self._sleep(self._deploy_poll)
+
     async def _verify_preview(self, pr: dict[str, Any], slug: str, title: str, headings: list[str]) -> str:  # fmt: skip
+        pr = await self._catch_up(pr)
         sha = str(pr["head"]["sha"])
         if sha in self._verified_previews:
             return self._verified_previews[sha]

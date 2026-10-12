@@ -146,6 +146,7 @@ class FakeGitHub:
             ("POST", rf"^{r}/pulls$", self._create_pull),
             ("GET", rf"^{r}/pulls/(?P<number>\d+)$", self._get_pull),
             ("PUT", rf"^{r}/pulls/(?P<number>\d+)/merge$", self._merge),
+            ("PUT", rf"^{r}/pulls/(?P<number>\d+)/update-branch$", self._update_branch),
             ("GET", rf"^{r}/deployments$", self._list_deployments),
             ("GET", rf"^{r}/deployments/(?P<deployment>\d+)/statuses$", self._deployment_statuses),
         ]
@@ -372,7 +373,30 @@ class FakeGitHub:
         base, _, head = spec.partition("...")
         if head not in self.trees or base not in self.trees:
             return _error(404, "Not Found")
-        return httpx.Response(200, json={"status": self._status_of(head), "ahead_by": 0, "behind_by": 0})  # fmt: skip
+        status = self._status_of(head)
+        return httpx.Response(200, json={"status": status, "ahead_by": int(status in ("ahead", "diverged")), "behind_by": int(status in ("behind", "diverged"))})  # fmt: skip
+
+    def _update_branch(self, request: httpx.Request, number: str) -> httpx.Response:
+        """GitHub's update-branch: the base branch merged into the pull request's branch,
+        which then gets a new head and a new preview deployment."""
+        failure = self._injected("update_branch")
+        if failure is not None:
+            return self._failure(failure, request)
+        pr = self.pulls.get(int(number))
+        if pr is None or pr.state != "open":
+            return _error(422, "Pull request is not open")
+        own = {
+            path: text
+            for path, text in self.trees[pr.head].items()
+            if self.trees[pr.base].get(path) != text
+        }
+        self.trees[pr.head] = {**self.trees[pr.base], **own}
+        self.blobs[pr.head] = {**self.blobs.get(pr.base, {}), **self.blobs.get(pr.head, {})}
+        self.branch_bases[pr.head] = self.branch_heads[pr.base]
+        self.branch_heads[pr.head] = self._sha(f"update{pr.number}{self.commits}")
+        self.commits += 1
+        self._new_deployment(pr.head)
+        return httpx.Response(202, json={"message": "Updating pull request branch."})
 
     def _update_ref(self, request: httpx.Request, branch: str) -> httpx.Response:
         """Moving a branch, as `git push --force` does: the tree comes with it."""
