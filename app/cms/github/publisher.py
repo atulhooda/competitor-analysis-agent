@@ -553,10 +553,18 @@ class GitHubPublishingAdapter:
             current = await self._read(file_path, onto)
             if current is None or current[0] != text:
                 changes.append((file_path, text.encode()))
-        if not changes:
-            return
         parent = str((await self._gh.get(f"repos/{self._repo}/git/ref/heads/{onto}"))["object"]["sha"])  # fmt: skip
-        tree = str((await self._gh.get(f"repos/{self._repo}/git/commits/{parent}"))["tree"]["sha"])
+        head = await self._gh.get(f"repos/{self._repo}/git/commits/{parent}")
+        tree = str(head["tree"]["sha"])
+        if not changes:
+            if stale or not await self._preview_lost(parent, head):
+                return
+            # Nothing to change, but this version will never get a preview: the same files
+            # again, as a new commit, for a new build.
+            commit = await self._gh.post(f"repos/{self._repo}/git/commits", {"message": f"{message} (rebuild the preview)", "tree": tree, "parents": [parent]})  # fmt: skip
+            await self._gh.patch(f"repos/{self._repo}/git/refs/heads/{branch}", {"sha": str(commit["sha"]), "force": False})  # fmt: skip
+            log.info("github.preview_rebuild", repo=self._repo, branch=branch, was=parent[:7])
+            return
         entries = []
         for file_path, data in changes:
             blob = await self._gh.post(f"repos/{self._repo}/git/blobs", {"content": base64.b64encode(data).decode(), "encoding": "base64"})  # fmt: skip
@@ -565,6 +573,27 @@ class GitHubPublishingAdapter:
         commit = await self._gh.post(f"repos/{self._repo}/git/commits", {"message": message, "tree": str(made["sha"]), "parents": [parent]})  # fmt: skip
         await self._gh.patch(f"repos/{self._repo}/git/refs/heads/{branch}", {"sha": str(commit["sha"]), "force": bool(stale)})  # fmt: skip
         log.info("github.commit", repo=self._repo, branch=branch, files=[p for p, _ in changes], rebuilt_on_base=stale)  # fmt: skip
+
+    async def _preview_lost(self, sha: str, commit: dict[str, Any]) -> bool:
+        """The preview of this commit will never come: Vercel canceled its build, or none was
+        reported long after the commit was made. A failed build isn't lost: building the
+        same files again fails again (and the failure is reported as such)."""
+        deployments = await self._gh.get(f"repos/{self._repo}/deployments", {"sha": sha, "per_page": 20})  # fmt: skip
+        previews = [d for d in (deployments if isinstance(deployments, list) else []) if "production" not in str(d.get("environment", "")).lower()]  # fmt: skip
+        states = []
+        for deployment in previews:
+            statuses = await self._gh.get(f"repos/{self._repo}/deployments/{deployment['id']}/statuses", {"per_page": 1})  # fmt: skip
+            states.append(str(statuses[0].get("state", "pending")).lower() if isinstance(statuses, list) and statuses else "pending")  # fmt: skip
+        if states:
+            return all(state == "inactive" for state in states)  # canceled
+        made = str(((commit.get("committer") or {}).get("date")) or "")
+        try:
+            age = (
+                self._now() - datetime.fromisoformat(made.replace("Z", "+00:00"))
+            ).total_seconds()
+        except ValueError:
+            return False
+        return age > self._deploy_timeout
 
     async def _ensure_pr(self, branch: str, title: str, body: str) -> dict[str, Any] | None:
         existing = await self._open_pr(branch)
@@ -660,6 +689,7 @@ class GitHubPublishingAdapter:
         while True:
             deployments = await self._gh.get(f"repos/{self._repo}/deployments", {"sha": sha, "per_page": 20})  # fmt: skip
             pending = False
+            canceled = 0
             for deployment in deployments if isinstance(deployments, list) else []:
                 environment = str(deployment.get("environment", "")).lower()
                 if ("production" in environment) != production:
@@ -672,9 +702,12 @@ class GitHubPublishingAdapter:
                 if state in ("failure", "error"):
                     where = "production" if production else "preview"
                     raise CMSDeploymentError(f"the {where} deployment of {sha[:7]} failed ({latest.get('description') or state}): see {latest.get('log_url') or latest.get('target_url') or 'Vercel'}")  # fmt: skip
+                if state == "inactive":  # canceled: it will never finish
+                    canceled += 1
+                    continue
                 pending = True
-            if self._clock() >= deadline:
-                return None
+            if (canceled and not pending) or self._clock() >= deadline:
+                return None  # the next run commits the files again for a new build
             log.debug("github.deployment_wait", sha=sha[:7], production=production, pending=pending)
             await self._sleep(self._deploy_poll)
 

@@ -72,7 +72,7 @@ class FakeGitHub:
     deployments: list[FakeDeployment] = field(default_factory=list)
     # How a deployment goes once created: "success" (default), "failure", "pending"
     # (never finishes), "none" (Vercel never reports one), "later" (pending on the first
-    # poll, success on the next).
+    # poll, success on the next), "canceled" (Vercel cancels the build: state inactive).
     preview_outcome: str = "success"
     production_outcome: str = "success"
     preview_protected: bool = False
@@ -432,7 +432,9 @@ class FakeGitHub:
             tree, parent = self.git_commits[sha]
             if parent != self.branch_heads[branch] and not body.get("force"):
                 return _error(422, "Update is not a fast forward")
-            texts, binaries = self.git_trees[tree]
+            snapshot = self._snapshot(tree.removeprefix("tree@")) if tree.startswith("tree@") else self.git_trees[tree]  # fmt: skip
+            assert snapshot is not None, tree
+            texts, binaries = snapshot
             self.trees[branch], self.blobs[branch] = dict(texts), dict(binaries)
             if parent == self.branch_heads[BASE]:
                 self.branch_bases[branch] = parent
@@ -502,7 +504,7 @@ class FakeGitHub:
         if outcome == "none":
             return
         self.next_deployment += 1
-        state = "success" if outcome == "success" else ("failure" if outcome == "failure" else "pending")  # fmt: skip
+        state = {"success": "success", "failure": "failure", "canceled": "inactive"}.get(outcome, "pending")  # fmt: skip
         url = SITE if production else f"https://preview-{self.next_deployment}.vercel.app"
         self.deployments.append(FakeDeployment(self.next_deployment, self.branch_heads[branch], "Production" if production else "Preview", branch, state, url))  # fmt: skip
 

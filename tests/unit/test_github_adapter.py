@@ -782,3 +782,17 @@ async def test_a_post_and_its_cover_reach_the_branch_in_one_commit(rig: Rig) -> 
     [(_, files)] = [c for c in rig.gh.committed if c[0].startswith("blog/")]
     assert sorted(files) == sorted([f"{CONTENT_DIR}/{PAIR_SLUG}.json", f"{CONTENT_DIR}/{PAIR_SLUG}.mdx", f"public/images/blog/{PAIR_SLUG}.png"])  # fmt: skip
     assert not any(c[1].startswith(f"/repos/{REPO}/contents/") for c in rig.gh.mutations)
+
+
+async def test_a_preview_vercel_canceled_is_built_again_on_the_next_run(rig: Rig) -> None:
+    adapter = rig.adapter()
+    publish = await payload_for(adapter, document(), TargetStatus.PUBLISH)
+    rig.gh.preview_outcome = "canceled"
+    with pytest.raises(CMSTimeoutError):
+        await adapter.create_post(publish)
+    assert rig.clock.sleeps == []  # a canceled build isn't waited for
+    rig.gh.preview_outcome = "success"
+    post = await adapter.update_post("pr:61", publish)
+    assert post.status is CMSPostStatus.PUBLISHED
+    assert len(rig.gh.committed) == 2  # the post, then the same files again for a new build
+    assert rig.gh.committed[1][1] == ()
