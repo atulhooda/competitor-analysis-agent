@@ -377,9 +377,7 @@ class GitHubPublishingAdapter:
         verified (and, for a public target, the pull request merged and verified live)."""
         branch, path = str(payload["branch"]), str(payload["path"])
         await self._ensure_branch(branch)
-        await self._ensure_cover(branch, payload)
-        await self._ensure_body(branch, payload)
-        await self._ensure_file(branch, path, str(payload["content"]), str(payload["commit_message"]))  # fmt: skip
+        await self._write_post(branch, payload, path, str(payload["content"]), str(payload["commit_message"]))  # fmt: skip
         pr = await self._ensure_pr(branch, str(payload["pr_title"]), str(payload["pr_body"]))
         if pr is None:  # nothing to propose: the base branch already holds this file
             return await self._published(payload, merged_sha=None)
@@ -397,16 +395,11 @@ class GitHubPublishingAdapter:
             if pr.get("state") != "open":
                 raise CMSConflictError(f"pull request #{value} was closed without being merged: reopen it, or delete branch {pr['head']['ref']} to start over")  # fmt: skip
             head_branch = str(pr["head"]["ref"])
-            await self._fresh_branch(head_branch, str(pr["head"]["sha"]))
-            await self._ensure_cover(head_branch, payload)
-            await self._ensure_body(head_branch, payload)
-            await self._ensure_file(head_branch, path, str(payload["content"]), str(payload["commit_message"]))  # fmt: skip
+            await self._write_post(head_branch, payload, path, str(payload["content"]), str(payload["commit_message"]))  # fmt: skip
             pr = await self._gh.get(f"repos/{self._repo}/pulls/{value}")
             return await self._from_pr(pr, payload)
         if kind == "branch":
-            await self._ensure_cover(value, payload)
-            await self._ensure_body(value, payload)
-            await self._ensure_file(value, path, str(payload["content"]), str(payload["commit_message"]))  # fmt: skip
+            await self._write_post(value, payload, path, str(payload["content"]), str(payload["commit_message"]))  # fmt: skip
             pr = await self._ensure_pr(value, str(payload["pr_title"]), str(payload["pr_body"]))
             if pr is None:
                 return await self._published(payload, merged_sha=None)
@@ -471,9 +464,7 @@ class GitHubPublishingAdapter:
         follow = {**payload, "content": text, "frontmatter": updated, "commit_message": f"Update blog post: {payload['title']}", "pr_title": f"Update blog post: {payload['title']}"}  # fmt: skip
         branch = str(payload["branch"])
         await self._ensure_branch(branch)
-        await self._ensure_cover(branch, follow)
-        await self._ensure_body(branch, follow)
-        await self._ensure_file(branch, str(payload["path"]), text, str(follow["commit_message"]))
+        await self._write_post(branch, follow, str(payload["path"]), text, str(follow["commit_message"]))  # fmt: skip
         pr = await self._ensure_pr(branch, str(follow["pr_title"]), str(payload["pr_body"]))
         if pr is None:
             return await self._published(follow, merged_sha=None)
@@ -504,7 +495,7 @@ class GitHubPublishingAdapter:
     async def _ensure_branch(self, branch: str) -> str:
         ref = await self._gh.get_optional(f"repos/{self._repo}/git/ref/heads/{branch}")
         if ref is not None:
-            return await self._fresh_branch(branch, str(ref["object"]["sha"]))
+            return str(ref["object"]["sha"])
         base = await self._gh.get(f"repos/{self._repo}/git/ref/heads/{self._base}")
         sha = str(base["object"]["sha"])
         try:
@@ -516,65 +507,64 @@ class GitHubPublishingAdapter:
         ref = await self._gh.get(f"repos/{self._repo}/git/ref/heads/{branch}")
         return str(ref["object"]["sha"])
 
-    async def _fresh_branch(self, branch: str, head: str) -> str:
-        """A post's branch that the base branch has moved past is taken back to the base
-        branch, and the caller writes the post's files onto it again as new commits.
+    async def _stale(self, branch: str) -> str | None:
+        """Why a post's branch must be rebuilt on the base branch, or None.
 
         Left behind by an earlier squash merge, it holds commits the base branch's history
         doesn't ("merge conflicts"). Behind with its pull request still open, its preview is
         the site as it was when the branch was made, without the posts published since, so
-        the blog index check refuses it on every run. A merge of the base branch into it
-        (GitHub's update-branch) doesn't help: Vercel builds no preview for that commit.
-        Only the agent's own branches are reset, and the agent rewrites every file it owns."""
+        the blog index check would refuse it on every run. Only the agent's own branches."""
         if not branch.startswith(self._config.branch_prefix):
-            return head
+            return None
         comparison = await self._gh.get(f"repos/{self._repo}/compare/{self._base}...{branch}")
         status = str(comparison.get("status") or "")
-        if status not in ("behind", "diverged"):
-            return head
-        base = await self._gh.get(f"repos/{self._repo}/git/ref/heads/{self._base}")
-        sha = str(base["object"]["sha"])
-        await self._gh.patch(f"repos/{self._repo}/git/refs/heads/{branch}", {"sha": sha, "force": True})  # fmt: skip
-        log.info("github.branch_reset", repo=self._repo, branch=branch, base=self._base, was=status)  # fmt: skip
-        return sha
+        return status if status in ("behind", "diverged") else None
 
-    async def _ensure_cover(self, branch: str, payload: dict[str, Any]) -> None:
-        """The post's cover picture on its own branch, committed at most once.
+    async def _write_post(self, branch: str, payload: dict[str, Any], path: str, content: str, message: str) -> None:  # fmt: skip
+        """Every file of the post (cover, body, the post file) in ONE commit on its branch,
+        and only the files that differ.
 
-        The file is looked up first, exactly like the branch, the post and the pull request.
-        Only when it is missing is the cover source asked for the bytes — so a publish
-        retried after a lost answer, a follow-up pull request or a second publication of the
-        same version neither regenerates the picture nor commits it again. A cover that
-        can't be had is a warning: the post is published with the frontmatter it has."""
+        One commit, because Vercel starts a build for every commit pushed and cancels some of
+        those that arrive together: when it cancels the build of the last one, the branch's
+        head never gets a preview and the post can never be verified (Skin Essence, October
+        2026). A stale branch (``_stale``) gets that commit on top of the base branch instead
+        of its own history, so the pull request never stops differing from the base branch
+        (GitHub closes a pull request whose branch is reset to it).
+
+        The cover is looked up before its bytes are asked for, so a retried publish neither
+        regenerates the picture nor commits it again; a cover that can't be had is a warning.
+        """
+        stale = await self._stale(branch)
+        onto = self._base if stale else branch  # what the files are compared with
+        changes: list[tuple[str, bytes]] = []
         cover = payload.get("cover")
-        if not isinstance(cover, dict) or self._covers is None:
+        if isinstance(cover, dict) and self._covers is not None:
+            cover_path = str(cover["path"])
+            if await self._gh.get_optional(f"repos/{self._repo}/contents/{cover_path}", {"ref": onto}) is None:  # fmt: skip
+                found = await self._covers.image(int(cover["article_id"]), int(cover["version_id"]))
+                if found is None:
+                    log.warning("github.cover_unavailable", repo=self._repo, branch=branch, path=cover_path)  # fmt: skip
+                else:
+                    changes.append((cover_path, found[1]))
+        files = (
+            [(str(payload["body_path"]), str(payload["body"]))] if payload.get("body_path") else []
+        )
+        for file_path, text in [*files, (path, content)]:
+            current = await self._read(file_path, onto)
+            if current is None or current[0] != text:
+                changes.append((file_path, text.encode()))
+        if not changes:
             return
-        path = str(cover["path"])
-        if await self._gh.get_optional(f"repos/{self._repo}/contents/{path}", {"ref": branch}) is not None:  # fmt: skip
-            return
-        found = await self._covers.image(int(cover["article_id"]), int(cover["version_id"]))
-        if found is None:
-            log.warning("github.cover_unavailable", repo=self._repo, branch=branch, path=path)
-            return
-        data = found[1]
-        await self._gh.put(f"repos/{self._repo}/contents/{path}", {"message": f"Add cover image: {payload['title']}", "content": base64.b64encode(data).decode(), "branch": branch})  # fmt: skip
-        log.info("github.cover", repo=self._repo, branch=branch, path=path, bytes=len(data))
-
-    async def _ensure_body(self, branch: str, payload: dict[str, Any]) -> None:
-        """json_pair: the body file, written before the JSON that names its digest (the site
-        imports it by slug), and only when it differs."""
-        if payload.get("body_path"):
-            await self._ensure_file(branch, str(payload["body_path"]), str(payload["body"]), f"{payload['commit_message']} (body)")  # fmt: skip
-
-    async def _ensure_file(self, branch: str, path: str, content: str, message: str) -> None:
-        current = await self._read(path, branch)
-        if current is not None and current[0] == content:
-            return
-        body: dict[str, Any] = {"message": message, "content": base64.b64encode(content.encode()).decode(), "branch": branch}  # fmt: skip
-        if current is not None:
-            body["sha"] = current[1]
-        await self._gh.put(f"repos/{self._repo}/contents/{path}", body)
-        log.info("github.file", repo=self._repo, branch=branch, path=path, action="updated" if current else "created")  # fmt: skip
+        parent = str((await self._gh.get(f"repos/{self._repo}/git/ref/heads/{onto}"))["object"]["sha"])  # fmt: skip
+        tree = str((await self._gh.get(f"repos/{self._repo}/git/commits/{parent}"))["tree"]["sha"])
+        entries = []
+        for file_path, data in changes:
+            blob = await self._gh.post(f"repos/{self._repo}/git/blobs", {"content": base64.b64encode(data).decode(), "encoding": "base64"})  # fmt: skip
+            entries.append({"path": file_path, "mode": "100644", "type": "blob", "sha": str(blob["sha"])})  # fmt: skip
+        made = await self._gh.post(f"repos/{self._repo}/git/trees", {"base_tree": tree, "tree": entries})  # fmt: skip
+        commit = await self._gh.post(f"repos/{self._repo}/git/commits", {"message": message, "tree": str(made["sha"]), "parents": [parent]})  # fmt: skip
+        await self._gh.patch(f"repos/{self._repo}/git/refs/heads/{branch}", {"sha": str(commit["sha"]), "force": bool(stale)})  # fmt: skip
+        log.info("github.commit", repo=self._repo, branch=branch, files=[p for p, _ in changes], rebuilt_on_base=stale)  # fmt: skip
 
     async def _ensure_pr(self, branch: str, title: str, body: str) -> dict[str, Any] | None:
         existing = await self._open_pr(branch)

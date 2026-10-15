@@ -3,6 +3,7 @@ site: access checks, ensure-semantics for branch, file and pull request, preview
 production verification, reconciliation after lost answers, merge behavior, deployment
 failures, protected previews, ownership, error mapping and secret redaction. No network."""
 
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import date
@@ -228,7 +229,8 @@ async def test_a_draft_is_a_pull_request_with_a_verified_preview(rig: Rig) -> No
     assert adapter.owns(post, MARKER)
     assert not adapter.owns(post, OTHER)
     assert adapter.verify(post, payload, status=TargetStatus.DRAFT, marker=MARKER)[0] == []
-    assert [m[1] for m in rig.gh.mutations] == [f"/repos/{REPO}/git/refs", f"/repos/{REPO}/contents/{CONTENT_DIR}/ai-receptionist-costs-2026.mdx", f"/repos/{REPO}/pulls"]  # fmt: skip
+    # The branch, then the post in one commit (blob, tree, commit, branch moved), then the PR.
+    assert [m[1] for m in rig.gh.mutations] == [f"/repos/{REPO}/git/refs", f"/repos/{REPO}/git/blobs", f"/repos/{REPO}/git/trees", f"/repos/{REPO}/git/commits", f"/repos/{REPO}/git/refs/heads/blog/ai-receptionist-costs-2026", f"/repos/{REPO}/pulls"]  # fmt: skip
     [pr] = rig.gh.open_pulls()
     assert (pr.head, pr.base, pr.title) == ("blog/ai-receptionist-costs-2026", BASE, "Add blog post: AI Receptionist Costs: What Clinics Pay in 2026")  # fmt: skip
     assert rig.gh.file("ai-receptionist-costs-2026", branch=pr.head) == payload["content"]
@@ -247,7 +249,7 @@ async def test_creating_the_same_draft_again_changes_nothing(rig: Rig) -> None:
     assert len(rig.gh.pulls) == 1
 
 
-@pytest.mark.parametrize("lost", ["create_ref", "put_contents", "create_pull"])
+@pytest.mark.parametrize("lost", ["create_ref", "update_ref", "create_pull"])
 async def test_a_lost_answer_is_reconciled_without_a_duplicate(rig: Rig, lost: str) -> None:
     adapter = rig.adapter()
     payload = await payload_for(adapter, document())
@@ -437,13 +439,13 @@ async def test_a_retried_publish_finds_the_cover_and_asks_for_nothing(rig: Rig) 
     payload = await payload_for(adapter, document(cover=cover()))
     await adapter.create_post(payload)
     assert covers.asked == [(7, 21)]
-    commits = [c for c in rig.gh.mutations if c[1].endswith(COVER_PATH)]
+    commits = rig.gh.commits_touching(COVER_PATH)
     # A second run over the same version: the file is on the branch, so it is neither
     # fetched from the cover source again nor committed again.
     await adapter.create_post(payload)
     await adapter.update_post("pr:61", payload)
     assert covers.asked == [(7, 21)]
-    assert [c for c in rig.gh.mutations if c[1].endswith(COVER_PATH)] == commits
+    assert rig.gh.commits_touching(COVER_PATH) == commits
     assert rig.gh.image(COVER_PATH, branch="blog/ai-receptionist-costs-2026") == COVER_BYTES
 
 
@@ -754,7 +756,9 @@ async def test_a_pull_request_left_behind_by_newer_posts_is_brought_up_to_date(r
     assert rig.gh.file("whatsapp-reminders") is not None
     post = await adapter.update_post(waiting.external_id, await payload_for(adapter, document(), TargetStatus.PUBLISH))  # fmt: skip
     assert post.status is CMSPostStatus.PUBLISHED
-    assert any(c[0] == "PATCH" and c[1].endswith("/git/refs/heads/blog/ai-receptionist-costs-2026") for c in rig.gh.calls)  # reset to main  # fmt: skip
+    moves = [json.loads(r.content) for r in rig.gh.requests if r.method == "PATCH" and r.url.path.endswith("/git/refs/heads/blog/ai-receptionist-costs-2026")]  # fmt: skip
+    assert moves[-1]["force"] is True  # rebuilt on main: one new commit on top of it
+    assert rig.gh.pulls[61].merged_at  # the same pull request, merged: it never went empty
     assert not any(
         c[1].endswith("/update-branch") for c in rig.gh.calls
     )  # Vercel builds no preview for that
@@ -765,4 +769,16 @@ async def test_a_pull_request_left_behind_by_newer_posts_is_brought_up_to_date(r
 async def test_a_pull_request_that_is_up_to_date_is_not_touched(rig: Rig) -> None:
     adapter = rig.adapter()
     await adapter.create_post(await payload_for(adapter, document(), TargetStatus.PUBLISH))
-    assert not any(c[0] == "PATCH" for c in rig.gh.calls)  # nothing to reset
+    moves = [json.loads(r.content) for r in rig.gh.requests if r.method == "PATCH"]
+    assert moves
+    assert not any(m.get("force") for m in moves)  # on its own history, never forced
+
+
+async def test_a_post_and_its_cover_reach_the_branch_in_one_commit(rig: Rig) -> None:
+    """Vercel cancels some of the builds of commits pushed together: if it cancels the last,
+    the branch's head never gets a preview. A post is therefore always one commit."""
+    adapter = pair_adapter(rig, covers=Covers())
+    await adapter.create_post(await payload_for(adapter, clinic_document(cover=cover()), TargetStatus.PUBLISH))  # fmt: skip
+    [(_, files)] = [c for c in rig.gh.committed if c[0].startswith("blog/")]
+    assert sorted(files) == sorted([f"{CONTENT_DIR}/{PAIR_SLUG}.json", f"{CONTENT_DIR}/{PAIR_SLUG}.mdx", f"public/images/blog/{PAIR_SLUG}.png"])  # fmt: skip
+    assert not any(c[1].startswith(f"/repos/{REPO}/contents/") for c in rig.gh.mutations)

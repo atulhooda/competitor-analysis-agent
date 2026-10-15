@@ -96,6 +96,17 @@ class FakeGitHub:
     next_deployment: int = 900
     commits: int = 0
     polls: dict[int, int] = field(default_factory=dict)
+    # Git data objects made through the API: blobs (bytes), trees (a snapshot: texts, binary
+    # files) and commits (tree id, parent).
+    git_blobs: dict[str, bytes] = field(default_factory=dict)
+    git_trees: dict[str, tuple[dict[str, str], dict[str, bytes]]] = field(default_factory=dict)
+    git_commits: dict[str, tuple[str, str]] = field(default_factory=dict)
+    git_tree_paths: dict[str, tuple[str, ...]] = field(
+        default_factory=dict
+    )  # files each tree wrote
+    committed: list[tuple[str, tuple[str, ...]]] = field(
+        default_factory=list
+    )  # (branch, files) per commit
 
     def __post_init__(self) -> None:
         self.trees.setdefault(BASE, {})
@@ -114,6 +125,10 @@ class FakeGitHub:
     @property
     def mutations(self) -> list[tuple[str, str]]:
         return [c for c in self.calls if c[0] in ("POST", "PUT", "PATCH", "DELETE")]
+
+    def commits_touching(self, path: str) -> list[tuple[str, tuple[str, ...]]]:
+        """The commits (branch, files) that wrote ``path``."""
+        return [c for c in self.committed if path in c[1]]
 
     def open_pulls(self) -> list[FakePullRequest]:
         return [p for p in self.pulls.values() if p.state == "open"]
@@ -139,6 +154,10 @@ class FakeGitHub:
             ("GET", rf"^{r}/git/ref/heads/(?P<branch>.+)$", self._get_ref),
             ("POST", rf"^{r}/git/refs$", self._create_ref),
             ("PATCH", rf"^{r}/git/refs/heads/(?P<branch>.+)$", self._update_ref),
+            ("GET", rf"^{r}/git/commits/(?P<sha>[^/]+)$", self._get_commit),
+            ("POST", rf"^{r}/git/blobs$", self._create_blob),
+            ("POST", rf"^{r}/git/trees$", self._create_tree),
+            ("POST", rf"^{r}/git/commits$", self._create_commit),
             ("GET", rf"^{r}/compare/(?P<spec>.+)$", self._compare),
             ("GET", rf"^{r}/contents/(?P<path>.+)$", self._get_contents),
             ("PUT", rf"^{r}/contents/(?P<path>.+)$", self._put_contents),
@@ -401,7 +420,7 @@ class FakeGitHub:
     def _update_ref(self, request: httpx.Request, branch: str) -> httpx.Response:
         """Moving a branch, as `git push --force` does: the tree comes with it."""
         failure = self._injected("update_ref")
-        if failure is not None:
+        if failure is not None and failure != "lost":
             return self._failure(failure, request)
         if branch not in self.trees:
             return _error(404, "Not Found")
@@ -409,6 +428,20 @@ class FakeGitHub:
             return _error(403, "Resource not accessible by personal access token")
         body = json.loads(request.content)
         sha = str(body["sha"])
+        if sha in self.git_commits:  # a commit made through the git data API
+            tree, parent = self.git_commits[sha]
+            if parent != self.branch_heads[branch] and not body.get("force"):
+                return _error(422, "Update is not a fast forward")
+            texts, binaries = self.git_trees[tree]
+            self.trees[branch], self.blobs[branch] = dict(texts), dict(binaries)
+            if parent == self.branch_heads[BASE]:
+                self.branch_bases[branch] = parent
+            self.branch_heads[branch] = sha
+            self.committed.append((branch, self.git_tree_paths.get(tree, ())))
+            self._new_deployment(branch)
+            if failure == "lost":
+                raise httpx.ReadTimeout("timed out after the branch moved (fake)", request=request)
+            return httpx.Response(200, json={"ref": f"refs/heads/{branch}", "object": {"sha": sha}})
         source = next((b for b, head in self.branch_heads.items() if head == sha), None)
         if source is None:
             return _error(422, "Object does not exist")
@@ -418,6 +451,48 @@ class FakeGitHub:
         self.branch_bases[branch] = self.branch_heads[BASE]
         self.mutations.append(("PATCH", f"git/refs/heads/{branch}"))
         return httpx.Response(200, json={"ref": f"refs/heads/{branch}", "object": {"sha": sha}})
+
+    def _snapshot(self, sha: str) -> tuple[dict[str, str], dict[str, bytes]] | None:
+        if sha in self.git_commits:
+            return self.git_trees[self.git_commits[sha][0]]
+        branch = next((b for b, head in self.branch_heads.items() if head == sha), None)
+        return (dict(self.trees[branch]), dict(self.blobs.get(branch, {}))) if branch else None
+
+    def _get_commit(self, request: httpx.Request, sha: str) -> httpx.Response:
+        if self._snapshot(sha) is None:
+            return _error(404, "No commit found for SHA")
+        return httpx.Response(200, json={"sha": sha, "tree": {"sha": f"tree@{sha}"}})
+
+    def _create_blob(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        data = base64.b64decode(body["content"]) if body.get("encoding") == "base64" else str(body["content"]).encode()  # fmt: skip
+        sha = _content_sha(data)
+        self.git_blobs[sha] = data
+        return httpx.Response(201, json={"sha": sha})
+
+    def _create_tree(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        base = self._snapshot(str(body["base_tree"]).removeprefix("tree@")) if str(body.get("base_tree", "")).startswith("tree@") else self.git_trees.get(str(body.get("base_tree")))  # fmt: skip
+        if base is None:
+            return _error(422, "base_tree not found")
+        texts, binaries = dict(base[0]), dict(base[1])
+        for entry in body["tree"]:
+            data = self.git_blobs[entry["sha"]]
+            if entry["path"].lower().endswith(IMAGE_SUFFIXES):
+                binaries[entry["path"]] = data
+            else:
+                texts[entry["path"]] = data.decode()
+        sha = f"t{len(self.git_trees) + 1:039d}"
+        self.git_trees[sha] = (texts, binaries)
+        self.git_tree_paths[sha] = tuple(entry["path"] for entry in body["tree"])
+        return httpx.Response(201, json={"sha": sha})
+
+    def _create_commit(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        self.commits += 1
+        sha = self._sha(f"commit{self.commits}{body['message']}")
+        self.git_commits[sha] = (str(body["tree"]), str(body["parents"][0]))
+        return httpx.Response(201, json={"sha": sha})
 
     # ── deployments (what Vercel reports to GitHub) ──────────────────────────
 

@@ -504,14 +504,14 @@ async def test_the_cover_is_generated_once_and_reused_by_a_second_publish(git: G
     await git.approve()
     await git.publish(**COVERS)
     [row] = await covers_of(git)
-    commits = [c for c in git.gh.mutations if c[1].endswith(f"{cover_path(git)}")]
+    commits = git.gh.commits_touching(f"{cover_path(git)}")
     assert len(commits) == 1
     _, outcome = await git.publish(TargetStatus.PUBLISH, publish_allow_direct_publish=True, **COVERS)  # fmt: skip
     assert outcome.status is PublicationStatus.PUBLISHED, outcome.error
     assert len(git.world.fake.image_requests) == 1  # the image model was called exactly once
     assert [c.sha256 for c in await covers_of(git)] == [row.sha256]
     assert len(await cover_calls(git)) == 1
-    assert [c for c in git.gh.mutations if c[1].endswith(f"{cover_path(git)}")] == commits
+    assert git.gh.commits_touching(f"{cover_path(git)}") == commits
     assert git.gh.image(cover_path(git)) == COVER_PNG  # merged to main with the post
 
 
@@ -522,7 +522,7 @@ async def test_a_publish_retried_after_a_lost_answer_neither_regenerates_nor_dup
     assert outcome.run_status is RunStatus.SUCCEEDED, outcome.error
     assert await git.attempts(result.publication_id or 0) == [("create", "unknown"), ("reconcile", "succeeded")]  # fmt: skip
     [pr] = git.gh.pulls.values()
-    commits = [c for c in git.gh.mutations if c[1].endswith(f"{cover_path(git)}")]
+    commits = git.gh.commits_touching(f"{cover_path(git)}")
     assert len(commits) == 1
     assert git.gh.image(cover_path(git), branch=pr.head) == COVER_PNG
     assert len(git.world.fake.image_requests) == 1
@@ -740,7 +740,7 @@ async def test_a_publish_retried_after_a_lost_answer_neither_re_searches_nor_re_
     assert (git.pex.queries, git.pex.downloads) == (searches, downloads)
     assert len(downloads) == 1
     assert len(await covers_of(git)) == 1
-    assert len([c for c in git.gh.mutations if c[1].endswith(cover_path(git))]) == 1
+    assert len(git.gh.commits_touching(cover_path(git))) == 1
     assert git.gh.image(cover_path(git)) == PHOTO_PNG  # merged to main with the post
 
 

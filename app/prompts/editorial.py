@@ -90,7 +90,9 @@ class EditorialIdeasOut(BaseModel):
 
 
 def max_output_tokens(ideas: int) -> int:
-    return 1_000 + 900 * ideas
+    # The model's thinking counts against this too: at 900 per idea, answers for six ideas
+    # were cut off ("incomplete") and the top-up failed (Skin Essence, October 2026).
+    return 4_000 + 1_500 * ideas
 
 
 def _data(text: str) -> str:
