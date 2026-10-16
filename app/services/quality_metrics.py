@@ -101,13 +101,14 @@ def compute(
     min_words: int,
     labels: set[str],
     banned: Sequence[str] = (),
+    extra_problems: Sequence[str] = (),
 ) -> QualityMetrics:
     headings = seo.package.headings
     paragraphs = [b for s in content.sections for b in s.blocks if b.type is BlockType.PARAGRAPH]  # fmt: skip
     paragraph_words = [len(_WORD.findall(strip_markers(b.text or ""))) for b in paragraphs]
     words = sum(len(_WORD.findall(strip_markers(t))) for *_, t in text_blocks(content))
     sentences = sum(len([x for x in split_sentences(strip_markers(t)) if x.strip()]) for *_, t in text_blocks(content))  # fmt: skip
-    problems = structural_problems(content, min_words=min_words, labels=labels) + banned_phrase_problems(content, banned)  # fmt: skip
+    problems = structural_problems(content, min_words=min_words, labels=labels) + banned_phrase_problems(content, banned) + list(extra_problems)  # fmt: skip
     structure = {
         "has_title": bool(content.title.strip()),
         "h1_count": headings.h1_count,

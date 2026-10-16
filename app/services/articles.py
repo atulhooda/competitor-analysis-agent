@@ -33,6 +33,7 @@ from sqlalchemy import func, select, true
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from app.compliance import writer_rules
 from app.config import GEMINI, Settings
 from app.core.errors import AppError, PermanentError, TransientError
 from app.core.timeutils import utcnow
@@ -274,7 +275,12 @@ class ArticleService:
                 inputs = await article_brief.load_brief_inputs(session, opportunity_id)
             except article_brief.BriefInputError as exc:
                 raise ArticleConflictError(str(exc)) from exc
-        return article_brief.build_brief(inputs)
+        return article_brief.build_brief(inputs, content_rules=self._content_rules())
+
+    def _content_rules(self) -> list[str]:
+        """The clinic's compliance rules, for the writer (none without CLINIC_ID)."""
+        clinic = self._settings.clinic
+        return writer_rules(clinic, self._settings.compliance_terms) if clinic else []
 
     async def create(self, opportunity_id: int, *, trigger: RunTrigger, regenerate: bool = False) -> ArticleRequestResult:  # fmt: skip
         """A new article (brief stored, run queued) for an approved opportunity. Returns
@@ -320,7 +326,7 @@ class ArticleService:
                 inputs = await article_brief.load_brief_inputs(session, opportunity_id)
             except article_brief.BriefInputError as exc:
                 raise ArticleConflictError(str(exc)) from exc
-            brief = article_brief.build_brief(inputs)
+            brief = article_brief.build_brief(inputs, content_rules=self._content_rules())
             attempts = await session.scalar(select(func.count()).select_from(Article).where(Article.opportunity_id == opportunity_id))  # fmt: skip
             output = brief.model_dump(mode="json")
             article = Article(
@@ -480,7 +486,7 @@ class ArticleService:
             # The brief builder changed: rebuild the brief from the inputs the article is
             # pinned to (its assessment and company profile version).
             inputs = await article_brief.load_brief_inputs(session, article.opportunity_id, assessment_id=article.assessment_id, company_profile_id=article.company_profile_id)  # fmt: skip
-            brief = article_brief.build_brief(inputs)
+            brief = article_brief.build_brief(inputs, content_rules=self._content_rules())
             output = brief.model_dump(mode="json")
             now = self._now()
             session.add(ArticleStepRun(article_id=article_id, run_id=run_id, step=ArticleStep.BRIEF.value, status=StepStatus.SUCCEEDED.value, fingerprint=self._brief_fingerprint(article.assessment_id, article.company_profile_id), prompt_version=article_brief.BRIEF_VERSION, output=output, output_hash=_digest(output), started_at=now, finished_at=now))  # fmt: skip

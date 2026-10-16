@@ -103,8 +103,12 @@ class ApprovalService:
             raise ApprovalRefusedError(f"Article {article.id} has no validated recommended version")  # fmt: skip
         await invalidate_stale(session, article, now)
         live = await live_decision(session, article.id)
-        if live is not None and live.decision == decision.value and (live.method == method.value or method is ApprovalMethod.AUTO):  # fmt: skip
-            return live, False  # the same decision on the same version and report: no-op
+        name = (approver or "").strip()[:200] or _DEFAULT_APPROVER[channel]
+        same = live is not None and live.decision == decision.value and (method is ApprovalMethod.AUTO or (live.method == method.value and (not (approver or '').strip() or live.approver == name)))  # fmt: skip
+        if same and live is not None:
+            return live, False  # the same decision by the same person: no-op
+        # Someone else's approval (a clinic's doctor after the operator) is recorded too, with
+        # their name and the time: whose approval counts is the publisher's to check.
         if live is not None:
             live.invalidated_at = now
             await session.flush()  # free the one-live-decision slot first
@@ -115,7 +119,7 @@ class ApprovalService:
             decision=decision.value,
             method=method.value,
             channel=channel.value,
-            approver=(approver or "").strip()[:200] or _DEFAULT_APPROVER[channel],
+            approver=name,
             note=note.strip()[:2_000] if note and note.strip() else None,
             created_at=now,
         )

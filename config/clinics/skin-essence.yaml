@@ -1,0 +1,53 @@
+# Skin Essence: the compliance configuration its blog posts are checked against (see
+# app/compliance). Facts only from the clinic's verified site content; anything unconfirmed
+# stays out. Approvers: the only people whose approval can publish a post.
+clinic:
+  clinic_id: skin-essence
+  name: Skin Essence
+  doctor:
+    name: Dr. Daksha Patel
+    qualification: MBBS, MD (Skin & VD)
+    council: Maharashtra Medical Council
+    # Not confirmed by the clinic yet. While it's missing, every post is BLOCKED (rule R12):
+    # add the real number here, never a placeholder.
+    registration_number:
+  approvers:
+  - Dr. Daksha Patel
+  # Treatments as the clinic lists them, by generic names (the site's "Botox" label is a
+  # Group A term: anti-wrinkle injections).
+  treatments:
+  - Acne scar treatment
+  - Acne treatment
+  - Anti-ageing treatment
+  - Anti-wrinkle injections
+  - Bridal skin care
+  - Chemical peels
+  - Dermal fillers
+  - Fat reduction
+  - Hair regrowth treatment
+  - Korean peel
+  - Laser hair reduction
+  - Laser toning
+  - Melasma treatment
+  - Mole and wart removal
+  - Paediatric dermatology
+  - Pigmentation treatment
+  - PRP and GFC hair treatment
+  - Mira peel
+  - Skin glow treatment
+  - Skin tightening treatment
+  services:
+  - Medical dermatology consultation
+  # Devices in use at the Pune clinic (published on its technology page).
+  devices:
+  - Coolite BOLT diode laser
+  - Hydra facial machine
+  - MiraPeel transdermal delivery system
+  - Qyros Q-switched Nd:YAG laser
+  areas:
+  - Kalyani Nagar
+  - Pune
+  ctas:
+  - Call the clinic
+  - WhatsApp the clinic
+  - Send an enquiry

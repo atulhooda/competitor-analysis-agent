@@ -458,3 +458,14 @@ def test_a_long_title_is_cut_to_fit_the_meta_title_with_its_suffix() -> None:
     assert not meta.removesuffix(" | Skin Essence Pune").endswith((" ", ":", ","))
     unspaced = compose_pair(document(title="Laser Hair Removal Guide", meta_title="Laser Hair Removal Guide", body_markdown="Intro.\n\n## One\n\nText.\n"), marker="0" * 32, config=SiteConfig(**{**config.__dict__, "meta_title_suffix": "| Skin Essence Pune"}), allowed_paths={"/"}, published_on=date(2026, 9, 16))  # fmt: skip
     assert unspaced.frontmatter["metaTitle"] == "Laser Hair Removal Guide | Skin Essence Pune"
+
+
+def test_a_clinic_post_carries_the_author_box_and_ends_with_the_consultation_note() -> None:
+    from app.compliance import CLOSING_NOTE
+
+    config = SiteConfig(site_url="https://clinic.example.in", content_dir="content/blog", branch_prefix="blog/", author_name="Clinic Editorial Team", author_role="", author_initials="CE", author_linkedin=None, cta_title="", cta_body="", cta_label="", cta_href="/", byline="", layout=JSON_PAIR, reviewed_by="Dr. Asha Rao, MBBS, Maharashtra Medical Council Reg. No. 2012/1234", closing_note=CLOSING_NOTE)  # fmt: skip
+    mdx = compose_pair(document(body_markdown="Intro.\n\n## One\n\nText.\n"), marker="0" * 32, config=config, allowed_paths={"/"}, published_on=date(2026, 10, 16))  # fmt: skip
+    assert mdx.frontmatter["reviewedBy"] == "Dr. Asha Rao, MBBS, Maharashtra Medical Council Reg. No. 2012/1234"  # fmt: skip
+    assert (mdx.body_text or "").rstrip().endswith(CLOSING_NOTE)
+    plain = compose_pair(document(body_markdown="Intro.\n\n## One\n\nText.\n"), marker="0" * 32, config=SiteConfig(**{**config.__dict__, "reviewed_by": None, "closing_note": None}), allowed_paths={"/"}, published_on=date(2026, 10, 16))  # fmt: skip
+    assert "reviewedBy" not in plain.frontmatter

@@ -194,6 +194,7 @@ class PreflightReport(BaseModel):
     publication_id: int | None = None
     external_id: str | None = None
     checks: list[PreflightCheck]
+    compliance: dict[str, Any] | None = Field(default=None, description="A clinic's compliance report (app/compliance): pass/fail per rule, every flagged term with its location and a rewrite")  # fmt: skip
 
     @property
     def blocking(self) -> list[PreflightCheck]:

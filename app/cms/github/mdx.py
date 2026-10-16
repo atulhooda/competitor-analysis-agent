@@ -128,6 +128,10 @@ class SiteConfig:
     meta_title_suffix: str = ""  # json_pair: " | Skin Essence Pune"
     # What the live post must carry to count as published.
     published_marker: str = "article:published_time"
+    # A clinic's compliance (app/compliance): the author box (doctor, qualification, council,
+    # registration number) and the note every post ends with. None: not a clinic.
+    reviewed_by: str | None = None
+    closing_note: str | None = None
 
     @property
     def site_host(self) -> str:
@@ -429,6 +433,8 @@ def compose_pair(document: RenderedDocument, *, marker: str, config: SiteConfig,
     meta_title = _fit(document.meta_title or title, META_TITLE_RANGE[1] - len(suffix)) + suffix
     description = _fit(document.excerpt, META_DESCRIPTION_RANGE[1])
     body, kept, dropped = filter_internal_links(document.body_markdown, config, allowed_paths)
+    if config.closing_note and not " ".join(body.split()).endswith(config.closing_note):
+        body = body.rstrip() + "\n\n" + config.closing_note
     suggested = [p for link in document.links if link.kind == "internal" and (p := site_path(link.url, config, allowed_paths))]  # fmt: skip
     related = pair_related([*kept, *suggested])
     body_text = body.strip() + "\n"
@@ -452,6 +458,7 @@ def compose_pair(document: RenderedDocument, *, marker: str, config: SiteConfig,
         "date": published_on.isoformat(),
         "excerpt": " ".join(document.excerpt.split()),
         "author": config.author_name,
+        **({"reviewedBy": config.reviewed_by} if config.reviewed_by else {}),
         "readingMinutes": reading_minutes(body_text),
         **({"heroImage": hero} if hero else {}),
         **related,

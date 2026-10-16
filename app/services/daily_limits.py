@@ -71,6 +71,13 @@ async def published_on(session: AsyncSession, day: date, settings: Settings, *, 
     return int(await session.scalar(query) or 0)
 
 
+async def drafted_on(session: AsyncSession, day: date, settings: Settings) -> int:
+    """Drafts created on ``day`` (pull requests opened for review, not public)."""
+    start, end = day_bounds(day, settings.scheduler_tz)
+    query = select(func.count(Publication.id)).where(Publication.status == PublicationStatus.DRAFT_CREATED.value, Publication.created_at >= start, Publication.created_at < end)  # fmt: skip
+    return int(await session.scalar(query) or 0)
+
+
 async def reserve_publication_slot(session: AsyncSession, publication: Publication, *, limit: int, settings: Settings, now: datetime) -> tuple[bool, int, date]:  # fmt: skip
     """Take one of today's publishing slots for ``publication``, atomically, inside the
     caller's transaction. Returns (reserved, used including this one if reserved, day)."""
@@ -150,4 +157,4 @@ async def daily_counts(session: AsyncSession, settings: Settings, now: datetime)
     )
 
 
-__all__ = ["daily_counts", "generated_on", "generation_limit", "paced_target", "published_on", "reserve_publication_slot", "written_by_on"]  # fmt: skip
+__all__ = ["daily_counts", "drafted_on", "generated_on", "generation_limit", "paced_target", "published_on", "reserve_publication_slot", "written_by_on"]  # fmt: skip

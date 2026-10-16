@@ -41,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from app.cms import LazyCMS
 from app.cms.base import CMSPost, CMSPublisher, TermResolution
 from app.cms.errors import CMSConfigurationError, CMSError, CMSTransientError, CMSValidationError
+from app.compliance import CLOSING_NOTE, ComplianceInput, ComplianceReport, check
 from app.config import Settings
 from app.core.errors import AppError
 from app.core.timeutils import utcnow
@@ -68,6 +69,7 @@ from app.domain.history import ACTIVE_RUN_STATUSES, RunStatus, RunTrigger
 from app.domain.opportunities import OpportunityEventKind, OpportunityStatus
 from app.domain.publishing import (
     IN_FLIGHT_PUBLICATION,
+    ApprovalMethod,
     AttemptAction,
     AttemptOutcome,
     CMSPostStatus,
@@ -203,6 +205,16 @@ class PublishingService:
 
     async def preflight(self, article_id: int, *, target: TargetStatus | str | None = None) -> PreflightReport:  # fmt: skip
         return (await self.dry_run(article_id, target=target)).preflight
+
+    async def compliance_report(self, article_id: int) -> ComplianceReport:
+        """The clinic's compliance report for an article's recommended version, as it would
+        be published (read-only: nothing is sent anywhere)."""
+        async with self._sessions() as session:
+            snap = await self._snapshot(session, article_id)
+        document = self._render(snap)
+        if document is None:
+            raise ValueError(f"article {article_id} has no validated version to check")
+        return self.compliance(document)
 
     async def dry_run(self, article_id: int, *, target: TargetStatus | str | None = None) -> DryRunReport:  # fmt: skip
         """Every check, the rendered article and the CMS request body, with no change made
@@ -347,6 +359,12 @@ class PublishingService:
                 publication.status, publication.last_error, publication.updated_at = _FINAL[target].value, None, self._now()  # fmt: skip
             return await self._finish(run_id, publication_id, RunStatus.SUCCEEDED, plan, None, action="none", warnings=plan.warnings)  # fmt: skip
         doc = await self._with_cover(document.model_copy(update={"slug": plan.slug or document.slug}), run_id, plan.warnings)  # fmt: skip
+        if self._settings.clinic is not None and doc.cover is not None:
+            covered = self.compliance(doc)  # the cover's alt text and file name are known now
+            if not covered.passed:
+                return await self._blocked(
+                    run_id, publication_id, plan, f"compliance: {covered.summary()}"
+                )
         try:  # the last checks (and the daily slot) come before any change to the CMS
             await self._begin_submit(publication_id, article_id, target, limit)
         except _LimitReached as exc:
@@ -713,6 +731,16 @@ class PublishingService:
             add("approval", True, f"approval #{snap.live.id} by {snap.live.approver} ({snap.live.method}) for version {snap.live.version_id} and report #{snap.live.quality_report_id}")  # fmt: skip
         else:
             add("approval", False, problem or "no approval")
+        clinic = s.clinic
+        compliance: ComplianceReport | None = None
+        if clinic is not None:
+            if target is TargetStatus.PUBLISH:  # R2: only the clinic's doctor can make it public
+                live = snap.live
+                by_doctor = live is not None and problem is None and live.method == ApprovalMethod.MANUAL.value and clinic.approves(live.approver)  # fmt: skip
+                add("doctor_approval", by_doctor, f"approved by {live.approver} on {live.created_at:%Y-%m-%d %H:%M} UTC" if by_doctor and live else f"a {clinic.name} post is made public only with the recorded approval of {' or '.join(clinic.allowed_approvers)}: `articles approve {article.id} --approver \"{clinic.allowed_approvers[0]}\"`")  # fmt: skip
+            if doc is not None:  # R3: any failure blocks the pull request
+                compliance = self.compliance(doc)
+                add("compliance", compliance.passed, compliance.summary())
         if snap.content is None or doc is None:
             add("content", False, "no content to publish")
         else:
@@ -731,7 +759,7 @@ class PublishingService:
             add("target_status", True, f"leaves the post as {target.value}" + (" (a verified draft first)" if target is TargetStatus.PUBLISH and s.publish_draft_first else ""))  # fmt: skip
         add("cms_config", self._cms.configured, f"{self._cms.name} at {self._cms.site}" if self._cms.configured else self._cms.configuration_hint)  # fmt: skip
         pub = snap.publication
-        plan = _Plan(report=self._report(snap, checks, target, "create"))
+        plan = _Plan(report=self._report(snap, checks, target, "create", compliance=compliance))
         if pub is not None and pub.status in IN_FLIGHT_PUBLICATION and pub.run_id not in (None, run_id):  # fmt: skip
             async with self._sessions() as session:
                 other = await session.get(Run, pub.run_id)
@@ -742,16 +770,16 @@ class PublishingService:
         if publisher is None or doc is None:
             if publisher is None:
                 add("cms", False, "not checked: the CMS isn't configured")
-            plan.report = self._report(snap, checks, target, "create")
+            plan.report = self._report(snap, checks, target, "create", compliance=compliance)
             return plan
         try:
             await self._cms_checks(snap, doc, target, publisher, plan, add)
         except CMSError as exc:  # the CMS couldn't be read: nothing is changed
             add("cms", False, f"the CMS couldn't be checked: {exc}")
             plan.transient = isinstance(exc, CMSTransientError)
-            plan.report = self._report(snap, checks, target, "create")
+            plan.report = self._report(snap, checks, target, "create", compliance=compliance)
             return plan
-        plan.report = self._report(snap, checks, target, plan.action, external_id=plan.post.external_id if plan.post else None)  # fmt: skip
+        plan.report = self._report(snap, checks, target, plan.action, compliance=compliance, external_id=plan.post.external_id if plan.post else None)  # fmt: skip
         return plan
 
     async def _cms_checks(self, snap: _Snapshot, doc: RenderedDocument, target: TargetStatus, publisher: CMSPublisher, plan: _Plan, add: Callable[..., None]) -> None:  # fmt: skip
@@ -816,7 +844,7 @@ class PublishingService:
         add("idempotency", True, {"none": f"publication #{pub.id if pub else '?'} already shows this version as {target.value}: nothing to change", "create": "no post yet: one will be created", "update": f"post {post.external_id if post else '?'} will be updated (never duplicated)", "publish": f"post {post.external_id if post else '?'} will be updated and made public"}[action])  # fmt: skip
         plan.terms, plan.post, plan.slug, plan.action = terms, post, slug, action
 
-    def _report(self, snap: _Snapshot, checks: list[PreflightCheck], target: TargetStatus, action: str, *, external_id: str | None = None) -> PreflightReport:  # fmt: skip
+    def _report(self, snap: _Snapshot, checks: list[PreflightCheck], target: TargetStatus, action: str, *, external_id: str | None = None, compliance: ComplianceReport | None = None) -> PreflightReport:  # fmt: skip
         return PreflightReport(
             article_id=snap.article.id,
             ready=all(c.passed for c in checks if c.blocking),
@@ -830,7 +858,40 @@ class PublishingService:
             publication_id=snap.publication.id if snap.publication else None,
             external_id=external_id,
             checks=list(checks),
+            compliance=compliance.model_dump(mode="json") if compliance else None,
         )
+
+    def compliance(self, doc: RenderedDocument) -> ComplianceReport:
+        """The clinic's compliance report for a post as it would be published: everything a
+        reader, an ad reviewer or a crawler sees (title, slug and URL, meta and social tags,
+        FAQ, tags, image alt text and file name, links, citations, the author box and the
+        closing note the site's layout adds)."""
+        clinic = self._settings.clinic
+        if clinic is None:
+            raise ValueError("no CLINIC_ID: there are no clinic rules")
+        fields = [("the title", doc.title), ("the slug", doc.slug), ("the meta title (also the Open Graph and Twitter title)", doc.meta_title), ("the meta description (also the Open Graph, Twitter and JSON-LD description)", doc.excerpt)]  # fmt: skip
+        fields += [(f"FAQ '{f.question[:40]}'", f"{f.question} {f.answer}") for f in doc.faq]
+        fields += [(f"tag '{t}'", t) for t in doc.tags]
+        urls = [("the post URL", f"/blog/{doc.slug}")]
+        urls += [(f"link '{link.anchor_text[:40]}'", link.url) for link in doc.links]
+        urls += [
+            (f"citation '{(src.title or src.url)[:40]}'", src.url) for src in doc.sources if src.url
+        ]
+        if doc.image is not None:
+            fields.append(("the image alt text", doc.image.alt_text))
+        if doc.cover is not None:
+            fields.append(("the cover image alt text", doc.cover.alt))
+            urls.append(("the cover image file name", doc.cover.filename))
+        body = (
+            doc.body_markdown.rstrip() + "\n\n" + CLOSING_NOTE
+        )  # the composer ends every post with it
+        ctas = (
+            [self._settings.publish_cta_label]
+            if self._settings.publish_layout != "json_pair"
+            else []
+        )
+        post = ComplianceInput(fields=fields, body=body, urls=urls, author_box=clinic.doctor.author_box, ctas=ctas)  # fmt: skip
+        return check(post, clinic, self._settings.compliance_terms)
 
 
 class _VerificationError(CMSError):

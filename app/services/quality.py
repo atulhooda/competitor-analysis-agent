@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from app.compliance import content_problems
 from app.config import Settings
 from app.core.errors import AppError
 from app.core.timeutils import utcnow
@@ -94,7 +95,7 @@ from app.prompts import quality_judge, revision
 from app.prompts import seo as seo_prompt
 from app.services.approval_rules import invalidate_stale
 from app.services.article_brief import domain_of
-from app.services.article_content import citations, word_count
+from app.services.article_content import citations, to_markdown, word_count
 from app.services.article_writing import ContentRejectedError, WritingConfig
 from app.services.articles import (
     ArticleBudgetExhaustedError,
@@ -425,6 +426,10 @@ class QualityService:
             load=SEOReport.model_validate,
         )
         labels = set(ctx.source_ids)
+        # A clinic's compliance rules (app/compliance): what the text breaks fails the
+        # content_valid gate, and the revision is asked to fix it.
+        clinic = self._settings.clinic
+        flagged = content_problems(content.title, [s.heading or "" for s in content.sections if s.heading], to_markdown(content), clinic, self._settings.compliance_terms) if clinic else []  # fmt: skip
         metrics, metrics_id, metrics_hash = await run(
             ArticleStep.METRICS,
             digest(
@@ -442,6 +447,7 @@ class QualityService:
                         if self._settings.banned_phrases
                         else {}
                     ),
+                    **({"compliance": flagged} if clinic else {}),
                 }
             ),
             prompt_version=None,
@@ -455,6 +461,7 @@ class QualityService:
                     min_words=self._settings.article_min_words,
                     labels=labels,
                     banned=self._settings.banned_phrases,
+                    extra_problems=flagged,
                 )
             ),
             load=QualityMetrics.model_validate,

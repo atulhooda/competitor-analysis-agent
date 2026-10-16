@@ -103,7 +103,7 @@ def _gap_type(gap: dict[str, Any]) -> GapType | None:
         return None
 
 
-def build_brief(inputs: BriefInputs) -> ArticleBrief:
+def build_brief(inputs: BriefInputs, *, content_rules: Sequence[str] = ()) -> ArticleBrief:
     """The brief for ``inputs``: identical inputs give an identical brief."""
     interp = inputs.interpretation or {}
     suggestion = inputs.suggestion
@@ -191,6 +191,7 @@ def build_brief(inputs: BriefInputs) -> ArticleBrief:
     ]
     if company.excluded_topics:
         avoid.append(f"Excluded topics: {', '.join(company.excluded_topics)}.")
+    avoid += list(content_rules)  # a clinic's compliance rules (app/compliance)
     return ArticleBrief(
         builder_version=BRIEF_VERSION,
         opportunity_id=inputs.opportunity_id,

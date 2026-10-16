@@ -18,6 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.cms import LazyCMS
 from app.cms.errors import CMSConfigurationError
+from app.compliance import ComplianceReport, load_clinic
+from app.compliance import check as compliance_check
+from app.compliance.site import from_site_post
 from app.config import get_settings, load_company_profile, load_competitors, load_topic_seeds
 from app.core.errors import ConfigurationError
 from app.core.logging import configure_logging
@@ -122,6 +125,7 @@ competitors_cli = typer.Typer(help="Manage monitored competitors (stored in the 
 topics_cli = typer.Typer(help="The topic taxonomy: list, inspect, seed, merge, consolidate.")
 company_cli = typer.Typer(no_args_is_help=True, help="Your company profile (what opportunities are scored against).")  # fmt: skip
 opportunities_cli = typer.Typer(help="Content opportunities: generate, rank, inspect, decide.")
+compliance_cli = typer.Typer(no_args_is_help=True, help="Clinic content rules: Google Ads drug terms and NMC medical advertising (CLINIC_ID).")  # fmt: skip
 editorial_cli = typer.Typer(help="Editorial topics: article ideas from your company profile alone (no competitor content).")  # fmt: skip
 articles_cli = typer.Typer(
     help="Article drafts from approved opportunities. Drafts only: nothing is published."
@@ -133,6 +137,7 @@ cli.add_typer(company_cli, name="company")
 cli.add_typer(opportunities_cli, name="opportunities")
 cli.add_typer(editorial_cli, name="editorial")
 cli.add_typer(articles_cli, name="articles")
+cli.add_typer(compliance_cli, name="compliance")
 console = Console()
 err = Console(stderr=True)
 
@@ -2259,6 +2264,89 @@ def article_approvals_cmd(article_id: int, json_output: bool = typer.Option(Fals
     for r in rows:
         table.add_row(str(r.id), r.decision.value, str(r.version_id), f"#{r.quality_report_id}", f"{r.method.value} ({r.channel.value})", escape(r.approver), f"{r.created_at:%Y-%m-%d %H:%M}", "yes" if r.live else "", escape((r.invalidated_reason or r.note or "")[:70]))  # fmt: skip
     console.print(table if rows else f"No decisions yet: `articles approve {article_id}`.")
+
+
+def _print_compliance(report: ComplianceReport) -> None:
+    """Rule 17: pass/fail per rule, every flagged term with where it is, and the rewrite."""
+    verdict = "[green]PASS[/green]" if report.passed else "[red]BLOCKED[/red]"
+    console.print(f"compliance for clinic {report.clinic_id}: {verdict}")
+    for rule in report.rules:
+        mark = "[green]pass[/green]" if rule.passed else "[red]FAIL[/red]"
+        console.print(f"  {rule.rule:<4} {mark}  {escape(rule.title)}" + ("" if rule.passed and not rule.detail else f": {escape(rule.detail)}"))  # fmt: skip
+        for f in rule.findings:
+            console.print(
+                f"         '{escape(f.term)}' in {escape(f.location)}: {escape(f.excerpt)}"
+            )
+            console.print(f"           → {escape(f.suggestion)}")
+
+
+@articles_cli.command("compliance")
+def article_compliance_cmd(article_id: int, json_output: bool = typer.Option(False, "--json")) -> None:  # fmt: skip
+    """The clinic compliance report of an article as it would be published (read-only)."""
+    if get_settings().clinic is None:
+        err.print("[red]CLINIC_ID isn't set: there are no clinic rules to check[/red]")
+        raise typer.Exit(code=2)
+
+    async def work(engine: AsyncEngine, sessions: SessionFactory) -> ComplianceReport:
+        service, cms = _publishing(engine, sessions)
+        try:
+            return await service.compliance_report(article_id)
+        finally:
+            await cms.aclose()
+
+    errors: tuple[type[Exception], ...] = (*_publishing_errors(), ValueError)
+    try:
+        report = _run_db(work)
+    except errors as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    if json_output:
+        sys.stdout.write(report.model_dump_json(indent=2) + "\n")
+    else:
+        _print_compliance(report)
+    if not report.passed:
+        raise typer.Exit(code=1)
+
+
+@compliance_cli.command("check")
+def compliance_check_cmd(
+    posts: Annotated[
+        list[Path],
+        typer.Argument(help="Post files as stored by the site: <slug>.json (and <slug>.mdx)."),
+    ],
+    clinic: str | None = typer.Option(None, "--clinic", help="Clinic id (default: CLINIC_ID)."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Check posts already on a site (or written by hand) against a clinic's rules. No
+    database, no network."""
+    settings = get_settings()
+    clinic_id = clinic or settings.clinic_id
+    if not clinic_id:
+        err.print("[red]give --clinic or set CLINIC_ID[/red]")
+        raise typer.Exit(code=2)
+    try:
+        config, terms = load_clinic(settings.clinics_dir, clinic_id), settings.compliance_terms
+    except ConfigurationError as exc:
+        err.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    blocked = 0
+    reports = []
+    for path in posts:
+        fields = json.loads(path.read_text(encoding="utf-8"))
+        body_path = path.with_suffix(".mdx")
+        body = body_path.read_text(encoding="utf-8") if body_path.is_file() else ""
+        report = compliance_check(from_site_post(fields, body), config, terms)
+        blocked += not report.passed
+        reports.append((path, report))
+    if json_output:
+        sys.stdout.write(json.dumps({str(p): r.model_dump(mode="json") for p, r in reports}, indent=2) + "\n")  # fmt: skip
+    else:
+        for path, report in reports:
+            console.print(f"\n[bold]{escape(str(path))}[/bold]")
+            _print_compliance(report)
+        console.print(f"\n{len(reports) - blocked} of {len(reports)} post(s) pass")
+    if blocked:
+        raise typer.Exit(code=1)
 
 
 def _print_preflight(report: PreflightReport) -> None:

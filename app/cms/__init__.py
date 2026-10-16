@@ -30,6 +30,7 @@ from app.cms.github import GitHubClient, GitHubPublishingAdapter, SiteClient, Si
 from app.cms.github.mdx import compose
 from app.cms.github.publisher import DEFAULT_SITE_PATHS
 from app.cms.wordpress import WordPressClient, WordPressPublisher, wordpress_payload
+from app.compliance import CLOSING_NOTE
 from app.config import Settings
 from app.core.timeutils import utcnow
 from app.domain.publishing import RenderedDocument, TargetStatus
@@ -37,6 +38,7 @@ from app.domain.publishing import RenderedDocument, TargetStatus
 
 def site_config(settings: Settings) -> SiteConfig:
     """The site's content contract, from configuration (never model output)."""
+    clinic = settings.clinic
     return SiteConfig(
         site_url=settings.site_url or "",
         content_dir=settings.github_content_dir,
@@ -57,6 +59,8 @@ def site_config(settings: Settings) -> SiteConfig:
         layout=settings.publish_layout,
         meta_title_suffix=settings.publish_meta_title_suffix,
         published_marker=settings.publish_live_published_marker,
+        reviewed_by=clinic.doctor.author_box if clinic else None,
+        closing_note=CLOSING_NOTE if clinic else None,
     )
 
 
@@ -104,6 +108,7 @@ class LazyCMS:
         s = self._settings
         data = {
             "provider": s.cms_provider,
+            "clinic": [s.clinic.doctor.author_box, CLOSING_NOTE] if s.clinic else None,
             "author": [
                 s.publish_author_name,
                 s.publish_author_role,

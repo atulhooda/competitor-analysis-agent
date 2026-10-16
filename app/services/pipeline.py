@@ -88,6 +88,7 @@ from app.services.approval_rules import authorization_problem, readiness_problem
 from app.services.articles import ArticleService
 from app.services.daily_limits import (
     daily_counts,
+    drafted_on,
     generated_on,
     generation_limit,
     paced_target,
@@ -322,7 +323,10 @@ class PipelineService:
 
     def _publish_target(self) -> TargetStatus:
         """Public only with PUBLISH_ALLOW_DIRECT_PUBLISH; otherwise PUBLISH_DEFAULT_STATUS
-        (a draft by default)."""
+        (a draft by default). A clinic (CLINIC_ID) only ever gets drafts: a post goes public
+        when its doctor has approved it and someone publishes it (`articles publish`)."""
+        if self._settings.clinic is not None:
+            return TargetStatus.DRAFT
         if self._settings.publish_allow_direct_publish:
             return TargetStatus.PUBLISH
         return TargetStatus(self._settings.publish_default_status)
@@ -557,6 +561,8 @@ class PipelineService:
             if self._settings.publish_pacing:
                 async with self._sessions() as session:
                     published = await published_on(session, day, self._settings)
+                    if self._publish_target() is TargetStatus.DRAFT:  # drafts are the day's output
+                        published += await drafted_on(session, day, self._settings)
                     on_the_way = await self._on_the_way(session)
                 due = paced_target(self._now(), self._settings)
                 wanted = max(due - published - on_the_way, 0)

@@ -9,9 +9,12 @@ import ipaddress
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal, Self
+from typing import TYPE_CHECKING, Any, Literal, Self
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+if TYPE_CHECKING:
+    from app.compliance import ClinicConfig, Term
 
 import yaml
 from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
@@ -56,6 +59,16 @@ QUALITY_COMPONENTS = (
 
 _GITHUB_REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _BRANCH_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*/$")
+
+
+_CLINICS: dict[tuple[Path, str], Any] = {}
+
+
+def _clinic(directory: Path, clinic_id: str, load: Any) -> Any:
+    key = (directory, clinic_id)
+    if key not in _CLINICS:
+        _CLINICS[key] = load(directory, clinic_id)
+    return _CLINICS[key]
 
 
 class Settings(BaseSettings):
@@ -157,6 +170,14 @@ class Settings(BaseSettings):
 
     # ── Opportunities (Phase 4) ──────────────────────────────────────────────
     company_file: Path = Path("config/company.yaml")
+    # Clinic compliance (app/compliance): CLINIC_ID names config/clinics/<id>.yaml. Set, every
+    # post is checked against the Google Ads drug-term and NMC rules, any failure blocks its
+    # pull request, the pipeline only ever opens drafts, and publishing needs the clinic
+    # doctor's recorded approval. Empty: no clinic rules (a company blog).
+    clinic_id: str | None = None
+    clinics_dir: Path = Path("config/clinics")
+    # The Group A term list, shared with the website's own check (one source of truth).
+    compliance_terms_file: Path = Path("config/compliance/group-a-terms.txt")
     scoring_file: Path = Path("config/scoring.yaml")
 
     # ── Editorial topics: article ideas from your company profile alone ──────
@@ -474,6 +495,22 @@ class Settings(BaseSettings):
         if self.job_retry_base_seconds > self.job_retry_max_seconds:
             raise ValueError("JOB_RETRY_BASE_SECONDS must not exceed JOB_RETRY_MAX_SECONDS")
         return self
+
+    @property
+    def clinic(self) -> "ClinicConfig | None":
+        """The clinic's compliance configuration (CLINIC_ID), loaded once."""
+        if not self.clinic_id:
+            return None
+        from app.compliance import load_clinic
+
+        clinic: ClinicConfig = _clinic(self.clinics_dir, self.clinic_id, load_clinic)
+        return clinic
+
+    @property
+    def compliance_terms(self) -> "tuple[Term, ...]":
+        from app.compliance import load_terms
+
+        return load_terms(self.compliance_terms_file)
 
     @property
     def banned_phrases(self) -> tuple[str, ...]:

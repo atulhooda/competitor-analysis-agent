@@ -1,0 +1,76 @@
+# Group A: prescription drug names (brand and generic) that may never appear in a clinic's
+# post: title, slug, URL, meta and social tags, JSON-LD, headings, body, image alt text and
+# file names, captions, link text or outbound URLs (journal citations included).
+#
+# One term per line. After "=>", the class wording to use where safety needs it, always
+# followed by "Your dermatologist will advise whether this is suitable for you."
+# A "(...)" replacement means: leave it out, describe the treatment instead.
+#
+# Single source of truth: the website repository's own check reads this same file.
+
+# botulinum toxins
+Botox => (describe the anti-wrinkle injection treatment, not the product)
+botulinum => (describe the anti-wrinkle injection treatment, not the product)
+botulinum toxin => (describe the anti-wrinkle injection treatment, not the product)
+onabotulinumtoxinA => (describe the treatment, not the product)
+abobotulinumtoxinA => (describe the treatment, not the product)
+incobotulinumtoxinA => (describe the treatment, not the product)
+Dysport => (describe the treatment, not the product)
+Xeomin => (describe the treatment, not the product)
+Daxxify => (describe the treatment, not the product)
+Jeuveau => (describe the treatment, not the product)
+Kybella => (describe the treatment, not the product)
+deoxycholic acid => (describe the treatment, not the product)
+# acne
+isotretinoin => a prescription oral acne medicine
+Accutane => a prescription oral acne medicine
+Isotroin => a prescription oral acne medicine
+tretinoin => a prescription retinoid cream
+Retin-A => a prescription retinoid cream
+adapalene => a prescription retinoid cream
+Differin => a prescription retinoid cream
+tazarotene => a prescription retinoid cream
+doxycycline => a prescription antibiotic
+minocycline => a prescription antibiotic
+azithromycin => a prescription antibiotic
+clindamycin => a prescription antibiotic
+spironolactone => a prescription hormonal acne medicine
+# pigmentation
+hydroquinone => a skin-lightening cream prescribed by your dermatologist
+Kligman => a skin-lightening cream prescribed by your dermatologist
+tranexamic acid => a prescription medicine for pigmentation
+# hair
+minoxidil => a prescription hair-regrowth treatment
+Rogaine => a prescription hair-regrowth treatment
+finasteride => a prescription hair-loss medicine
+Propecia => a prescription hair-loss medicine
+dutasteride => a prescription hair-loss medicine
+# steroids
+triamcinolone => (describe the treatment, not the medicine)
+Kenacort => (describe the treatment, not the medicine)
+clobetasol => a prescription anti-inflammatory cream
+betamethasone => a prescription anti-inflammatory cream
+mometasone => a prescription anti-inflammatory cream
+hydrocortisone => a prescription anti-inflammatory cream
+steroid => a prescription anti-inflammatory medicine
+steroids => a prescription anti-inflammatory medicine
+corticosteroid => a prescription anti-inflammatory medicine
+corticosteroids => a prescription anti-inflammatory medicine
+# other prescription medicines
+methotrexate => a prescription medicine
+cyclosporine => a prescription medicine
+ivermectin => a prescription medicine
+permethrin => a prescription medicine
+terbinafine => a prescription antifungal medicine
+itraconazole => a prescription antifungal medicine
+fluconazole => a prescription antifungal medicine
+ketoconazole => a prescription antifungal medicine
+bimatoprost => (describe the treatment, not the medicine)
+Latisse => (describe the treatment, not the medicine)
+lidocaine => a numbing cream applied by the clinic
+EMLA => a numbing cream applied by the clinic
+# injectables
+glutathione injection => (describe the treatment, not the product)
+glutathione injections => (describe the treatment, not the product)
+poly-L-lactic acid => (describe the treatment, not the product)
+Sculptra => (describe the treatment, not the product)
