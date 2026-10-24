@@ -38,6 +38,7 @@ from app.cms.errors import (
     CMSTransientError,
     CMSValidationError,
 )
+from app.cms.github.app_auth import GitHubAppAuth
 
 log = structlog.get_logger(__name__)
 
@@ -52,8 +53,9 @@ class GitHubClient:
         self,
         api_url: str,
         repo: str,
-        token: SecretStr,
+        token: SecretStr | None,
         *,
+        app: GitHubAppAuth | None = None,
         timeout: float = 30.0,
         max_retries: int = 2,
         user_agent: str = "competitor-analysis-agent",
@@ -68,8 +70,15 @@ class GitHubClient:
         self._read_only = read_only
         self._sleep = sleep
         self._backoff = backoff
+        if token is None and app is None:
+            raise ValueError("a GitHub token or a GitHub App is needed")
+        self._app = app  # signed in as the app: every write is the app's, never a person's
         headers = {
-            "Authorization": f"Bearer {token.get_secret_value()}",
+            **(
+                {"Authorization": f"Bearer {token.get_secret_value()}"}
+                if token is not None and app is None
+                else {}
+            ),
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": API_VERSION,
             "User-Agent": user_agent,
@@ -103,6 +112,8 @@ class GitHubClient:
 
     async def aclose(self) -> None:
         await self._http.aclose()
+        if self._app is not None:
+            await self._app.aclose()
 
     async def _request(self, method: str, path: str, *, params: Mapping[str, Any] | None = None, json: Mapping[str, Any] | None = None, retry: bool) -> Any:  # fmt: skip
         path = path.lstrip("/")
@@ -113,7 +124,10 @@ class GitHubClient:
             started = time.monotonic()
             error: CMSError
             try:
-                response = await self._http.request(method, path, params=params, json=json)
+                auth = {"Authorization": f"Bearer {await self._app.token()}"} if self._app else None
+                response = await self._http.request(
+                    method, path, params=params, json=json, headers=auth
+                )
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
                 error = CMSNetworkError(f"{method} /{path}: couldn't connect to GitHub ({type(exc).__name__})")  # fmt: skip
             except httpx.TimeoutException as exc:

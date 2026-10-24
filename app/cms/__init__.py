@@ -27,6 +27,7 @@ from app.cms.base import (
 )
 from app.cms.errors import CMSConfigurationError, CMSError
 from app.cms.github import GitHubClient, GitHubPublishingAdapter, SiteClient, SiteConfig
+from app.cms.github.app_auth import GitHubAppAuth
 from app.cms.github.mdx import compose
 from app.cms.github.publisher import DEFAULT_SITE_PATHS
 from app.cms.wordpress import WordPressClient, WordPressPublisher, wordpress_payload
@@ -156,12 +157,14 @@ class LazyCMS:
         if not s.cms_configured:
             raise CMSConfigurationError(s.cms_hint)
         if s.cms_provider == "github":
-            if not (s.github_repo and s.github_token and s.site_url):
+            if not (s.github_repo and (s.github_token or s.github_app) and s.site_url):
                 raise CMSConfigurationError(s.cms_hint)
+            app = GitHubAppAuth(s.github_api_url, s.github_repo, str(s.github_app_id), s.github_app_private_key, transport=self._transport, timeout=s.cms_request_timeout, user_agent=s.crawler_user_agent) if s.github_app and s.github_app_private_key else None  # fmt: skip
             client = GitHubClient(
                 s.github_api_url,
                 s.github_repo,
-                s.github_token,
+                None if app else s.github_token,
+                app=app,
                 timeout=s.cms_request_timeout,
                 max_retries=s.cms_max_retries,
                 user_agent=s.crawler_user_agent,

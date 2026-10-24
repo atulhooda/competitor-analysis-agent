@@ -256,6 +256,11 @@ class Settings(BaseSettings):
     github_token: SecretStr | None = (
         None  # fine-grained: Contents + Pull requests (read/write), this repo only
     )
+    # Or sign in as a GitHub App (preferred): commits, pull requests and merges are then the
+    # app's ("<app>[bot]"), never on a person's profile. GITHUB_APP_ID and the app's private
+    # key (the whole .pem; literal \n is fine); the installation on GITHUB_REPO is found.
+    github_app_id: str | None = None
+    github_app_private_key: SecretStr | None = None
     github_base_branch: str = "main"
     github_content_dir: str = "src/content/blog"  # one <slug>.mdx per post
     # How a post is laid out in the repository. frontmatter: one <slug>.mdx with YAML
@@ -353,7 +358,7 @@ class Settings(BaseSettings):
     pipeline_approve_opportunities: bool = True
     pipeline_min_opportunity_score: float = Field(default=60.0, ge=0, le=100)
 
-    @field_validator("api_key", "gemini_api_key", "anthropic_api_key", "wordpress_application_password", "github_token", "vercel_protection_bypass_secret", "pexels_api_key", mode="before")  # fmt: skip
+    @field_validator("api_key", "gemini_api_key", "anthropic_api_key", "wordpress_application_password", "github_token", "github_app_private_key", "vercel_protection_bypass_secret", "pexels_api_key", mode="before")  # fmt: skip
     @classmethod
     def _blank_secret_is_unset(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
@@ -513,6 +518,11 @@ class Settings(BaseSettings):
         return load_terms(self.compliance_terms_file)
 
     @property
+    def github_app(self) -> bool:
+        """Signing in as a GitHub App (both the app id and its private key are set)."""
+        return bool(self.github_app_id and self.github_app_private_key)
+
+    @property
     def banned_phrases(self) -> tuple[str, ...]:
         """QUALITY_BANNED_PHRASES as a list: trimmed, blanks dropped, each once."""
         return tuple(dict.fromkeys(" ".join(p.split()) for p in self.quality_banned_phrases.split(",") if p.strip()))  # fmt: skip
@@ -527,7 +537,9 @@ class Settings(BaseSettings):
         shown): the repository, token and site for github; URL and credentials for
         wordpress."""
         if self.cms_provider == "github":
-            return bool(self.github_repo and self.github_token and self.site_url)
+            return bool(
+                self.github_repo and (self.github_token or self.github_app) and self.site_url
+            )
         return bool(self.wordpress_base_url and self.wordpress_username and self.wordpress_application_password)  # fmt: skip
 
     @property
@@ -549,7 +561,7 @@ class Settings(BaseSettings):
     def cms_hint(self) -> str:
         """What to set for publishing to work with the configured provider."""
         if self.cms_provider == "github":
-            return "GitHub publishing isn't configured: set GITHUB_REPO (owner/name), GITHUB_TOKEN (a fine-grained token with Contents and Pull requests read/write on that repository) and PUBLISH_SITE_URL"  # fmt: skip
+            return "GitHub publishing isn't configured: set GITHUB_REPO (owner/name), GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY (a GitHub App installed on that repository: its commits are the app's, not yours) or GITHUB_TOKEN (a fine-grained token with Contents and Pull requests read/write; its commits are its owner's), and PUBLISH_SITE_URL"  # fmt: skip
         return "WordPress isn't configured: set WORDPRESS_BASE_URL, WORDPRESS_USERNAME and WORDPRESS_APPLICATION_PASSWORD (an Application Password)"  # fmt: skip
 
     @property
