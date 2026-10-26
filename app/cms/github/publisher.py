@@ -82,6 +82,7 @@ DEFAULT_SITE_PATHS = frozenset({"/", "/blog", "/services", "/clinics", "/contact
 MINIMAL_SITE_PATHS = frozenset({"/", "/blog", "/contact"})
 MAX_LISTED_FILES = 200
 MAX_OPEN_PRS = 100
+REBUILD_NOTE = "(rebuild the preview)"  # marks the one retry commit of a version
 _TAGS = re.compile(r"<[^>]+>")
 _LOC = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>")
 _POST_LINK = re.compile(r'href="/blog/([a-z0-9][a-z0-9-]*)/?"')
@@ -557,11 +558,16 @@ class GitHubPublishingAdapter:
         head = await self._gh.get(f"repos/{self._repo}/git/commits/{parent}")
         tree = str(head["tree"]["sha"])
         if not changes:
-            if stale or not await self._preview_lost(parent, head):
+            # One retry per version: if Vercel ignores the rebuild too (a broken Git
+            # integration), committing again every hour would only pile commits on the branch.
+            already = REBUILD_NOTE in str(head.get("message") or "")
+            if stale or already or not await self._preview_lost(parent, head):
+                if already:
+                    log.warning("github.preview_still_missing", repo=self._repo, branch=branch, sha=parent[:7])  # fmt: skip
                 return
             # Nothing to change, but this version will never get a preview: the same files
             # again, as a new commit, for a new build.
-            commit = await self._gh.post(f"repos/{self._repo}/git/commits", {"message": f"{message} (rebuild the preview)", "tree": tree, "parents": [parent]})  # fmt: skip
+            commit = await self._gh.post(f"repos/{self._repo}/git/commits", {"message": f"{message} {REBUILD_NOTE}", "tree": tree, "parents": [parent]})  # fmt: skip
             await self._gh.patch(f"repos/{self._repo}/git/refs/heads/{branch}", {"sha": str(commit["sha"]), "force": False})  # fmt: skip
             log.info("github.preview_rebuild", repo=self._repo, branch=branch, was=parent[:7])
             return

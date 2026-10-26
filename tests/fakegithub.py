@@ -104,6 +104,7 @@ class FakeGitHub:
     git_tree_paths: dict[str, tuple[str, ...]] = field(
         default_factory=dict
     )  # files each tree wrote
+    git_messages: dict[str, str] = field(default_factory=dict)
     committed: list[tuple[str, tuple[str, ...]]] = field(
         default_factory=list
     )  # (branch, files) per commit
@@ -456,14 +457,26 @@ class FakeGitHub:
 
     def _snapshot(self, sha: str) -> tuple[dict[str, str], dict[str, bytes]] | None:
         if sha in self.git_commits:
-            return self.git_trees[self.git_commits[sha][0]]
+            tree = self.git_commits[sha][0]
+            return (
+                self._snapshot(tree.removeprefix("tree@"))
+                if tree.startswith("tree@")
+                else self.git_trees[tree]
+            )
         branch = next((b for b, head in self.branch_heads.items() if head == sha), None)
         return (dict(self.trees[branch]), dict(self.blobs.get(branch, {}))) if branch else None
 
     def _get_commit(self, request: httpx.Request, sha: str) -> httpx.Response:
         if self._snapshot(sha) is None:
             return _error(404, "No commit found for SHA")
-        return httpx.Response(200, json={"sha": sha, "tree": {"sha": f"tree@{sha}"}})
+        return httpx.Response(
+            200,
+            json={
+                "sha": sha,
+                "tree": {"sha": f"tree@{sha}"},
+                "message": self.git_messages.get(sha, ""),
+            },
+        )
 
     def _create_blob(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -494,6 +507,7 @@ class FakeGitHub:
         self.commits += 1
         sha = self._sha(f"commit{self.commits}{body['message']}")
         self.git_commits[sha] = (str(body["tree"]), str(body["parents"][0]))
+        self.git_messages[sha] = str(body.get("message") or "")
         return httpx.Response(201, json={"sha": sha})
 
     # ── deployments (what Vercel reports to GitHub) ──────────────────────────

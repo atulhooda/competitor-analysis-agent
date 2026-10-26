@@ -796,3 +796,19 @@ async def test_a_preview_vercel_canceled_is_built_again_on_the_next_run(rig: Rig
     assert post.status is CMSPostStatus.PUBLISHED
     assert len(rig.gh.committed) == 2  # the post, then the same files again for a new build
     assert rig.gh.committed[1][1] == ()
+
+
+async def test_a_preview_that_never_comes_is_retried_once_not_every_hour(rig: Rig) -> None:
+    """If Vercel ignores the rebuild too (its Git integration broken), the agent must not keep
+    adding a commit to the branch on every run."""
+    adapter = rig.adapter()
+    publish = await payload_for(adapter, document(), TargetStatus.PUBLISH)
+    rig.gh.preview_outcome = "canceled"
+    for _ in range(4):  # four hourly runs
+        with pytest.raises(CMSTimeoutError):
+            await (
+                adapter.create_post(publish)
+                if not rig.gh.pulls
+                else adapter.update_post("pr:61", publish)
+            )
+    assert len(rig.gh.committed) == 2  # the post, and a single rebuild
