@@ -26,6 +26,9 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY alembic.ini ./
 COPY migrations ./migrations
 COPY app ./app
+# Clinic compliance: each clinic's rules and the shared term list (no secrets in them).
+COPY config/clinics ./config/clinics
+COPY config/compliance ./config/compliance
 RUN uv sync --frozen --no-dev
 
 # Never run as root: this process talks to GitHub with a write token.
