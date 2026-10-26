@@ -359,6 +359,11 @@ class PublishingService:
                 publication.status, publication.last_error, publication.updated_at = _FINAL[target].value, None, self._now()  # fmt: skip
             return await self._finish(run_id, publication_id, RunStatus.SUCCEEDED, plan, None, action="none", warnings=plan.warnings)  # fmt: skip
         doc = await self._with_cover(document.model_copy(update={"slug": plan.slug or document.slug}), run_id, plan.warnings)  # fmt: skip
+        clinic = self._settings.clinic
+        live = snap.live
+        if clinic is not None and target is TargetStatus.PUBLISH and live is not None and live.method == ApprovalMethod.MANUAL.value and clinic.approves(live.approver):  # fmt: skip
+            local = live.created_at.astimezone(self._settings.scheduler_tz) if live.created_at.tzinfo else live.created_at  # fmt: skip
+            doc = doc.model_copy(update={"approved_by": live.approver, "approved_on": local.date().isoformat()})  # fmt: skip
         if self._settings.clinic is not None and doc.cover is not None:
             covered = self.compliance(doc)  # the cover's alt text and file name are known now
             if not covered.passed:
@@ -740,7 +745,10 @@ class PublishingService:
                 add("doctor_approval", by_doctor, f"approved by {live.approver} on {live.created_at:%Y-%m-%d %H:%M} UTC" if by_doctor and live else f"a {clinic.name} post is made public only with the recorded approval of {' or '.join(clinic.allowed_approvers)}: `articles approve {article.id} --approver \"{clinic.allowed_approvers[0]}\"`")  # fmt: skip
             if doc is not None:  # R3: any failure blocks the pull request
                 compliance = self.compliance(doc)
-                add("compliance", compliance.passed, compliance.summary())
+                # R12 blocks publishing: a draft for the doctor to review may open before the
+                # registration number is in config (a placeholder still blocks everything).
+                blocking = [r for r in compliance.failed if not (r.rule == "R12" and not r.findings and target is not TargetStatus.PUBLISH)]  # fmt: skip
+                add("compliance", not blocking, compliance.summary() if blocking else (compliance.summary() + ("" if compliance.passed else " (doesn't block a draft)")))  # fmt: skip
         if snap.content is None or doc is None:
             add("content", False, "no content to publish")
         else:

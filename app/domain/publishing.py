@@ -169,6 +169,10 @@ class RenderedDocument(BaseModel):
     content_hash: str
     unknown_citations: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    # A clinic's doctor approved this version for publication (name, date): written into the
+    # post where the site records it (json_pair: approvedBy/approvedOn, status published).
+    approved_by: str | None = None
+    approved_on: str | None = None
 
 
 # ── Preflight ────────────────────────────────────────────────────────────────

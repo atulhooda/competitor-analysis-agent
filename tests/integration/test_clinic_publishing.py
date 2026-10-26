@@ -22,13 +22,13 @@ clinic:
     qualification: MBBS, MD (Dermatology)
     council: Maharashtra Medical Council
     registration_number: {registration}
-  areas: []
+  areas: {areas}
 """
 
 
-def clinic_settings(directory: Path, *, registration: str = "'2012/03/1234'", **overrides: Any) -> dict[str, Any]:  # fmt: skip
-    (directory / "test-clinic.yaml").write_text(CLINIC.format(registration=registration), encoding="utf-8")  # fmt: skip
-    return {"clinic_id": "test-clinic", "clinics_dir": directory, "publish_auto_approve": True, "publish_allow_direct_publish": True, **overrides}  # fmt: skip
+def clinic_settings(directory: Path, *, registration: str = "'2012/03/1234'", areas: str = "[]", **overrides: Any) -> dict[str, Any]:  # fmt: skip
+    (directory / "test-clinic.yaml").write_text(CLINIC.format(registration=registration, areas=areas), encoding="utf-8")  # fmt: skip
+    return {"clinic_id": "test-clinic", "clinics_dir": directory, "publish_auto_approve": True, "publish_allow_direct_publish": True, "publish_cta_label": "Call the clinic", **overrides}  # fmt: skip
 
 
 def checks(report: Any) -> dict[str, tuple[bool, str]]:
@@ -43,12 +43,12 @@ async def test_every_draft_carries_the_compliance_report(pub: Pub, tmp_path: Pat
 
 
 async def test_a_compliance_failure_blocks_the_draft_before_the_cms_is_touched(pub: Pub, tmp_path: Path) -> None:  # fmt: skip
-    # No registration number: the author box can't be completed (R12).
-    settings = clinic_settings(tmp_path, registration="")
+    # The post never names the clinic's area (R16).
+    settings = clinic_settings(tmp_path, areas="[Kalyani Nagar]")
     report = await pub.service(**settings).preflight(pub.article_id, target=TargetStatus.DRAFT)
     passed, detail = checks(report)["compliance"]
     assert not passed
-    assert "R12" in detail
+    assert "R16" in detail
     assert not report.ready
     await pub.approve()
     _, outcome = await pub.publish(TargetStatus.DRAFT, **settings)
@@ -96,3 +96,16 @@ def test_the_pipeline_only_ever_opens_drafts_for_a_clinic(tmp_path: Path, clinic
     pipeline = PipelineService.__new__(PipelineService)
     pipeline._settings = settings
     assert pipeline._publish_target() is (TargetStatus.DRAFT if clinic else TargetStatus.PUBLISH)
+
+
+async def test_without_a_registration_number_a_draft_opens_but_nothing_goes_public(pub: Pub, tmp_path: Path) -> None:  # fmt: skip
+    settings = clinic_settings(tmp_path, registration="")
+    service = pub.service(**settings)
+    draft = checks(await service.preflight(pub.article_id, target=TargetStatus.DRAFT))["compliance"]
+    assert draft[0] is True, draft[1]
+    assert "doesn't block a draft" in draft[1]
+    public = checks(await service.preflight(pub.article_id, target=TargetStatus.PUBLISH))[
+        "compliance"
+    ]
+    assert public[0] is False
+    assert "R12" in public[1]

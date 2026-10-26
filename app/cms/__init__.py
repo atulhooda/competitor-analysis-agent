@@ -62,6 +62,7 @@ def site_config(settings: Settings) -> SiteConfig:
         published_marker=settings.publish_live_published_marker,
         reviewed_by=clinic.doctor.author_box if clinic else None,
         closing_note=CLOSING_NOTE if clinic else None,
+        approval_required=clinic is not None,
     )
 
 

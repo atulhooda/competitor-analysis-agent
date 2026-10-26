@@ -90,7 +90,7 @@ _MARKER = re.compile(r"^[0-9a-f]{32}$")
 
 FRONTMATTER, JSON_PAIR = "frontmatter", "json_pair"
 # json_pair: the site's field order, then the agent's own keys (its schema drops unknown keys).
-PAIR_ORDER = ("slug", "title", "metaTitle", "metaDescription", "date", "excerpt", "author", "reviewedBy", "readingMinutes", "heroImage", "relatedTreatments", "relatedConcerns", "agentPublication", "agentSource", "agentBody")  # fmt: skip
+PAIR_ORDER = ("slug", "title", "metaTitle", "metaDescription", "date", "excerpt", "author", "reviewedBy", "status", "approvedBy", "approvedOn", "readingMinutes", "heroImage", "relatedTreatments", "relatedConcerns", "agentPublication", "agentSource", "agentBody")  # fmt: skip
 # Internal links to these sections become the post's related cards (field → path prefix).
 PAIR_RELATED = (("relatedTreatments", "/treatments/"), ("relatedConcerns", "/concerns/"))
 MAX_RELATED = 3
@@ -132,6 +132,9 @@ class SiteConfig:
     # registration number) and the note every post ends with. None: not a clinic.
     reviewed_by: str | None = None
     closing_note: str | None = None
+    # The site keeps unapproved posts as drafts (json_pair "status"): a post is "published"
+    # only with the doctor's approval (approvedBy/approvedOn), "draft" otherwise.
+    approval_required: bool = False
 
     @property
     def site_host(self) -> str:
@@ -459,6 +462,19 @@ def compose_pair(document: RenderedDocument, *, marker: str, config: SiteConfig,
         "excerpt": " ".join(document.excerpt.split()),
         "author": config.author_name,
         **({"reviewedBy": config.reviewed_by} if config.reviewed_by else {}),
+        **(
+            (
+                {
+                    "status": "published",
+                    "approvedBy": document.approved_by,
+                    "approvedOn": document.approved_on,
+                }
+                if document.approved_by and document.approved_on
+                else {"status": "draft"}
+            )
+            if config.approval_required
+            else {}
+        ),
         "readingMinutes": reading_minutes(body_text),
         **({"heroImage": hero} if hero else {}),
         **related,
@@ -520,6 +536,10 @@ def validate_pair(text: str, body: str, *, marker: str) -> list[str]:
         value = fields.get(name, [])
         if not isinstance(value, list) or not all(isinstance(s, str) and _PAIR_SLUG.match(s) for s in value):  # fmt: skip
             problems.append(f"json: {name} must be a list of slugs")
+    if fields.get("status") == "published" and not (fields.get("approvedBy") and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(fields.get("approvedOn") or ""))):  # fmt: skip
+        problems.append(
+            "json: a published post needs approvedBy and approvedOn (the doctor's approval)"
+        )
     if fields.get("agentPublication") != marker:
         problems.append("json: agentPublication must be this publication's marker")
     if fields.get("agentBody") != body_digest(body):

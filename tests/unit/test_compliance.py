@@ -223,3 +223,10 @@ def test_a_post_as_the_site_stores_it_is_checked_the_same_way() -> None:
     r4 = next(r for r in report.rules if r.rule == "R4")
     assert {f.location for f in r4.findings} >= {"the title", "the slug", "the post URL", "the hero image file name"}  # fmt: skip
     assert "R12" in failing(report)  # no reviewedBy author box
+
+
+def test_the_websites_procedure_terms_are_blocked_too() -> None:
+    terms = load_terms(REPO_TERMS)
+    for text in ("Dermal fillers for smile lines.", "A liposuction alternative.", "Skin boosters explained.", "Mesotherapy for hair.", "An injection-free option."):  # fmt: skip
+        assert "R4" in failing(check(post(text + "\n\n" + GOOD_BODY), clinic(), terms)), text
+    assert "R4" not in failing(check(post("Your skin's lipid barrier matters.\n\n" + GOOD_BODY), clinic(), terms))  # fmt: skip

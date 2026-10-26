@@ -469,3 +469,18 @@ def test_a_clinic_post_carries_the_author_box_and_ends_with_the_consultation_not
     assert (mdx.body_text or "").rstrip().endswith(CLOSING_NOTE)
     plain = compose_pair(document(body_markdown="Intro.\n\n## One\n\nText.\n"), marker="0" * 32, config=SiteConfig(**{**config.__dict__, "reviewed_by": None, "closing_note": None}), allowed_paths={"/"}, published_on=date(2026, 10, 16))  # fmt: skip
     assert "reviewedBy" not in plain.frontmatter
+
+
+def test_a_clinic_post_is_a_draft_until_the_doctor_approves_it() -> None:
+    from app.compliance import CLOSING_NOTE
+
+    config = SiteConfig(site_url="https://clinic.example.in", content_dir="content/blog", branch_prefix="blog/", author_name="Clinic Editorial Team", author_role="", author_initials="CE", author_linkedin=None, cta_title="", cta_body="", cta_label="", cta_href="/", byline="", layout=JSON_PAIR, closing_note=CLOSING_NOTE, approval_required=True)  # fmt: skip
+    body = "Intro.\n\n## One\n\nText.\n"
+    draft = compose_pair(document(body_markdown=body), marker="0" * 32, config=config, allowed_paths={"/"}, published_on=date(2026, 10, 26))  # fmt: skip
+    assert draft.frontmatter["status"] == "draft"
+    assert "approvedBy" not in draft.frontmatter
+    approved = compose_pair(document(body_markdown=body, approved_by="Dr. Asha Rao", approved_on="2026-10-26"), marker="0" * 32, config=config, allowed_paths={"/"}, published_on=date(2026, 10, 26))  # fmt: skip
+    assert (approved.frontmatter["status"], approved.frontmatter["approvedBy"], approved.frontmatter["approvedOn"]) == ("published", "Dr. Asha Rao", "2026-10-26")  # fmt: skip
+    assert not any("approvedBy and approvedOn" in p for p in validate_pair(approved.text, approved.body_text or "", marker="0" * 32))  # fmt: skip
+    broken = pair_json({**approved.frontmatter, "approvedOn": None})
+    assert any("approvedBy and approvedOn" in p for p in validate_pair(broken, approved.body_text or "", marker="0" * 32))  # fmt: skip

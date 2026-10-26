@@ -9,7 +9,7 @@ repositories read the same list:
     Botox => (no replacement: describe the treatment, not the product)
     steroid
 
-A term matches as a whole word or phrase, in any case, inside words joined by hyphens or
+A term starting ``re:`` is a regular expression (``re:lipo\\w*``). A term matches as a whole word or phrase, in any case, inside words joined by hyphens or
 underscores too (``isotretinoin-guide``, ``botox_1.jpg``): slugs, file names and URLs are
 checked like prose.
 """
@@ -31,6 +31,8 @@ class Term:
 
     @property
     def pattern(self) -> re.Pattern[str]:
+        if self.term.startswith("re:"):  # a regular expression, as the website's list has (lipo\w*)
+            return re.compile(r"(?<![a-z0-9])(?:" + self.term[3:] + r")(?![a-z0-9])", re.IGNORECASE)
         words = [re.escape(w) for w in self.term.split()]
         return re.compile(
             r"(?<![a-z0-9])" + r"[\s_\-]+".join(words) + r"(?![a-z0-9])", re.IGNORECASE
