@@ -12,7 +12,9 @@ clinic:
     council: Gujarat Medical Council
     # Her Gujarat Medical Council number. While it's missing, nothing goes public (rule R12):
     # add the real number here, never a placeholder.
-    registration_number:
+    # From her Gujarat Medical Council certificate (G-16735, 21 Aug 2009, registered as
+    # Jethava Daksha Narottambhai), confirmed by the doctor.
+    registration_number: G-16735
   approvers:
   - Dr. Daksha Patel
   # Her standing approval: posts that pass every compliance rule are published under her name
