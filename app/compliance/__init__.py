@@ -23,6 +23,7 @@ from app.compliance.rules import (
     RuleResult,
     check,
     content_problems,
+    neutral_wording,
     writer_rules,
 )
 from app.compliance.terms import Term, load_terms
@@ -41,5 +42,6 @@ __all__ = [
     "content_problems",
     "load_clinic",
     "load_terms",
+    "neutral_wording",
     "writer_rules",
 ]

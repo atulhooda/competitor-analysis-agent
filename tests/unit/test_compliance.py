@@ -230,3 +230,10 @@ def test_the_websites_procedure_terms_are_blocked_too() -> None:
     for text in ("Dermal fillers for smile lines.", "A liposuction alternative.", "Skin boosters explained.", "Mesotherapy for hair.", "An injection-free option."):  # fmt: skip
         assert "R4" in failing(check(post(text + "\n\n" + GOOD_BODY), clinic(), terms)), text
     assert "R4" not in failing(check(post("Your skin's lipid barrier matters.\n\n" + GOOD_BODY), clinic(), terms))  # fmt: skip
+
+
+def test_superlatives_in_a_search_snippet_get_neutral_words() -> None:
+    from app.compliance import neutral_wording
+
+    assert neutral_wording("Permanent results with the safest, painless care") == "Long-lasting results with the safe, comfortable care"  # fmt: skip
+    assert neutral_wording("A topical cream") == "A topical cream"  # whole words only

@@ -41,7 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from app.cms import LazyCMS
 from app.cms.base import CMSPost, CMSPublisher, TermResolution
 from app.cms.errors import CMSConfigurationError, CMSError, CMSTransientError, CMSValidationError
-from app.compliance import CLOSING_NOTE, ComplianceInput, ComplianceReport, check
+from app.compliance import CLOSING_NOTE, ComplianceInput, ComplianceReport, check, neutral_wording
 from app.config import Settings
 from app.core.errors import AppError
 from app.core.timeutils import utcnow
@@ -715,6 +715,8 @@ class PublishingService:
         authored = bool(snap.report is not None and snap.report.authored)
         score = snap.report.overall_score if snap.report is not None and not authored else None
         written = snap.article.created_at.astimezone(self._settings.scheduler_tz) if snap.article.created_at.tzinfo else snap.article.created_at  # fmt: skip
+        if self._settings.clinic is not None:  # superlatives in the search snippet, neutralised
+            doc = doc.model_copy(update={"excerpt": neutral_wording(doc.excerpt), "meta_title": neutral_wording(doc.meta_title)})  # fmt: skip
         return doc.model_copy(update={"written_on": written.date().isoformat(), "article_id": snap.article.id, "version_id": snap.version.id if snap.version else None, "content_type": snap.article.content_type, "authored": authored, "quality_score": score, "opportunity_title": snap.opportunity_title, "content_hash": content_hash})  # fmt: skip
 
     # ── preflight ────────────────────────────────────────────────────────────
@@ -894,7 +896,9 @@ class PublishingService:
         fields += [(f"FAQ '{f.question[:40]}'", f"{f.question} {f.answer}") for f in doc.faq]
         fields += [(f"tag '{t}'", t) for t in doc.tags]
         urls = [("the post URL", f"/blog/{doc.slug}")]
-        urls += [(f"link '{link.anchor_text[:40]}'", link.url) for link in doc.links]
+        # Only the links the post shows: an unplaced suggestion (say, to a page the site has
+        # since removed) never reaches the reader. Inline links are in the body already.
+        urls += [(f"link '{link.anchor_text[:40]}'", link.url) for link in doc.links if link.placed]
         urls += [
             (f"citation '{(src.title or src.url)[:40]}'", src.url) for src in doc.sources if src.url
         ]

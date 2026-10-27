@@ -222,6 +222,22 @@ def check(post: ComplianceInput, clinic: ClinicConfig, terms: Sequence[Term]) ->
     return ComplianceReport(clinic_id=clinic.clinic_id, passed=all(r.passed for r in rules), rules=rules)  # fmt: skip
 
 
+# Neutral words for superlatives in a short field (a meta description, a title): what a
+# person would write instead. Anything else stays flagged and blocks.
+NEUTRAL = {"permanent": "long-lasting", "permanently": "for the long term", "painless": "comfortable", "safest": "safe", "best": "suitable", "top": "key", "leading": "common", "flawless": "healthy-looking", "guaranteed": "expected", "miracle": "effective", "revolutionary": "modern", "state-of-the-art": "modern", "world-class": "careful", "most advanced": "modern"}  # fmt: skip
+_NEUTRAL = re.compile(r"(?<![a-z0-9-])(" + "|".join(re.escape(k) for k in sorted(NEUTRAL, key=len, reverse=True)) + r")(?![a-z0-9-])", re.IGNORECASE)  # fmt: skip
+
+
+def neutral_wording(text: str) -> str:
+    """``text`` with its superlatives replaced by neutral words, keeping a capital letter."""
+
+    def swap(match: re.Match[str]) -> str:
+        word = NEUTRAL[match.group(1).lower()]
+        return word[0].upper() + word[1:] if match.group(1)[0].isupper() else word
+
+    return _NEUTRAL.sub(swap, text)
+
+
 # Rules an article's own text can break (the rest is assembled at publishing: the author box,
 # the closing note, the call to action).
 CONTENT_RULES = ("R4", "R5", "R6", "R8", "R9", "R10", "R11", "R13", "R15", "R16")
@@ -277,5 +293,6 @@ __all__ = [
     "RuleResult",
     "check",
     "content_problems",
+    "neutral_wording",
     "writer_rules",
 ]
