@@ -561,7 +561,9 @@ class PipelineService:
             per_run = self._settings.max_articles_per_run or None
             if self._settings.publish_pacing:
                 async with self._sessions() as session:
-                    published = await published_on(session, day, self._settings)
+                    published = await published_on(
+                        session, day, self._settings, scheduled_only=True
+                    )
                     if self._publish_target() is TargetStatus.DRAFT:  # drafts are the day's output
                         published += await drafted_on(session, day, self._settings)
                     on_the_way = await self._on_the_way(session)
@@ -703,7 +705,7 @@ class PipelineService:
         done: dict[str, dict[str, Any]] = dict(progress.get("done") or {})
         day = local_day(self._now(), settings.scheduler_tz)
         async with self._sessions() as session:
-            used = await published_on(session, day, settings)
+            used = await published_on(session, day, settings, scheduled_only=True)
             candidates = await publish_candidates(session, site=self._s.cms.site or "", done=_DONE[target])  # fmt: skip
         remaining = max(limit - used, 0)
         states = {c.article.id: _approval_state(c, settings) for c in candidates}
@@ -767,7 +769,9 @@ class PipelineService:
             left_for_later=[a for a in eligible if str(a) not in done],
         )
         async with self._sessions() as session:
-            summary["published_today_after"] = await published_on(session, day, settings)
+            summary["published_today_after"] = await published_on(
+                session, day, settings, scheduled_only=True
+            )
         runs = [int(e["run_id"]) for e in done.values() if e.get("run_id")]
         return StageResult(StageStatus.COMPLETED_WITH_WARNINGS if warnings else StageStatus.COMPLETED, summary, warnings, runs)  # fmt: skip
 

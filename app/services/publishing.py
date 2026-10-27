@@ -507,6 +507,9 @@ class PublishingService:
             if problem is not None or live is None:
                 raise _Blocked(problem or "no approval")
             if limit is not None and target is TargetStatus.PUBLISH:
+                # The pipeline's own post: it uses the day's MAX_ARTICLES_PER_DAY allowance (a
+                # post published by hand doesn't).
+                publication.details = {**(publication.details or {}), "pipeline": True}
                 reserved, used, day = await reserve_publication_slot(session, publication, limit=limit, settings=self._settings, now=self._now())  # fmt: skip
                 if not reserved:
                     raise _LimitReached(f"the daily publishing limit is reached ({used} of {limit} on {day}, {self._settings.scheduler_timezone}): left for a later run")  # fmt: skip
@@ -527,6 +530,7 @@ class PublishingService:
             category = {"name": terms.category.name, "id": terms.category.id} if terms.category else None  # fmt: skip
             image = doc.image.model_dump(mode="json") if doc.image else None
             publication.details = {
+                **({"pipeline": True} if (publication.details or {}).get("pipeline") else {}),
                 "render_version": doc.render_version,
                 "title": doc.title,
                 "slug": post.slug or doc.slug,

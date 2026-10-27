@@ -133,7 +133,9 @@ async def test_two_publishers_racing_for_the_last_slot_publish_exactly_one(rig: 
     assert sum(1 for p in rig.wp.posts.values() if p["status"] == "publish") == 2
 
 
-async def test_a_manual_publication_is_not_limited_but_uses_the_allowance(rig: Rig) -> None:
+async def test_a_manual_publication_doesnt_use_the_pipelines_daily_allowance(rig: Rig) -> None:
+    """MAX_ARTICLES_PER_DAY is the pipeline's own posts: a backlog someone publishes by hand
+    doesn't stop the day's scheduled posts (Skin Essence, 27 Oct 2026)."""
     await rig.clone_opportunity(score=99.0)
     await rig.run(max_articles_generated_per_day=2, automated_publishing_enabled=False)
     first, second = [a.id for a in await rig.articles()]
@@ -144,6 +146,5 @@ async def test_a_manual_publication_is_not_limited_but_uses_the_allowance(rig: R
     assert manual.status is PublicationStatus.PUBLISHED
     job = await rig.run(max_articles_generated_per_day=2)
     publish = next(st for st in job.stages if st.stage.value == "publish")
-    assert publish.status.value == "skipped"  # the person's publication used today's slot
-    assert await _count(rig) == 1
-    assert second not in (publish.summary.get("published") or [])
+    assert publish.summary.get("published") == [second]  # the day's own slot is still free
+    assert await _count(rig) == 2

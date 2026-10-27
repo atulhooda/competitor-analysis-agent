@@ -29,8 +29,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.db.locks import PUBLISH_LIMIT_LOCK_KEY
-from app.db.models import Article, Opportunity, Publication, PublicationAttempt
+from app.db.models import Article, Opportunity, Publication, PublicationAttempt, Run
 from app.domain.articles import ArticleStatus
+from app.domain.history import RunTrigger
 from app.domain.jobs import DailyCounts
 from app.domain.opportunities import EDITORIAL_KEY_PREFIX, OpportunityOrigin
 from app.domain.publishing import (
@@ -63,9 +64,15 @@ def _counted(day: date, start: datetime, end: datetime) -> ColumnElement[bool]:
     )
 
 
-async def published_on(session: AsyncSession, day: date, settings: Settings, *, exclude_id: int | None = None) -> int:  # fmt: skip
+async def published_on(session: AsyncSession, day: date, settings: Settings, *, exclude_id: int | None = None, scheduled_only: bool = False) -> int:  # fmt: skip
+    """Public posts on ``day``. ``scheduled_only``: only the pipeline's own,
+    the ones MAX_ARTICLES_PER_DAY limits: a post someone publishes by hand (a backlog) doesn't
+    use the day's allowance."""
     start, end = day_bounds(day, settings.scheduler_tz)
     query = select(func.count(Publication.id)).where(_counted(day, start, end))
+    if scheduled_only:  # the pipeline's (marked since 27 Oct 2026; before that, scheduled runs)
+        scheduled = exists().where(Run.id == Publication.run_id, Run.trigger == RunTrigger.SCHEDULE.value)  # fmt: skip
+        query = query.where(or_(Publication.details["pipeline"].as_boolean().is_(True), scheduled))
     if exclude_id is not None:
         query = query.where(Publication.id != exclude_id)
     return int(await session.scalar(query) or 0)
@@ -83,7 +90,9 @@ async def reserve_publication_slot(session: AsyncSession, publication: Publicati
     caller's transaction. Returns (reserved, used including this one if reserved, day)."""
     await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": PUBLISH_LIMIT_LOCK_KEY})  # fmt: skip
     day = local_day(now, settings.scheduler_tz)
-    used = await published_on(session, day, settings, exclude_id=publication.id)
+    used = await published_on(
+        session, day, settings, exclude_id=publication.id, scheduled_only=True
+    )
     if used >= limit:
         return False, used, day
     publication.limit_day = day
