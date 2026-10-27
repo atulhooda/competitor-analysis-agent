@@ -45,6 +45,18 @@ class Doctor(BaseModel):
         )
 
 
+class StandingApproval(BaseModel):
+    """The doctor's recorded authorisation to publish posts that pass every compliance rule,
+    without approving each one: who gave it, when, in what words, and through whom."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    by: str = Field(min_length=1, max_length=120)
+    given_on: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    statement: str = Field(min_length=20, max_length=2_000)
+    relayed_by: str | None = Field(default=None, max_length=200, description="Who passed it on, and how")  # fmt: skip
+
+
 class ClinicConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -57,6 +69,13 @@ class ClinicConfig(BaseModel):
     devices: list[str] = Field(default_factory=list, description="Devices the clinic actually uses (brand names allowed only here)")  # fmt: skip
     areas: list[str] = Field(default_factory=list, description="Local area names a post names (at least one)")  # fmt: skip
     ctas: list[str] = Field(default_factory=lambda: list(DEFAULT_CTAS), description="The only call-to-action wording allowed")  # fmt: skip
+    standing_approval: StandingApproval | None = None
+
+    @property
+    def standing(self) -> StandingApproval | None:
+        """The standing approval, if it was given by one of the clinic's approvers."""
+        s = self.standing_approval
+        return s if s is not None and self.approves(s.by) else None
 
     @property
     def allowed_approvers(self) -> tuple[str, ...]:
@@ -93,4 +112,4 @@ def load_clinic(directory: Path, clinic_id: str) -> ClinicConfig:
     return clinic
 
 
-__all__ = ["DEFAULT_CTAS", "ClinicConfig", "Doctor", "load_clinic"]
+__all__ = ["DEFAULT_CTAS", "ClinicConfig", "Doctor", "StandingApproval", "load_clinic"]

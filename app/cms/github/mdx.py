@@ -458,7 +458,9 @@ def compose_pair(document: RenderedDocument, *, marker: str, config: SiteConfig,
         "title": title,
         "metaTitle": meta_title,
         "metaDescription": description,
-        "date": published_on.isoformat(),
+        "date": document.written_on
+        if config.approval_required and document.written_on
+        else published_on.isoformat(),
         "excerpt": " ".join(document.excerpt.split()),
         "author": config.author_name,
         **({"reviewedBy": config.reviewed_by} if config.reviewed_by else {}),

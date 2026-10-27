@@ -173,6 +173,7 @@ class RenderedDocument(BaseModel):
     # post where the site records it (json_pair: approvedBy/approvedOn, status published).
     approved_by: str | None = None
     approved_on: str | None = None
+    written_on: str | None = Field(default=None, description="The day the article was written (YYYY-MM-DD): a clinic post carries it as its date")  # fmt: skip
 
 
 # ── Preflight ────────────────────────────────────────────────────────────────

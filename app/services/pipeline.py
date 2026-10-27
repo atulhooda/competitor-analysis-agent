@@ -325,8 +325,9 @@ class PipelineService:
         """Public only with PUBLISH_ALLOW_DIRECT_PUBLISH; otherwise PUBLISH_DEFAULT_STATUS
         (a draft by default). A clinic (CLINIC_ID) only ever gets drafts: a post goes public
         when its doctor has approved it and someone publishes it (`articles publish`)."""
-        if self._settings.clinic is not None:
-            return TargetStatus.DRAFT
+        clinic = self._settings.clinic
+        if clinic is not None:  # public only under the doctor's standing approval
+            return TargetStatus.PUBLISH if clinic.standing is not None and self._settings.publish_allow_direct_publish else TargetStatus.DRAFT  # fmt: skip
         if self._settings.publish_allow_direct_publish:
             return TargetStatus.PUBLISH
         return TargetStatus(self._settings.publish_default_status)

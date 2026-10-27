@@ -484,3 +484,9 @@ def test_a_clinic_post_is_a_draft_until_the_doctor_approves_it() -> None:
     assert not any("approvedBy and approvedOn" in p for p in validate_pair(approved.text, approved.body_text or "", marker="0" * 32))  # fmt: skip
     broken = pair_json({**approved.frontmatter, "approvedOn": None})
     assert any("approvedBy and approvedOn" in p for p in validate_pair(broken, approved.body_text or "", marker="0" * 32))  # fmt: skip
+
+
+def test_a_clinic_post_is_dated_the_day_it_was_written() -> None:
+    config = SiteConfig(site_url="https://clinic.example.in", content_dir="content/blog", branch_prefix="blog/", author_name="Team", author_role="", author_initials="T", author_linkedin=None, cta_title="", cta_body="", cta_label="", cta_href="/", byline="", layout=JSON_PAIR, approval_required=True)  # fmt: skip
+    mdx = compose_pair(document(body_markdown="Intro.\n\n## One\n\nText.\n", written_on="2026-10-16"), marker="0" * 32, config=config, allowed_paths={"/"}, published_on=date(2026, 10, 27))  # fmt: skip
+    assert mdx.frontmatter["date"] == "2026-10-16"

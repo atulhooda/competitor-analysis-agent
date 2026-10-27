@@ -7,12 +7,21 @@ clinic:
   doctor:
     name: Dr. Daksha Patel
     qualification: MBBS, MD (Skin & VD)
-    council: Maharashtra Medical Council
-    # Not confirmed by the clinic yet. While it's missing, every post is BLOCKED (rule R12):
+    # Her Maharashtra registration isn't issued yet (Oct 2026): the author box shows her
+    # Gujarat registration until it is.
+    council: Gujarat Medical Council
+    # Her Gujarat Medical Council number. While it's missing, nothing goes public (rule R12):
     # add the real number here, never a placeholder.
     registration_number:
   approvers:
   - Dr. Daksha Patel
+  # Her standing approval: posts that pass every compliance rule are published under her name
+  # without a per-post approval. Given in person; her words, as sent.
+  standing_approval:
+    by: Dr. Daksha Patel
+    given_on: '2026-10-27'
+    statement: I, Dr. Daksha Patel, approve the pending Skin Essence blog posts and authorise Engageo to publish future posts on skinessence2017.com under my name when they pass the compliance checks.
+    relayed_by: Atul Hooda (Engageo), in person with Dr. Patel, 27 Oct 2026
   # Treatments as the clinic lists them, by generic names. Injectables and fillers aren't
   # named at all (the website's restricted procedure terms, 19 Oct 2026): anti-ageing
   # treatment covers them.

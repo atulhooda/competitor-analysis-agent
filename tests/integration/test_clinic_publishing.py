@@ -120,3 +120,41 @@ def test_a_missing_registration_number_never_blocks_a_draft_only_a_public_post()
     assert compliance_blocking(missing, TargetStatus.DRAFT) == []
     assert [r.rule for r in compliance_blocking(missing, TargetStatus.PUBLISH)] == ["R12"]
     assert [r.rule for r in compliance_blocking(placeholder, TargetStatus.DRAFT)] == ["R12"]
+
+
+STANDING = """  standing_approval:
+    by: Dr. Asha Rao
+    given_on: '2026-10-27'
+    statement: I approve publishing posts that pass the compliance checks under my name.
+    relayed_by: the agency, in person
+"""
+
+
+async def test_a_standing_approval_from_the_doctor_lets_compliant_posts_go_public(pub: Pub, tmp_path: Path) -> None:  # fmt: skip
+    settings = clinic_settings(tmp_path)
+    (tmp_path / "test-clinic.yaml").write_text((tmp_path / "test-clinic.yaml").read_text() + STANDING, encoding="utf-8")  # fmt: skip
+    passed, detail = checks(await pub.service(**settings).preflight(pub.article_id, target=TargetStatus.PUBLISH))["doctor_approval"]  # fmt: skip
+    assert passed
+    assert detail == "standing approval by Dr. Asha Rao given on 2026-10-27 (the agency, in person)"
+
+
+async def test_a_standing_approval_by_someone_else_counts_for_nothing(pub: Pub, tmp_path: Path) -> None:  # fmt: skip
+    settings = clinic_settings(tmp_path)
+    (tmp_path / "test-clinic.yaml").write_text((tmp_path / "test-clinic.yaml").read_text() + STANDING.replace("Dr. Asha Rao", "The Agency"), encoding="utf-8")  # fmt: skip
+    assert checks(await pub.service(**settings).preflight(pub.article_id, target=TargetStatus.PUBLISH))["doctor_approval"][0] is False  # fmt: skip
+
+
+@pytest.mark.parametrize("standing", [True, False])
+def test_with_a_standing_approval_the_pipeline_publishes(tmp_path: Path, standing: bool) -> None:
+    from app.config import _CLINICS
+    from app.services.pipeline import PipelineService
+    from tests.fakesite import make_settings
+
+    _CLINICS.clear()
+    settings_values = clinic_settings(tmp_path)
+    if standing:
+        (tmp_path / "test-clinic.yaml").write_text((tmp_path / "test-clinic.yaml").read_text() + STANDING, encoding="utf-8")  # fmt: skip
+    pipeline = PipelineService.__new__(PipelineService)
+    pipeline._settings = make_settings(**settings_values)
+    assert pipeline._publish_target() is (TargetStatus.PUBLISH if standing else TargetStatus.DRAFT)
+    _CLINICS.clear()

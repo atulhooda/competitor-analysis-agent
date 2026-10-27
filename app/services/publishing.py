@@ -370,6 +370,8 @@ class PublishingService:
         if clinic is not None and target is TargetStatus.PUBLISH and live is not None and live.method == ApprovalMethod.MANUAL.value and clinic.approves(live.approver):  # fmt: skip
             local = live.created_at.astimezone(self._settings.scheduler_tz) if live.created_at.tzinfo else live.created_at  # fmt: skip
             doc = doc.model_copy(update={"approved_by": live.approver, "approved_on": local.date().isoformat()})  # fmt: skip
+        elif clinic is not None and target is TargetStatus.PUBLISH and clinic.standing is not None:
+            doc = doc.model_copy(update={"approved_by": clinic.standing.by, "approved_on": clinic.standing.given_on})  # fmt: skip
         if self._settings.clinic is not None and doc.cover is not None:
             covered = self.compliance(doc)  # the cover's alt text and file name are known now
             if compliance_blocking(covered, target):
@@ -712,7 +714,8 @@ class PublishingService:
         # Gemini): the pull request says who wrote it instead of showing a score of zero.
         authored = bool(snap.report is not None and snap.report.authored)
         score = snap.report.overall_score if snap.report is not None and not authored else None
-        return doc.model_copy(update={"article_id": snap.article.id, "version_id": snap.version.id if snap.version else None, "content_type": snap.article.content_type, "authored": authored, "quality_score": score, "opportunity_title": snap.opportunity_title, "content_hash": content_hash})  # fmt: skip
+        written = snap.article.created_at.astimezone(self._settings.scheduler_tz) if snap.article.created_at.tzinfo else snap.article.created_at  # fmt: skip
+        return doc.model_copy(update={"written_on": written.date().isoformat(), "article_id": snap.article.id, "version_id": snap.version.id if snap.version else None, "content_type": snap.article.content_type, "authored": authored, "quality_score": score, "opportunity_title": snap.opportunity_title, "content_hash": content_hash})  # fmt: skip
 
     # ── preflight ────────────────────────────────────────────────────────────
 
@@ -747,8 +750,12 @@ class PublishingService:
         if clinic is not None:
             if target is TargetStatus.PUBLISH:  # R2: only the clinic's doctor can make it public
                 live = snap.live
+                standing = clinic.standing
                 by_doctor = live is not None and problem is None and live.method == ApprovalMethod.MANUAL.value and clinic.approves(live.approver)  # fmt: skip
-                add("doctor_approval", by_doctor, f"approved by {live.approver} on {live.created_at:%Y-%m-%d %H:%M} UTC" if by_doctor and live else f"a {clinic.name} post is made public only with the recorded approval of {' or '.join(clinic.allowed_approvers)}: `articles approve {article.id} --approver \"{clinic.allowed_approvers[0]}\"`")  # fmt: skip
+                if standing is not None and not by_doctor:
+                    add("doctor_approval", True, f"standing approval by {standing.by} given on {standing.given_on}" + (f" ({standing.relayed_by})" if standing.relayed_by else ""))  # fmt: skip
+                else:
+                    add("doctor_approval", by_doctor, f"approved by {live.approver} on {live.created_at:%Y-%m-%d %H:%M} UTC" if by_doctor and live else f"a {clinic.name} post is made public only with the recorded approval of {' or '.join(clinic.allowed_approvers)}: `articles approve {article.id} --approver \"{clinic.allowed_approvers[0]}\"`")  # fmt: skip
             if doc is not None:  # R3: any failure blocks the pull request
                 compliance = self.compliance(doc)
                 # R12 blocks publishing: a draft for the doctor to review may open before the
