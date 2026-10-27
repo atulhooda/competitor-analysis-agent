@@ -421,6 +421,11 @@ class GitHubPublishingAdapter:
 
     async def _from_pr(self, pr: dict[str, Any], payload: dict[str, Any]) -> CMSPost:
         slug, path = str(payload["slug"]), str(payload["path"])
+        # Right after a commit GitHub can still report the pull request's previous head, whose
+        # preview is the site before the commit: the branch's own head is the truth.
+        ref = await self._gh.get_optional(f"repos/{self._repo}/git/ref/heads/{pr['head']['ref']}")
+        if isinstance(ref, dict) and ref.get("object", {}).get("sha"):
+            pr = {**pr, "head": {**pr["head"], "sha": str(ref["object"]["sha"])}}
         if payload["status"] == TargetStatus.PUBLISH.value:
             return await self._publish(pr, payload)
         await self._verify_preview(pr, slug, str(payload["title"]), list(payload.get("headings") or []))  # fmt: skip
