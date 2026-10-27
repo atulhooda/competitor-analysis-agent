@@ -169,6 +169,12 @@ class _Plan:
     warnings: list[str] = field(default_factory=list)
 
 
+def compliance_blocking(report: ComplianceReport, target: TargetStatus) -> list[Any]:
+    """The failed rules that stop this publication. A missing registration number (R12
+    without a flagged placeholder) stops only a public post: the doctor reviews the draft."""
+    return [r for r in report.failed if not (r.rule == "R12" and not r.findings and target is not TargetStatus.PUBLISH)]  # fmt: skip
+
+
 def idempotency_key(article_id: int, version_id: int, cms: str, site: str) -> str:
     return hashlib.sha256(f"{article_id}:{version_id}:{cms}:{site}".encode()).hexdigest()
 
@@ -366,7 +372,7 @@ class PublishingService:
             doc = doc.model_copy(update={"approved_by": live.approver, "approved_on": local.date().isoformat()})  # fmt: skip
         if self._settings.clinic is not None and doc.cover is not None:
             covered = self.compliance(doc)  # the cover's alt text and file name are known now
-            if not covered.passed:
+            if compliance_blocking(covered, target):
                 return await self._blocked(
                     run_id, publication_id, plan, f"compliance: {covered.summary()}"
                 )
@@ -747,7 +753,7 @@ class PublishingService:
                 compliance = self.compliance(doc)
                 # R12 blocks publishing: a draft for the doctor to review may open before the
                 # registration number is in config (a placeholder still blocks everything).
-                blocking = [r for r in compliance.failed if not (r.rule == "R12" and not r.findings and target is not TargetStatus.PUBLISH)]  # fmt: skip
+                blocking = compliance_blocking(compliance, target)
                 add("compliance", not blocking, compliance.summary() if blocking else (compliance.summary() + ("" if compliance.passed else " (doesn't block a draft)")))  # fmt: skip
         if snap.content is None or doc is None:
             add("content", False, "no content to publish")

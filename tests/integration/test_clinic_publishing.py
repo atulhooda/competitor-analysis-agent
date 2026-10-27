@@ -109,3 +109,14 @@ async def test_without_a_registration_number_a_draft_opens_but_nothing_goes_publ
     ]
     assert public[0] is False
     assert "R12" in public[1]
+
+
+def test_a_missing_registration_number_never_blocks_a_draft_only_a_public_post() -> None:
+    from app.compliance import ComplianceReport, RuleResult
+    from app.services.publishing import compliance_blocking
+
+    missing = ComplianceReport(clinic_id="c", passed=False, rules=[RuleResult(rule="R12", title="Author box", passed=False, detail="no registration number")])  # fmt: skip
+    placeholder = ComplianceReport(clinic_id="c", passed=False, rules=[RuleResult(rule="R12", title="Author box", passed=False, findings=[{"rule": "R12", "term": "[PENDING]", "location": "author box", "excerpt": "", "suggestion": ""}])])  # fmt: skip
+    assert compliance_blocking(missing, TargetStatus.DRAFT) == []
+    assert [r.rule for r in compliance_blocking(missing, TargetStatus.PUBLISH)] == ["R12"]
+    assert [r.rule for r in compliance_blocking(placeholder, TargetStatus.DRAFT)] == ["R12"]
