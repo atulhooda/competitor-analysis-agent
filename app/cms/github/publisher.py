@@ -785,7 +785,9 @@ class GitHubPublishingAdapter:
             return self._post(file[0], external_id("pr", number), CMSPostStatus.PUBLISHED, slug, url=f"{self._config.site_url}/blog/{slug}", edit_url=str(pr.get("html_url") or ""))  # fmt: skip
         if pr.get("state") != "open":
             return self._post("", external_id("pr", number), CMSPostStatus.TRASH, slug, edit_url=str(pr.get("html_url") or ""))  # fmt: skip
-        file = await self._read(path, str(pr["head"]["sha"]))
+        # The branch, not the head sha the pull request reports: right after a commit GitHub
+        # can still report the previous head, and the file would look like it hadn't changed.
+        file = await self._read(path, str(pr["head"]["ref"]))
         if file is None:
             return None
         return self._post(file[0], external_id("pr", number), CMSPostStatus.DRAFT, slug, edit_url=str(pr.get("html_url") or ""))  # fmt: skip
