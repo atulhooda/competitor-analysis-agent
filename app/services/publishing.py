@@ -715,8 +715,11 @@ class PublishingService:
         authored = bool(snap.report is not None and snap.report.authored)
         score = snap.report.overall_score if snap.report is not None and not authored else None
         written = snap.article.created_at.astimezone(self._settings.scheduler_tz) if snap.article.created_at.tzinfo else snap.article.created_at  # fmt: skip
-        if self._settings.clinic is not None:  # superlatives in the search snippet, neutralised
-            doc = doc.model_copy(update={"excerpt": neutral_wording(doc.excerpt), "meta_title": neutral_wording(doc.meta_title)})  # fmt: skip
+        if (
+            self._settings.clinic is not None
+        ):  # single banned words get the neutral one, everywhere shown
+            faq = [f.model_copy(update={"question": neutral_wording(f.question), "answer": neutral_wording(f.answer)}) for f in doc.faq]  # fmt: skip
+            doc = doc.model_copy(update={"title": neutral_wording(doc.title), "excerpt": neutral_wording(doc.excerpt), "meta_title": neutral_wording(doc.meta_title), "body_markdown": neutral_wording(doc.body_markdown), "headings": [neutral_wording(h) for h in doc.headings], "faq": faq})  # fmt: skip
         return doc.model_copy(update={"written_on": written.date().isoformat(), "article_id": snap.article.id, "version_id": snap.version.id if snap.version else None, "content_type": snap.article.content_type, "authored": authored, "quality_score": score, "opportunity_title": snap.opportunity_title, "content_hash": content_hash})  # fmt: skip
 
     # ── preflight ────────────────────────────────────────────────────────────
