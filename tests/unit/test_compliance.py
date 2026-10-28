@@ -237,3 +237,13 @@ def test_superlatives_in_a_search_snippet_get_neutral_words() -> None:
 
     assert neutral_wording("Permanent results with the safest, painless care") == "Long-lasting results with the safe, comfortable care"  # fmt: skip
     assert neutral_wording("A topical cream") == "A topical cream"  # whole words only
+
+
+def test_injection_wording_is_neutralised_and_the_faq_is_checked_as_shown() -> None:
+    from app.compliance import neutral_wording
+
+    assert neutral_wording("What side effects do PRP injections have?") == "What side effects do PRP sessions have?"  # fmt: skip
+    clean = content_problems("PRP in Pune", [], GOOD_BODY, clinic(), TERMS, [("Are PRP injections painful?", "Most find them tolerable.")])  # fmt: skip
+    assert not any(p.startswith("R4") for p in clean)
+    flagged = content_problems("PRP in Pune", [], GOOD_BODY, clinic(), TERMS, [("Is isotretinoin needed?", "Sometimes.")])  # fmt: skip
+    assert any(p.startswith("R4") and "FAQ" in p for p in flagged)

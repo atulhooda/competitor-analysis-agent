@@ -429,7 +429,7 @@ class QualityService:
         # A clinic's compliance rules (app/compliance): what the text breaks fails the
         # content_valid gate, and the revision is asked to fix it.
         clinic = self._settings.clinic
-        flagged = content_problems(content.title, [s.heading or "" for s in content.sections if s.heading], to_markdown(content), clinic, self._settings.compliance_terms) if clinic else []  # fmt: skip
+        flagged = content_problems(content.title, [s.heading or "" for s in content.sections if s.heading], to_markdown(content), clinic, self._settings.compliance_terms, [(f.question, f.answer) for f in seo.package.faq]) if clinic else []  # fmt: skip
         metrics, metrics_id, metrics_hash = await run(
             ArticleStep.METRICS,
             digest(

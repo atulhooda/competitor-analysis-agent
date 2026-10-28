@@ -224,7 +224,7 @@ def check(post: ComplianceInput, clinic: ClinicConfig, terms: Sequence[Term]) ->
 
 # Neutral words for superlatives in a short field (a meta description, a title): what a
 # person would write instead. Anything else stays flagged and blocks.
-NEUTRAL = {"cure": "treat", "cures": "treats", "cured": "treated", "curing": "treating", "expert": "specialist", "experts": "specialists", "renowned": "qualified", "safest": "safe", "permanent": "long-lasting", "permanently": "for the long term", "painless": "comfortable", "best": "suitable", "top": "key", "leading": "common", "flawless": "healthy-looking", "guaranteed": "expected", "miracle": "effective", "revolutionary": "modern", "state-of-the-art": "modern", "world-class": "careful", "most advanced": "modern"}  # fmt: skip
+NEUTRAL = {"cure": "treat", "cures": "treats", "cured": "treated", "curing": "treating", "expert": "specialist", "experts": "specialists", "renowned": "qualified", "safest": "safe", "permanent": "long-lasting", "permanently": "for the long term", "painless": "comfortable", "best": "suitable", "top": "key", "leading": "common", "flawless": "healthy-looking", "guaranteed": "expected", "miracle": "effective", "revolutionary": "modern", "state-of-the-art": "modern", "world-class": "careful", "most advanced": "modern", "injection": "session", "injections": "sessions", "injectable": "treatment", "injectables": "treatments"}  # fmt: skip
 _NEUTRAL = re.compile(r"(?<![a-z0-9-])(" + "|".join(re.escape(k) for k in sorted(NEUTRAL, key=len, reverse=True)) + r")(?![a-z0-9-])", re.IGNORECASE)  # fmt: skip
 
 
@@ -243,10 +243,12 @@ def neutral_wording(text: str) -> str:
 CONTENT_RULES = ("R4", "R5", "R6", "R8", "R9", "R10", "R11", "R13", "R14", "R15", "R16")
 
 
-def content_problems(title: str, headings: Sequence[str], body: str, clinic: ClinicConfig, terms: Sequence[Term]) -> list[str]:  # fmt: skip
+def content_problems(title: str, headings: Sequence[str], body: str, clinic: ClinicConfig, terms: Sequence[Term], faq: Sequence[tuple[str, str]] = ()) -> list[str]:  # fmt: skip
     """What in an article's own text breaks the rules, with the rewrite: the quality gate
-    fails on these, so the revision fixes them before the post reaches publishing."""
-    post = ComplianceInput(fields=[("the title", title), *[(f"heading '{h[:60]}'", h) for h in headings]], body=body)  # fmt: skip
+    fails on these, so the revision fixes them before the post reaches publishing. The FAQ
+    is checked as publishing shows it, after its neutral wording."""
+    shown = [(f"FAQ '{q[:40]}'", neutral_wording(f"{q} {a}")) for q, a in faq]
+    post = ComplianceInput(fields=[("the title", title), *[(f"heading '{h[:60]}'", h) for h in headings], *shown], body=body)  # fmt: skip
     report = check(post, clinic, terms)
     problems = []
     for result in report.rules:
