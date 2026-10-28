@@ -247,3 +247,13 @@ def test_injection_wording_is_neutralised_and_the_faq_is_checked_as_shown() -> N
     assert not any(p.startswith("R4") for p in clean)
     flagged = content_problems("PRP in Pune", [], GOOD_BODY, clinic(), TERMS, [("Is isotretinoin needed?", "Sometimes.")])  # fmt: skip
     assert any(p.startswith("R4") and "FAQ" in p for p in flagged)
+
+
+def test_the_seo_and_topic_prompts_carry_the_rules() -> None:
+    from app.prompts import editorial, seo
+
+    rules = writer_rules(clinic(), TERMS)
+    shown = seo.render(topic="t", audience="a", intent="informational", angle="x", company="c", article="body", keywords=[], internal=[], external=[], categories=["Skin"], rules=rules)  # fmt: skip
+    assert "FAQ" in shown
+    assert MEDICINE_ADVICE in shown
+    assert MEDICINE_ADVICE in editorial.render(company=["- name: c"], excluded=[], covered=[], count=3, rules=rules)  # fmt: skip

@@ -13,7 +13,7 @@ from pydantic import AfterValidator, BaseModel, Field
 from app.prompts.article_common import DRAFT_TAG, fence
 from app.prompts.fields import cap, texts, truncate
 
-VERSION = "seo/2"
+VERSION = "seo/3"
 MAX_OUTPUT_TOKENS = 4_000
 
 SYSTEM = f"""\
@@ -94,6 +94,7 @@ def render(
     internal: Sequence[str],
     external: Sequence[str],
     categories: Sequence[str],
+    rules: Sequence[str] = (),
 ) -> str:
     lines = [
         f"Topic: {topic}",
@@ -113,6 +114,15 @@ def render(
         "",
         "Category options: " + "; ".join(categories),
         "",
+        *(
+            [
+                "Never write, in any field (meta title, meta description, slug, FAQ, tags, image alt text):",
+                *[f"- {r}" for r in rules],
+                "",
+            ]
+            if rules
+            else []
+        ),
         fence(DRAFT_TAG, article),
         "",
         "Prepare the SEO package.",

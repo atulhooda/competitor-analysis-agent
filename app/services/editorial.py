@@ -37,6 +37,7 @@ import structlog
 from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.compliance import ComplianceInput, check, writer_rules
 from app.config import Settings, load_scoring_config
 from app.core.errors import AppError, TransientError
 from app.core.timeutils import utcnow
@@ -269,6 +270,7 @@ class EditorialService:
                             excluded=company.excluded_topics,
                             covered=covered.lines,
                             count=summary.asked,
+                            rules=self._content_rules(),
                         ),
                         system=prompt.SYSTEM,
                         model=self._settings.synthesis_model,
@@ -283,6 +285,10 @@ class EditorialService:
                 summary.proposed = len(response.data.ideas)
                 ideas = select_ideas(response.data.ideas, company=company, config=config, covered=covered, allowed=numbers_in("\n".join(lines)), keep=options.count, min_score=options.min_score)  # fmt: skip
                 for idea in ideas:
+                    if not idea.rejected and (banned := self._banned_terms(idea)):
+                        idea.rejected = (
+                            f"excluded by the clinic's compliance rules ({', '.join(banned)})"
+                        )
                     summary.unverified_sentences_removed += idea.unverified_sentences_removed
                     if idea.rejected:
                         category = _category(idea.rejected)
@@ -296,6 +302,21 @@ class EditorialService:
             except Exception as exc:  # the run must never be left "running"
                 log.exception("editorial.crashed", run_id=run_id)
                 return await self._finish(run_id, summary, ideas, llm, fatal=f"{type(exc).__name__}: {exc}")  # fmt: skip
+
+    def _content_rules(self) -> list[str]:
+        """The clinic's compliance rules, so Gemini proposes only topics a post can be written
+        about (none without CLINIC_ID)."""
+        clinic = self._settings.clinic
+        return writer_rules(clinic, self._settings.compliance_terms) if clinic else []
+
+    def _banned_terms(self, idea: EditorialIdea) -> list[str]:
+        """Banned terms in an idea's topic, title or keyword: its post would be blocked."""
+        clinic = self._settings.clinic
+        if clinic is None:
+            return []
+        post = ComplianceInput(fields=[("the topic", idea.topic), ("the title", idea.title), ("the keyword", idea.primary_keyword)], body="")  # fmt: skip
+        found = [f.term for r in check(post, clinic, self._settings.compliance_terms).rules if r.rule in ("R4", "R13") for f in r.findings]  # fmt: skip
+        return list(dict.fromkeys(found))
 
     async def _finish(
         self,

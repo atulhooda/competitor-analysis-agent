@@ -294,6 +294,7 @@ async def build_seo(llm: BudgetedLLM, inputs: SEOInputs, content: ArticleContent
                 for i, s in enumerate(external, start=1)
             ],
             categories=categories,
+            rules=inputs.brief.things_to_avoid,
         ),
         system=prompt.SYSTEM,
         model=config.model,
