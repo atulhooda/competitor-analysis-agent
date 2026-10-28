@@ -5,8 +5,13 @@ Real job machinery, real PostgreSQL, the fake Gemini and CMS. No network."""
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import update
+
+from app.db.models import Opportunity, Publication
 from app.domain.articles import ArticleStatus
 from app.domain.jobs import JobType, JobView, StageStatus
+from app.domain.opportunities import OpportunityStatus
+from app.domain.publishing import PublicationStatus
 from app.llm import LLMBillingError
 from app.prompts.article_research import DiscoverOut
 from tests.integration.test_pipeline import rig as rig
@@ -84,3 +89,16 @@ async def test_an_attempt_gemini_billed_nothing_for_leaves_the_allowance_alone(r
     rig.env.wall.now = AT_0040
     await slot(rig, max_articles_generated_per_day=1)  # the day's one attempt is still there
     assert posts(rig) == 1
+
+
+async def test_an_article_a_check_blocks_at_publishing_is_replaced_the_same_day(rig: Rig) -> None:  # fmt: skip
+    rig.distinct_slugs()
+    await spare_opportunities(rig, 1)
+    rig.env.wall.now = AT_0010
+    await slot(rig)
+    async with rig.env.sessions() as session, session.begin():  # as if a check had blocked its post
+        await session.execute(update(Publication).values(status=PublicationStatus.BLOCKED.value))
+        await session.execute(update(Opportunity).where(Opportunity.status == OpportunityStatus.USED.value).values(status=OpportunityStatus.APPROVED.value))  # fmt: skip
+    rig.env.wall.now = AT_0040
+    again = await rig.run(JobType.GENERATE_ARTICLES, **PACED)
+    assert summary(again, "generate")["pace"] == {"due": 1, "published_today": 0, "on_the_way": 0, "wanted": 1}  # fmt: skip

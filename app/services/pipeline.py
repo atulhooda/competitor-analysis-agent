@@ -45,7 +45,7 @@ from app.config import Settings
 from app.core.errors import ConfigurationError
 from app.core.timeutils import utcnow
 from app.db.locks import generation_limit_lock
-from app.db.models import Article, LLMCall, Run
+from app.db.models import Article, LLMCall, Publication, Run
 from app.db.pipeline_queries import (
     OpportunityCandidate,
     PublishCandidate,
@@ -607,10 +607,13 @@ class PipelineService:
     async def _on_the_way(self, session: AsyncSession) -> int:
         """Articles that will become posts without another being written: those being written
         or validated (started recently: an older one is stuck), and ready ones the publish
-        stage would send. Failed and needs-review articles aren't: they get replaced."""
+        stage would send. Failed and needs-review articles aren't: they get replaced. Nor is a
+        ready one whose version a check blocked: it would be blocked again."""
         writing = await session.scalar(select(func.count(Article.id)).where(Article.status.in_([s.value for s in (*IN_PROGRESS_STATUSES, ArticleStatus.COMPLETED)]), Article.created_at >= self._now() - _STUCK_AFTER))  # fmt: skip
-        ready = await publish_candidates(session, site=self._s.cms.site or "", done=_DONE[self._publish_target()])  # fmt: skip
-        return int(writing or 0) + sum(1 for c in ready if _approval_state(c, self._settings) in ("approved", "auto"))  # fmt: skip
+        site = self._s.cms.site or ""
+        ready = await publish_candidates(session, site=site, done=_DONE[self._publish_target()])
+        blocked = set((await session.execute(select(Publication.article_id, Publication.version_id).where(Publication.site == site, Publication.status == PublicationStatus.BLOCKED.value))).tuples())  # fmt: skip
+        return int(writing or 0) + sum(1 for c in ready if (c.article.id, c.article.recommended_version_id) not in blocked and _approval_state(c, self._settings) in ("approved", "auto"))  # fmt: skip
 
     async def _write_article(self, article_id: int, run_id: int | None, trigger: RunTrigger) -> dict[str, Any]:  # fmt: skip
         try:
