@@ -604,15 +604,20 @@ class PipelineService:
             await self._save_progress(ctx, Stage.GENERATE, progress)
         return progress
 
+    async def _blocked(self, session: AsyncSession) -> set[tuple[int, int]]:
+        """(article, version) pairs a check blocked at publishing: unchanged, they would be
+        blocked again, so they are neither on their way nor worth another attempt."""
+        query = select(Publication.article_id, Publication.version_id).where(Publication.site == (self._s.cms.site or ""), Publication.status == PublicationStatus.BLOCKED.value)  # fmt: skip
+        return {(a, v) for a, v in (await session.execute(query)).tuples()}
+
     async def _on_the_way(self, session: AsyncSession) -> int:
         """Articles that will become posts without another being written: those being written
         or validated (started recently: an older one is stuck), and ready ones the publish
         stage would send. Failed and needs-review articles aren't: they get replaced. Nor is a
         ready one whose version a check blocked: it would be blocked again."""
         writing = await session.scalar(select(func.count(Article.id)).where(Article.status.in_([s.value for s in (*IN_PROGRESS_STATUSES, ArticleStatus.COMPLETED)]), Article.created_at >= self._now() - _STUCK_AFTER))  # fmt: skip
-        site = self._s.cms.site or ""
-        ready = await publish_candidates(session, site=site, done=_DONE[self._publish_target()])
-        blocked = set((await session.execute(select(Publication.article_id, Publication.version_id).where(Publication.site == site, Publication.status == PublicationStatus.BLOCKED.value))).tuples())  # fmt: skip
+        ready = await publish_candidates(session, site=self._s.cms.site or "", done=_DONE[self._publish_target()])  # fmt: skip
+        blocked = await self._blocked(session)
         return int(writing or 0) + sum(1 for c in ready if (c.article.id, c.article.recommended_version_id) not in blocked and _approval_state(c, self._settings) in ("approved", "auto"))  # fmt: skip
 
     async def _write_article(self, article_id: int, run_id: int | None, trigger: RunTrigger) -> dict[str, Any]:  # fmt: skip
@@ -710,6 +715,10 @@ class PipelineService:
         async with self._sessions() as session:
             used = await published_on(session, day, settings, scheduled_only=True)
             candidates = await publish_candidates(session, site=self._s.cms.site or "", done=_DONE[target])  # fmt: skip
+            blocked = await self._blocked(session)
+        # A version a check blocked goes last: the others aren't held up behind it, and it is
+        # still tried when a slot is left (a fix of the rules or the rendering may pass it).
+        candidates.sort(key=lambda c: (c.article.id, c.article.recommended_version_id) in blocked)  # fmt: skip
         remaining = max(limit - used, 0)
         states = {c.article.id: _approval_state(c, settings) for c in candidates}
         eligible = [c.article.id for c in candidates if states[c.article.id] in ("approved", "auto")]  # fmt: skip
@@ -747,7 +756,9 @@ class PipelineService:
                 sent, streak = sent + 1, 0
             elif entry.get("action") == "deferred_daily_limit":
                 break  # another publisher took the last slot: the limit holds
-            elif _publish_failed(entry):
+            elif (
+                _publish_failed(entry) and entry["status"] != PublicationStatus.BLOCKED.value
+            ):  # a check, not the CMS
                 streak += 1
                 if streak >= _PUBLISH_FAILURE_STREAK:
                     notes.append(f"stopped after {streak} consecutive failures (is the CMS reachable?)")  # fmt: skip

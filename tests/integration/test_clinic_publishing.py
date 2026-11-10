@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import select, update
 
+from app.db.models import ArticleCitation, ArticleSource
 from app.domain.publishing import ApprovalChannel, PublicationStatus, TargetStatus
 from tests.integration.test_publishing import Pub
 from tests.integration.test_publishing import pub as pub
@@ -158,3 +160,16 @@ def test_with_a_standing_approval_the_pipeline_publishes(tmp_path: Path, standin
     pipeline._settings = make_settings(**settings_values)
     assert pipeline._publish_target() is (TargetStatus.PUBLISH if standing else TargetStatus.DRAFT)
     _CLINICS.clear()
+
+
+async def test_a_source_a_clinic_cant_show_is_left_out_with_its_citations(pub: Pub, tmp_path: Path) -> None:  # fmt: skip
+    async with (
+        pub.world.env.sessions() as session,
+        session.begin(),
+    ):  # a cited source's URL has a superlative
+        url = (await session.scalars(select(ArticleSource.url).join(ArticleCitation, ArticleCitation.source_id == ArticleSource.id).limit(1))).one()  # fmt: skip
+        await session.execute(update(ArticleSource).where(ArticleSource.url == url).values(url="https://example.org/miracle-peel-results"))  # fmt: skip
+    report = await pub.service(**clinic_settings(tmp_path)).preflight(pub.article_id, target=TargetStatus.DRAFT)  # fmt: skip
+    assert report.compliance is not None
+    r9 = next(r for r in report.compliance["rules"] if r["rule"] == "R9")
+    assert r9["passed"], r9

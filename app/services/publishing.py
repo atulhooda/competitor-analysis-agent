@@ -704,10 +704,25 @@ class PublishingService:
             opportunity_title=opportunity.title if opportunity is not None else None,
         )
 
+    def _showable(self, text: str) -> bool:
+        """A source's title and URL break no rule a clinic post's text is held to (a drug
+        name, a superlative such as "miracle" in a URL): no neutral word can fix a URL."""
+        clinic = self._settings.clinic
+        if clinic is None:
+            return True
+        report = check(ComplianceInput(fields=[("the source", text)], body=""), clinic, self._settings.compliance_terms)  # fmt: skip
+        return not any(r.findings for r in report.rules if r.rule in ("R4", "R8", "R9", "R10", "R11", "R13", "R15"))  # fmt: skip
+
     def _render(self, snap: _Snapshot) -> RenderedDocument | None:
         if snap.content is None:
             return None
-        doc = render_article(snap.content, sources=snap.sources, seo=snap.seo.package if snap.seo else None, allowed_internal=snap.allowed_internal, allowed_external=snap.allowed_external)  # fmt: skip
+        sources, external = snap.sources, snap.allowed_external
+        if (
+            self._settings.clinic is not None
+        ):  # a source a clinic can't show is left out, with its citations
+            sources = {label: (title, url) for label, (title, url) in sources.items() if self._showable(f"{title or ''} {url}")}  # fmt: skip
+            external = {url for url in external if self._showable(url)}
+        doc = render_article(snap.content, sources=sources, seo=snap.seo.package if snap.seo else None, allowed_internal=snap.allowed_internal, allowed_external=external)  # fmt: skip
         # Provenance the target may show (a pull request description): no secret, no id
         # the reader can't use.
         # The byline, the closing line, the call to action and the cover come from
