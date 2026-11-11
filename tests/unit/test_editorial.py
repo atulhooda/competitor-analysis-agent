@@ -179,3 +179,20 @@ def test_each_source_owns_its_key_namespace() -> None:
     assert opportunity_origin("core:ai agent") is OpportunityOrigin.COMPETITORS
     assert not any(EDITORIAL_KEY_PREFIX.startswith(p) for p in SIGNAL_KEY_PREFIXES)
     assert humanize_slug("how-to-reduce_no-shows") == "how to reduce no shows"
+
+
+def test_a_title_template_used_three_times_is_not_used_again_by_a_business_blog() -> None:
+    covered = _Covered(entries=[(humanize_slug(s),) for s in ("holter-monitor-ai-agent-handoff-in-india", "mammography-ai-agent-handoff-india", "denture-ai-agent-handoff-india")], lines=[], keys={})  # fmt: skip
+    ideas = (idea("Colposcopy AI agent handoff"), idea("AI agent handoff costs for small teams"))
+    business = {i.topic: i.rejected for i in select_ideas(ideas, company=COMPANY, config=CONFIG, covered=covered, allowed=ALLOWED, keep=10, template_limit=3)}  # fmt: skip
+    assert "agent handoff" in (business["Colposcopy AI agent handoff"] or "")
+    assert (
+        business["AI agent handoff costs for small teams"] is None
+    )  # a new angle, not the template
+    clinic = {i.topic: i.rejected for i in select_ideas(ideas, company=COMPANY, config=CONFIG, covered=covered, allowed=ALLOWED, keep=10)}  # fmt: skip
+    assert clinic["Colposcopy AI agent handoff"] is None  # a clinic's posts take one condition each
+
+
+def test_only_a_business_blog_is_told_to_avoid_title_templates() -> None:
+    assert prompt.TEMPLATES in prompt.render(company=["- name: x"], excluded=[], covered=[], count=3, templates=True)  # fmt: skip
+    assert prompt.TEMPLATES not in prompt.render(company=["- name: x"], excluded=[], covered=[], count=3)  # fmt: skip

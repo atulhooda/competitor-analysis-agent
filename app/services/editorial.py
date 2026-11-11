@@ -27,6 +27,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -271,6 +272,7 @@ class EditorialService:
                             covered=covered.lines,
                             count=summary.asked,
                             rules=self._content_rules(),
+                            templates=self._settings.clinic is None,
                         ),
                         system=prompt.SYSTEM,
                         model=self._settings.synthesis_model,
@@ -283,7 +285,7 @@ class EditorialService:
                     items=summary.asked,
                 )
                 summary.proposed = len(response.data.ideas)
-                ideas = select_ideas(response.data.ideas, company=company, config=config, covered=covered, allowed=numbers_in("\n".join(lines)), keep=options.count, min_score=options.min_score)  # fmt: skip
+                ideas = select_ideas(response.data.ideas, company=company, config=config, covered=covered, allowed=numbers_in("\n".join(lines)), keep=options.count, min_score=options.min_score, template_limit=None if self._settings.clinic else TEMPLATE_LIMIT)  # fmt: skip
                 for idea in ideas:
                     if not idea.rejected and (banned := self._banned_terms(idea)):
                         idea.rejected = (
@@ -479,6 +481,7 @@ def select_ideas(
     allowed: set[str],
     keep: int,
     min_score: float | None = None,
+    template_limit: int | None = None,
 ) -> list[EditorialIdea]:
     """Check every idea, then keep the best ``keep`` by strategic fit (ties: the model's
     order). Returns every idea, the rejected ones with the reason. ``min_score``: the score
@@ -495,6 +498,8 @@ def select_ideas(
                 idea.rejected = f"already proposed: {covered.keys.get(idea.key) or 'earlier in this run'}"  # fmt: skip
             elif (twin := _twin(idea, [*covered.entries, *accepted])) is not None:
                 idea.rejected = f"near-duplicate of '{twin}'"
+            elif template_limit and (frame := _template(idea, [*covered.entries, *accepted], template_limit)) is not None:  # fmt: skip
+                idea.rejected = f"near-duplicate: another '… {frame}' post, a template already used {template_limit}+ times"  # fmt: skip
             else:
                 seen_keys.add(idea.key)
                 accepted.append(_labels(idea))
@@ -585,6 +590,26 @@ def served_topic(claimed: str, labels: Sequence[str], company: CompanyProfile) -
 
 def _labels(idea: EditorialIdea) -> tuple[str, ...]:
     return (idea.topic, idea.title, idea.primary_keyword)
+
+
+# A title template ("<a test or procedure> appointment scheduling in India") is used at most
+# this often by a business blog (a clinic's posts rightly take one condition each): niche variants of one post find no searchers and read as mass-produced pages.
+TEMPLATE_LIMIT = 3
+_FRAME_FILLER = frozenset({"a", "an", "and", "for", "how", "in", "india", "indian", "of", "on", "the", "to", "with", "your", "clinic", "clinics", "hospital", "hospitals", "guide"})  # fmt: skip
+
+
+def _frames(text: str) -> set[str]:
+    """The last two meaningful words of a label: what the variants of a template share."""
+    words = [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in _FRAME_FILLER]
+    return {" ".join(words[-2:])} if len(words) >= 3 else set()
+
+
+def _template(idea: EditorialIdea, entries: Sequence[tuple[str, ...]], limit: int) -> str | None:
+    """The template an idea repeats, when ``limit`` covered posts already use it."""
+    for frame in _frames(idea.primary_keyword) | _frames(idea.topic):
+        if sum(1 for entry in entries if any(frame in _frames(label) for label in entry)) >= limit:  # fmt: skip
+            return frame
+    return None
 
 
 def _twin(idea: EditorialIdea, entries: Sequence[tuple[str, ...]]) -> str | None:

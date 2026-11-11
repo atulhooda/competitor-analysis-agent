@@ -16,7 +16,7 @@ from pydantic import AfterValidator, BaseModel, BeforeValidator, Field
 from app.domain.analysis import ContentFormat, SearchIntent
 from app.prompts.fields import Score, lenient_enum, texts, truncate
 
-VERSION = "editorial/4"
+VERSION = "editorial/5"
 
 SYSTEM = """\
 You are the content strategist for a startup's blog. You propose article ideas the startup \
@@ -30,6 +30,9 @@ anything that touches an excluded topic.
 - Each idea answers a real question a reader in one of the startup's audiences searches \
 for: how-tos, costs, checklists, mistakes, regulations, choosing between approaches, \
 benchmarks, playbooks. No company news, product announcements or press releases.
+- Write for the startup's audiences themselves, the people who would buy or use what it \
+offers, never for their customers: a startup selling to clinics writes for clinic owners \
+and managers, not for patients looking for a test.
 - When the profile names a market, every idea is for readers there: the topic, title and \
 primary keyword are worded the way people there search (their terms and spelling), and \
 when they would search with a place (the country or a city, e.g. "... in India", \
@@ -56,6 +59,15 @@ Fields per idea:
 - key_points: 3-6 short points the article must cover.
 - confidence: 0-1, how sure you are that readers want this piece.
 """
+
+# For a business selling to businesses (not a clinic writing for its patients, whose posts
+# rightly take one condition each): niche variants of one title find no searchers.
+TEMPLATES = (
+    "- prefer topics many of the audiences search for (their problems, costs, how to choose, "
+    "mistakes, comparisons of approaches). Never make variants of one title by swapping a "
+    'niche (a test, procedure, specialty or city) into the same template, e.g. "<procedure> '
+    'appointment scheduling in India": one broad, useful guide beats many narrow copies.'
+)
 
 # Formats an idea may take. Case studies, news and announcements need facts the profile
 # can't supply; landing and product pages aren't blog posts.
@@ -100,12 +112,13 @@ def _data(text: str) -> str:
     return " ".join(text.split()).replace("<", "&lt;").replace(">", "&gt;")
 
 
-def render(*, company: Sequence[str], excluded: Sequence[str], covered: Sequence[str], count: int, rules: Sequence[str] = ()) -> str:  # fmt: skip
+def render(*, company: Sequence[str], excluded: Sequence[str], covered: Sequence[str], count: int, rules: Sequence[str] = (), templates: bool = False) -> str:  # fmt: skip
     return "\n".join(
         [
             "Startup profile:",
             *company,
             "- excluded topics (never propose): " + ("; ".join(excluded) or "none"),
+            *([TEMPLATES] if templates else []),
             *(
                 [
                     "- the publisher's content rules: never propose a topic, title or keyword that needs any of these:",
