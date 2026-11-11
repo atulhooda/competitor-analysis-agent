@@ -148,3 +148,15 @@ async def test_a_manual_publication_doesnt_use_the_pipelines_daily_allowance(rig
     publish = next(st for st in job.stages if st.stage.value == "publish")
     assert publish.summary.get("published") == [second]  # the day's own slot is still free
     assert await _count(rig) == 2
+
+
+async def test_failed_attempts_leave_the_allowance_up_to_a_ceiling(rig: Rig) -> None:
+    await _published_article(rig)
+    async with rig.env.sessions() as session, session.begin():
+        [article] = list(await session.scalars(select(Article)))
+        article.status = ArticleStatus.FAILED.value
+        article.tokens_used = 500  # billed
+    settings = rig.settings(max_articles_generated_per_day=1, max_editorial_articles_per_day=0)
+    async with rig.env.sessions() as session:
+        assert await generated_on(session, DAY, settings) == 0  # a failure doesn't use the slot
+        assert await generated_on(session, DAY, rig.settings(max_articles_generated_per_day=0, max_editorial_articles_per_day=0)) == 1  # past the ceiling it does  # fmt: skip

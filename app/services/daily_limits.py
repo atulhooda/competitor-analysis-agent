@@ -100,16 +100,25 @@ async def reserve_publication_slot(session: AsyncSession, publication: Publicati
 
 
 async def generated_on(session: AsyncSession, day: date, settings: Settings, *, origin: OpportunityOrigin | None = None) -> int:  # fmt: skip
-    """Articles created on ``day``, except attempts that failed before anything was billed;
-    with ``origin``, only those from that kind of opportunity (each origin has its own daily
-    allowance)."""
+    """The day's allowance used on ``day``; with ``origin``, only by that kind of opportunity
+    (each origin has its own daily allowance).
+
+    A failed attempt doesn't use the allowance, so a day of topics that couldn't be
+    researched still gets its posts; but every billed attempt counts toward a hard ceiling
+    of twice the allowance, so failures can't spend without end: past ``limit`` billed
+    failures, each further one uses a slot."""
     start, end = day_bounds(day, settings.scheduler_tz)
-    free = and_(Article.status == ArticleStatus.FAILED.value, Article.tokens_used == 0, Article.quality_tokens_used == 0)  # fmt: skip
-    query = select(func.count(Article.id)).where(Article.created_at >= start, Article.created_at < end, ~free)  # fmt: skip
+    failed = Article.status == ArticleStatus.FAILED.value
+    free = and_(failed, Article.tokens_used == 0, Article.quality_tokens_used == 0)
+    billed = func.count(Article.id).filter(~free)
+    kept = func.count(Article.id).filter(~failed)
+    query = select(billed, kept).where(Article.created_at >= start, Article.created_at < end)  # fmt: skip
     if origin is not None:
         editorial = Opportunity.key.startswith(EDITORIAL_KEY_PREFIX, autoescape=True)
         query = query.join(Opportunity, Opportunity.id == Article.opportunity_id).where(editorial if origin is OpportunityOrigin.EDITORIAL else ~editorial)  # fmt: skip
-    return int(await session.scalar(query) or 0)
+    total, succeeded = (await session.execute(query)).one()
+    limit = generation_limit(settings, origin) if origin is not None else settings.max_articles_generated_per_day + settings.max_editorial_articles_per_day  # fmt: skip
+    return max(int(succeeded or 0), int(total or 0) - limit)
 
 
 async def written_by_on(session: AsyncSession, day: date, settings: Settings, *, writer: str) -> int:  # fmt: skip
