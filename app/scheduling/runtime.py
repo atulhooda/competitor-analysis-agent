@@ -58,7 +58,9 @@ async def standalone(settings: Settings, *, pooled: bool = True, fetcher: Polite
         scans=ScanService(engine, sessions, active_fetcher, settings),
         analyses=AnalysisService(engine, sessions, lazy_llm, settings),
         opportunities=OpportunityService(engine, sessions, lazy_llm, settings),
-        articles=ArticleService(engine, sessions, lazy_llm, settings, resolver=resolver),
+        articles=ArticleService(
+            engine, sessions, lazy_llm, settings, resolver=resolver, fetcher=active_fetcher
+        ),
         quality=QualityService(engine, sessions, lazy_llm, settings, resolver=resolver),
         publishing=PublishingService(engine, sessions, settings, lazy_cms, covers=covers),
         cms=lazy_cms,

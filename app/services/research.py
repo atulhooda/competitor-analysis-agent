@@ -1,5 +1,6 @@
 """Article research (Phase 5): Gemini with Google Search grounding proposes sources, and
-Gemini's URL context tool reads them. This process never fetches a page itself.
+Gemini's URL context tool reads them. Pages that tool can't open are fetched by the
+crawler (robots-aware, SSRF-guarded) and given to Gemini as fenced, untrusted text.
 
     discover   one grounded call: the research questions (claims needing evidence) and
                candidate sources (URLs the model saw in search results)
@@ -10,9 +11,14 @@ Gemini's URL context tool reads them. This process never fetches a page itself.
     read       URL context calls (budgeted, capped): Gemini retrieves the pages and extracts
                facts with supporting excerpts
 
-A candidate becomes a source only if the URL tool reports that page as retrieved: a URL the
-model made up, or one that fails to load, never reaches the article. Every fact is tied to
-the source it was read from.
+A candidate becomes a source only if the URL tool reports that page as retrieved, or the
+crawler fetched it: a URL the model made up, or one that fails to load, never reaches the
+article. Every fact is tied to the source it was read from, and a fact from a fetched page
+is kept only if its excerpt is found word for word in the text that was fetched.
+
+The fallback: many sites refuse Gemini's reader every time (a page that failed once was
+never read on a later try, Nov 2026), and research fell short on about half the articles.
+At most MAX_FETCHED_PAGES pages per read call are fetched, in one extra call without tools.
 
 A read call can be refused outright (HTTP 400, nothing billed): "Request contains an
 invalid argument", "Request blocked due to copyright/recitation content", "Model generated
@@ -44,9 +50,14 @@ from difflib import SequenceMatcher
 from typing import Any, Self
 from urllib.parse import urlsplit
 
+import structlog
+
 from app.config import GEMINI, Settings
 from app.core.errors import PermanentError
 from app.crawling.errors import FetchError, UnsafeDestinationError
+from app.crawling.extract import extract_page
+from app.crawling.fetcher import FetchKind, PoliteFetcher
+from app.crawling.html import decode_html
 from app.crawling.netguard import Resolver, ensure_public_destination
 from app.crawling.urls import normalize_url
 from app.domain.analysis import LLMPurpose
@@ -73,6 +84,8 @@ from app.prompts import article_research as prompt
 from app.services.article_brief import domain_of
 from app.services.llm_usage import BudgetedLLM
 
+log = structlog.get_logger(__name__)
+
 MAX_URL_LENGTH = 2_000
 MAX_URLS_PER_CALL = 20  # Gemini's URL context limit per request
 MAX_FACTS = 40
@@ -83,6 +96,9 @@ UNREADABLE_WINDOW_DAYS = 30  # how far back the URL tool's record of a site goes
 UNREADABLE_MIN_TRIES = 5  # pages of a site tried before it can be judged
 UNREADABLE_MAX_SHARE = 0.2  # a site whose pages were read less often than this is skipped
 MAX_AVOIDED_IN_PROMPT = 40  # unreadable sites the search is told about
+MAX_FETCHED_PAGES = 6  # pages the crawler fetches per read call, after the URL tool failed
+MAX_FETCHED_CHARS = 12_000  # of each fetched page's text, sent to Gemini
+MIN_FETCHED_WORDS = 80  # less is a stub, an error or a login page
 _READER_FAILURES = ("URL context status:", "retrieved, but the model couldn't read it")
 
 
@@ -258,6 +274,37 @@ def unreadable_domains(candidates: Iterable[tuple[str, str, str | None]]) -> lis
     return [site for site, n in tried.most_common() if n >= UNREADABLE_MIN_TRIES and read[site] < UNREADABLE_MAX_SHARE * n]  # fmt: skip
 
 
+async def fetch_text(fetcher: PoliteFetcher, url: str) -> tuple[str, str] | None:
+    """(final URL, main text) of a public HTML page, or None when it can't be had."""
+    try:
+        result = await fetcher.fetch(url, FetchKind.PAGE)
+    except FetchError:
+        return None
+    except Exception:  # a fallback never sinks the research that called it
+        log.warning("research.fetch_failed", url=url, exc_info=True)
+        return None
+    if result.status != 200 or not result.content:
+        return None
+    try:
+        page = extract_page(decode_html(result.content, result.content_type), result.final_url)
+    except Exception:  # a pathological page costs that page, nothing more
+        return None
+    if page.word_count < MIN_FETCHED_WORDS:
+        return None
+    return result.final_url, page.text[:MAX_FETCHED_CHARS]
+
+
+def _squash(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _quoted(page: prompt.PageOut, text: str) -> prompt.PageOut:
+    """Only the facts whose excerpt is in ``text`` (whitespace and case aside)."""
+    body = _squash(text)
+    facts = [f for f in page.facts if f.excerpt and _squash(f.excerpt.strip(" .…\"'")) in body]
+    return page.model_copy(update={"facts": facts})
+
+
 async def research(
     llm: BudgetedLLM,
     brief: ArticleBrief,
@@ -266,6 +313,7 @@ async def research(
     resolver: Resolver,
     company_domain: str | None,
     unreadable: Collection[str] = (),
+    fetcher: PoliteFetcher | None = None,
 ) -> ResearchResult:
     """Research for ``brief``. Raises ``ResearchFailedError`` with fewer than
     ``config.min_sources`` usable sources; LLM budget and availability errors propagate.
@@ -277,6 +325,7 @@ async def research(
     (``ARTICLE_RESEARCH_MAX_TOKENS``) and one page-reading budget
     (``ARTICLE_RESEARCH_MAX_URL_CONTEXT_CALLS``): the second pass reads what the first left
     unspent, never more. Pages on ``unreadable`` sites (``unreadable_domains``) are skipped.
+    With ``fetcher``, pages the URL tool fails on are fetched and read from their text.
     """
     start = llm.usage.total_tokens
     avoid = sorted(unreadable)[:MAX_AVOIDED_IN_PROMPT]
@@ -346,9 +395,17 @@ async def research(
             pages: dict[str, prompt.PageOut] = {}
             for page in read.data.pages:
                 pages.setdefault(normalize_url(page.url) or page.url, page)
+            unopened: list[_Candidate] = []
             for candidate in batch:
                 final_url, status = retrieval[candidate.url]
                 page_out = pages.get(candidate.url) or pages.get(final_url)
+                if (
+                    status != "success"
+                    and fetcher is not None
+                    and len(unopened) < MAX_FETCHED_PAGES
+                ):
+                    unopened.append(candidate)
+                    continue
                 if status != "success":
                     reason = f"URL context status: {status}"
                 elif page_out is None or not page_out.readable:
@@ -359,6 +416,55 @@ async def research(
                     reads.append(_Read(candidate, final_url, status, page_out, calls["read"]))
                     continue
                 dispositions.append(CandidateDisposition(url=candidate.url, title=candidate.title, source_type=candidate.source_type, outcome="not_retrieved", reason=reason))  # fmt: skip
+            if unopened and fetcher is not None:
+                await read_fetched(unopened, fetcher, retrieval)
+
+    async def read_fetched(unopened: Sequence[_Candidate], fetcher: PoliteFetcher, retrieval: dict[str, tuple[str, str]]) -> None:  # fmt: skip
+        """The crawler fetches pages the URL tool couldn't open; one call reads their text."""
+
+        def lost(candidate: _Candidate, reason: str) -> None:
+            dispositions.append(CandidateDisposition(url=candidate.url, title=candidate.title, source_type=candidate.source_type, outcome="not_retrieved", reason=reason))  # fmt: skip
+
+        fetched: list[tuple[_Candidate, str, str]] = []
+        for candidate in unopened:
+            got = await fetch_text(fetcher, candidate.url)
+            if got is None:
+                lost(candidate, f"URL context status: {retrieval[candidate.url][1]}; the crawler couldn't fetch it either")  # fmt: skip
+            else:
+                fetched.append((candidate, *got))
+        if not fetched:
+            return
+        request = LLMRequest(
+            prompt=prompt.render_fetched(questions, [(c.url, text) for c, _, text in fetched]),
+            system=prompt.FETCHED_SYSTEM,
+            model=config.model,
+            max_output_tokens=prompt.read_max_output_tokens(len(fetched)),
+            reasoning_effort=config.reasoning_effort,
+        )
+        if not fits(request):
+            notes.append(f"research token budget reached: {len(fetched)} fetched page(s) not read")
+            for c, _, _ in fetched:
+                lost(c, "fetched, but the research token budget was reached")
+            return
+        try:
+            out = await llm.structured(request, prompt.ReadOut, purpose=LLMPurpose.ARTICLE_RESEARCH, prompt_version=prompt.VERSION)  # fmt: skip
+        except (LLMRequestRejectedError, LLMResponseError) as exc:
+            notes.append(f"reading {len(fetched)} fetched page(s) failed ({exc})")
+            for c, _, _ in fetched:
+                lost(c, "fetched, but reading its text failed")
+            return
+        by_url = {normalize_url(p.url) or p.url: p for p in out.data.pages}
+        for candidate, final_url, text in fetched:
+            page_out = by_url.get(normalize_url(candidate.url) or candidate.url)
+            if page_out is None or not page_out.readable:
+                lost(candidate, "fetched, but the model couldn't read it")
+                continue
+            page_out = _quoted(page_out, text)
+            if not any(f.statement.strip() for f in page_out.facts):
+                lost(candidate, "fetched, but no relevant facts quoted from the page")
+                continue
+            reads.append(_Read(candidate, final_url, "fetched", page_out, calls["read"]))
+        notes.append(f"the crawler fetched {len(fetched)} page(s) the URL tool couldn't open")
 
     for pass_number in range(1, MAX_DISCOVERY_PASSES + 1):
         # Never more usable sources than asked for, and never more reading than paid for.

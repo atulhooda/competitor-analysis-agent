@@ -37,6 +37,7 @@ from app.compliance import writer_rules
 from app.config import GEMINI, Settings
 from app.core.errors import AppError, PermanentError, TransientError
 from app.core.timeutils import utcnow
+from app.crawling.fetcher import PoliteFetcher
 from app.crawling.netguard import Resolver, system_resolver
 from app.db.article_queries import research_candidates_since
 from app.db.locks import article_lock
@@ -224,8 +225,10 @@ class ArticleService:
         now: Callable[[], datetime] = utcnow,
         resolver: Resolver = system_resolver,
         writers: WritingRouter | None = None,
+        fetcher: PoliteFetcher | None = None,
     ) -> None:
         self._engine = engine
+        self._fetcher = fetcher  # fetches research pages Gemini's URL tool can't open
         self._sessions = sessions
         self._llm = llm
         self._settings = settings
@@ -578,7 +581,7 @@ class ArticleService:
             website = chain.brief.company.website
             async with self._sessions() as session:
                 seen = await research_candidates_since(session, self._now() - timedelta(days=UNREADABLE_WINDOW_DAYS))  # fmt: skip
-            return await research(llm, chain.brief, ResearchConfig.from_settings(self._settings, writer), resolver=self._resolver, company_domain=domain_of(website) if website else None, unreadable=frozenset(unreadable_domains(seen)))  # fmt: skip
+            return await research(llm, chain.brief, ResearchConfig.from_settings(self._settings, writer), resolver=self._resolver, company_domain=domain_of(website) if website else None, unreadable=frozenset(unreadable_domains(seen)), fetcher=self._fetcher)  # fmt: skip
         config = WritingConfig.from_settings(self._settings, writer)
         if chain.research is None:
             raise RuntimeError("the writing steps need research")
@@ -622,7 +625,7 @@ class ArticleService:
                         article_id=chain.article_id, step_id=step_id, label=s.label, url=s.url, requested_url=s.requested_url,
                         domain=s.domain, title=s.title, publisher=s.publisher, published=s.published, source_type=s.source_type.value,
                         relevance=s.relevance, attribution_required=s.attribution_required, excerpt=s.excerpt, facts=facts[s.label],
-                        retrieval={"tool": "url_context", "status": s.retrieval_status, "requested_url": s.requested_url}, retrieved_at=now,
+                        retrieval={"tool": "crawler" if s.retrieval_status == "fetched" else "url_context", "status": s.retrieval_status, "requested_url": s.requested_url}, retrieved_at=now,
                     )  # fmt: skip
                     session.add(source)
                     await session.flush()

@@ -83,7 +83,7 @@ def create_app(
         app.state.topic_admin = TopicAdminService(sessions, lazy_llm, settings)
         app.state.opportunities = OpportunityService(engine, sessions, lazy_llm, settings)
         app.state.editorial = EditorialService(engine, sessions, lazy_llm, settings, fetcher=active_fetcher)  # fmt: skip
-        app.state.articles = ArticleService(engine, sessions, lazy_llm, settings, resolver=resolver)
+        app.state.articles = ArticleService(engine, sessions, lazy_llm, settings, resolver=resolver, fetcher=active_fetcher)  # fmt: skip
         app.state.quality = QualityService(engine, sessions, lazy_llm, settings, resolver=resolver)
         covers = CoverService(sessions, settings, lazy_llm)
         lazy_cms = cms or LazyCMS(settings, covers=covers)
