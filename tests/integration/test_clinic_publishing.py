@@ -173,3 +173,4 @@ async def test_a_source_a_clinic_cant_show_is_left_out_with_its_citations(pub: P
     assert report.compliance is not None
     r9 = next(r for r in report.compliance["rules"] if r["rule"] == "R9")
     assert r9["passed"], r9
+    assert checks(report)["citations"][0], checks(report)["citations"]  # left out on purpose, not missing

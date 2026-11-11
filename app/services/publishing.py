@@ -723,6 +723,8 @@ class PublishingService:
             sources = {label: (title, url) for label, (title, url) in sources.items() if self._showable(f"{title or ''} {url}")}  # fmt: skip
             external = {url for url in external if self._showable(url)}
         doc = render_article(snap.content, sources=sources, seo=snap.seo.package if snap.seo else None, allowed_internal=snap.allowed_internal, allowed_external=external)  # fmt: skip
+        left_out = set(snap.sources) - set(sources)  # on purpose: not a missing source
+        doc = doc.model_copy(update={"unknown_citations": [label for label in doc.unknown_citations if label not in left_out]})  # fmt: skip
         # Provenance the target may show (a pull request description): no secret, no id
         # the reader can't use.
         # The byline, the closing line, the call to action and the cover come from
@@ -733,13 +735,15 @@ class PublishingService:
         # Gemini): the pull request says who wrote it instead of showing a score of zero.
         authored = bool(snap.report is not None and snap.report.authored)
         score = snap.report.overall_score if snap.report is not None and not authored else None
-        written = snap.article.created_at.astimezone(self._settings.scheduler_tz) if snap.article.created_at.tzinfo else snap.article.created_at  # fmt: skip
+        dated = (
+            self._now().astimezone(self._settings.scheduler_tz).date()
+        )  # the day it goes out, not the day it was written
         if (
             self._settings.clinic is not None
         ):  # single banned words get the neutral one, everywhere shown
             faq = [f.model_copy(update={"question": neutral_wording(f.question), "answer": neutral_wording(f.answer)}) for f in doc.faq]  # fmt: skip
             doc = doc.model_copy(update={"title": neutral_wording(doc.title), "excerpt": neutral_wording(doc.excerpt), "meta_title": neutral_wording(doc.meta_title), "body_markdown": neutral_wording(doc.body_markdown), "headings": [neutral_wording(h) for h in doc.headings], "faq": faq})  # fmt: skip
-        return doc.model_copy(update={"written_on": written.date().isoformat(), "article_id": snap.article.id, "version_id": snap.version.id if snap.version else None, "content_type": snap.article.content_type, "authored": authored, "quality_score": score, "opportunity_title": snap.opportunity_title, "content_hash": content_hash})  # fmt: skip
+        return doc.model_copy(update={"dated_on": dated.isoformat(), "article_id": snap.article.id, "version_id": snap.version.id if snap.version else None, "content_type": snap.article.content_type, "authored": authored, "quality_score": score, "opportunity_title": snap.opportunity_title, "content_hash": content_hash})  # fmt: skip
 
     # ── preflight ────────────────────────────────────────────────────────────
 
